@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+results/
+logs_archive/
+log_cache/
+build_cache/
+hints/
+scripts/*.csv
+.properties_backup.json
