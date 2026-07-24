@@ -21,23 +21,27 @@ def recordings_dir(game: Game, branch: str) -> Path:
 
 
 def list_recordings(game: Game, branch: str) -> list[Path]:
-    """All .rec tapes for one test case, sorted by name.
+    """All replay tapes for one test case, sorted by name.
 
-    Only tapes inside ``<game.rec_dir>/<branch>/`` are used, so each case replays
-    its own recordings.
+    Only tapes inside ``<game.rec_dir>/<branch>/`` matching the game's
+    ``rec_glob`` (``*.rec`` for SuperTux, ``*.stkagent`` for SuperTuxKart) are
+    used, so each case replays its own recordings.
     """
     rec_dir = recordings_dir(game, branch)
     if not rec_dir.exists():
         return []
-    return sorted(rec_dir.glob("*.rec"))
+    return sorted(rec_dir.glob(game.rec_glob))
 
 
 def frame_count(rec_path: Path) -> int:
     """Frames recorded in a tape, read from its ``frames <N>`` header line.
 
-    The v2 header is a few ``key value`` lines (level/bonus/pocket/coins/
-    tuxdolls/frames) before the per-frame data; v1 has the count on line 2.
-    Returns 0 if no count is found.
+    Both games write a ``key value`` header ending in a ``frames <N>`` line. For
+    SuperTux that's the per-frame count (v2: level/bonus/.../frames; v1: a bare
+    count on line 2). For SuperTuxKart (.stkagent v6) the header lists per-kart
+    tape sections, each opened by its own ``frames <N>``; every kart is captured
+    on the same World update so all counts are equal, so the FIRST one is the
+    replay length. Returns 0 if no count is found.
     """
     with open(rec_path, encoding="utf-8", errors="replace") as f:
         for _ in range(16):  # header is tiny; don't scan the whole tape

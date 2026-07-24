@@ -7,13 +7,16 @@ lives on `base`. This script brings each branch up to date by rebasing it onto
 `base` (replaying the branch's mutation commits on top of base's new
 instrumentation).
 
-    python prepare_branches.py             # every branch of the (single) game
+    python prepare_branches.py             # every branch of every game
     python prepare_branches.py --game "Super Tux"   # a specific game's branches
     python prepare_branches.py --branch X  # just one branch
     python prepare_branches.py --dry-run   # report status only, no rebase
 
-With a multi-game dataset, ``--game`` selects which game's repo/base to reconcile
-against (defaults to the only registered game when there is exactly one).
+With a multi-game dataset, ``--game`` selects a single game's repo/base to
+reconcile against; with no ``--game`` every registered game is processed in turn,
+each against its own repo/base. Each game's working tree is checked (and, for a
+real run, its HEAD restored) independently, so a dirty tree in one game only skips
+that game — the others still run.
 
 Because the instrumentation diverged hard (each branch deletes `event_log_server`
 and adds `game_state_sender`), CONFLICTS ARE EXPECTED on most branches. On a
@@ -111,11 +114,59 @@ def reconcile(branch: str, dry_run: bool) -> str:
     return "NEEDS-MANUAL"
 
 
-def main(argv: list[str]) -> int:
+def dataset_branches(game: config.Game) -> list[str]:
+    """Unique dataset branches belonging to ``game``, in dataset order."""
+    seen, branches = set(), []
+    for c in read_cases():
+        try:
+            if config.get_game(c.game).name != game.name:
+                continue
+        except config.UnknownGameError:
+            continue
+        if c.branch not in seen:
+            seen.add(c.branch)
+            branches.append(c.branch)
+    return branches
+
+
+def process_game(game: config.Game, branch: str | None, dry_run: bool) -> dict[str, str]:
+    """Reconcile one game's branches against its base, returning per-branch outcomes.
+
+    Sets the module-global ``GAME`` (git() / reconcile() operate on it) for the
+    duration, checks the game's own working tree, and restores its starting HEAD.
+    A dirty tree skips the game (empty outcomes) rather than raising, so a
+    multi-game run keeps going.
+    """
     global GAME
+    GAME = game
+
+    print(f"\n=== {game.name}  ({game.repo_dir}) ===")
+    if not dry_run and not is_clean():
+        print(f"  SKIP: working tree is dirty — commit or stash first.",
+              file=sys.stderr)
+        return {}
+
+    branches = [branch] if branch else dataset_branches(game)
+    if not branches:
+        print("  (no branches to process)")
+        return {}
+
+    start = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    outcomes: dict[str, str] = {}
+    try:
+        for b in branches:
+            status = reconcile(b, dry_run)
+            outcomes[b] = status
+            print(f"  {b:<45} {status}")
+    finally:
+        git("checkout", start or game.base_branch)
+    return outcomes
+
+
+def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Reconcile dataset branches with base")
     ap.add_argument("--game", default=None,
-                    help="which game's repo/base to reconcile (default: the only "
+                    help="which game's repo/base to reconcile (default: every "
                          "registered game)")
     ap.add_argument("--branch", help="only process this branch")
     ap.add_argument("--dry-run", action="store_true",
@@ -123,43 +174,24 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     if args.game is not None:
-        GAME = config.get_game(args.game)
-    elif len(config.GAMES) == 1:
-        GAME = next(iter(config.GAMES.values()))
+        games = [config.get_game(args.game)]
     else:
-        print(f"ABORT: multiple games registered {sorted(config.GAMES)}; "
-              "pass --game to pick one.", file=sys.stderr)
-        return 2
+        games = list(config.GAMES.values())
 
-    if not args.dry_run and not is_clean():
-        print(f"ABORT: {GAME.name} working tree is dirty — commit or stash first.",
-              file=sys.stderr)
-        return 2
+    # A bare --branch with several games can't tell which repo it lives in; route
+    # it to the games whose dataset actually lists it (skip the rest silently).
+    if args.branch and args.game is None and len(games) > 1:
+        games = [g for g in games if args.branch in dataset_branches(g)]
+        if not games:
+            print(f"ABORT: no registered game has a dataset branch {args.branch!r}; "
+                  "pass --game to target a repo directly.", file=sys.stderr)
+            return 2
 
-    if args.branch:
-        branches = [args.branch]
-    else:
-        # Unique branches for this game, preserving dataset order.
-        seen, branches = set(), []
-        for c in read_cases():
-            try:
-                if config.get_game(c.game).name != GAME.name:
-                    continue
-            except config.UnknownGameError:
-                continue
-            if c.branch not in seen:
-                seen.add(c.branch)
-                branches.append(c.branch)
-
-    start = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    # Per-game outcomes, keyed "<game>/<branch>" so same-named branches don't clash.
     outcomes: dict[str, str] = {}
-    try:
-        for b in branches:
-            status = reconcile(b, args.dry_run)
-            outcomes[b] = status
-            print(f"  {b:<45} {status}")
-    finally:
-        git("checkout", start or GAME.base_branch)
+    for game in games:
+        for b, status in process_game(game, args.branch, args.dry_run).items():
+            outcomes[f"{game.name}/{b}"] = status
 
     print("\nSummary:")
     counts: dict[str, int] = {}

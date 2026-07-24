@@ -121,8 +121,7 @@ def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
     """
     before = {d.name for d in gamerv.run_dirs()}
     t_launch = time.time()
-    proc = repo.launch(game, [game.replay_flag, str(rec),
-                              game.replay_delay_flag, str(game.replay_delay)])
+    proc = repo.launch(game, game.replay_args(str(rec)))
     log = None
     ok = False
     try:
@@ -132,8 +131,10 @@ def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
             print("    [warn] gamerv log did not start (window/portal?) — skipping tape")
             return None
 
-        # The in-game replay fires replay_delay seconds after launch. If attaching
-        # took longer than that, the earliest replay events were cleared away.
+        # The replay's events start ~replay_delay seconds after launch (SuperTux
+        # waits exactly that long via --replay-delay; SuperTuxKart has no such flag,
+        # so it's the estimated track-load + countdown latency). If attaching took
+        # longer than that, the earliest replay events were cleared away.
         elapsed = time.time() - t_launch
         if elapsed > game.replay_delay:
             print(f"    [warn] logging attached after {elapsed:.1f}s "
@@ -277,7 +278,11 @@ def run_case(case: TestCase, manual_auto: bool = False,
 
     # Baseline-contrast rows record on base + mutant (step 5 builds both in turn),
     # so step 2 only verifies the tree is clean and defers the build to step 5.
-    baseline_contrast = case.branch in game.baseline_contrast_branches
+    # The choice is per-row: the dataset's "Positive Source" column (base -> the
+    # good states come from base) drives it, OR'd with the game-level always-on
+    # set so an all-branches mutation configured in config.py still qualifies.
+    baseline_contrast = (case.baseline_contrast
+                         or case.branch in game.baseline_contrast_branches)
 
     try:
         # Preflight: gamerv must have a catalog bundle for this game, or it would

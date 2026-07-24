@@ -98,14 +98,62 @@ class Game:
     # Build-dir-relative files to snapshot in the build cache (binary + any
     # build-local shared libs it loads at runtime).
     cache_artifacts: tuple[str, ...]
-    rec_dir: Path                               # root of the .rec replay tapes
+    rec_dir: Path                               # root of the replay tapes
+    rec_glob: str                               # tape filename glob (e.g. "*.rec")
     launch_args: tuple[str, ...]                # args added to every game launch
     replay_flag: str                            # CLI flag naming the tape to replay
-    replay_delay_flag: str                      # CLI flag for the pre-replay delay
-    replay_delay: float                         # seconds the game waits before replay
+    # How the flag carries the tape path: False -> two args "<flag> <path>"
+    # (SuperTux --replay foo.rec); True -> one joined arg "<flag>=<path>"
+    # (SuperTuxKart --agent-replay=foo.stkagent).
+    replay_flag_joins_value: bool
+    # CLI flag for the pre-replay delay, or None if the game has no such flag
+    # (SuperTuxKart boots straight into the race; nothing tells it to wait).
+    replay_delay_flag: str | None
+    replay_delay: float                         # seconds until the replay's events start
     replay_margin: float                        # extra wait after a replay's duration
     seconds_per_step: float                     # wall-clock seconds per logical frame
     baseline_contrast_branches: frozenset[str]  # always-on mutations (record on base+mutant)
+    # Extra fixed args appended after the replay flag on every replay launch, for
+    # games that need one. Witch Blast's replay obeys a per-run frame budget
+    # (``--frames N``, default 600) and self-closes when it is spent, which would
+    # truncate any tape longer than the budget — so we pass a budget larger than
+    # any tape and let the tape-exhausted check end the replay instead. Empty for
+    # SuperTux / SuperTuxKart, whose replays run the whole tape unconditionally.
+    replay_extra_args: tuple[str, ...] = ()
+    # CLI flag that turns ON closed-loop drift correction during replay (snap the
+    # kart back onto the recorded transform when it diverges), or None if the game
+    # has no such knob. Correction is OFF game-side by default; the pipeline
+    # appends this flag only for rows whose dataset "Replay Correct" cell asks for
+    # it (see TestCase.correct_drift). SuperTuxKart: "--agent-replay-correct".
+    # SuperTux / Witch Blast: None — their replays are already pure input playback
+    # with no drift snap-back, so a build's physics is always free to diverge.
+    replay_correct_flag: str | None = None
+
+    def replay_args(self, rec_path: str, correct_drift: bool = False) -> list[str]:
+        """CLI args appended to a launch so it replays the tape at ``rec_path``.
+
+        Encodes the per-game differences in "how to call a replay": whether the
+        flag joins its value with ``=`` (SuperTuxKart's ``--agent-replay=<f>``) or
+        takes it as a separate arg (SuperTux's ``--replay <f>``); whether a
+        pre-replay delay flag exists at all (SuperTux passes ``--replay-delay <s>``;
+        SuperTuxKart/Witch Blast have no such flag, so ``replay_delay`` is only the
+        controller's estimate of the launch->first-event latency for the stop-timer
+        math); and any fixed trailing args the game needs (``replay_extra_args``).
+
+        ``correct_drift`` (from the row's TestCase) requests drift correction; it
+        only adds an arg when the game actually has a ``replay_correct_flag``, so a
+        row can safely ask for it on a game that has no such knob (it's a no-op).
+        """
+        if self.replay_flag_joins_value:
+            args = [f"{self.replay_flag}={rec_path}"]
+        else:
+            args = [self.replay_flag, rec_path]
+        if self.replay_delay_flag is not None:
+            args += [self.replay_delay_flag, str(self.replay_delay)]
+        args += list(self.replay_extra_args)
+        if correct_drift and self.replay_correct_flag is not None:
+            args.append(self.replay_correct_flag)
+        return args
 
 
 def _supertux() -> Game:
@@ -131,6 +179,7 @@ def _supertux() -> Game:
         # is a system lib). Anything missing at store time is skipped.
         cache_artifacts=("supertux2", "external/simplesquirrel/libsimplesquirrel.so"),
         rec_dir=Path.home() / ".local" / "share" / "supertux2",
+        rec_glob="*.rec",
         # WINDOWED, deliberately NOT --fullscreen: with a fullscreen surface,
         # GNOME/mutter direct-scans-it-out and stops feeding the PipeWire *monitor*
         # screencast gamerv records — capture then measures ~0.09 fps, the event
@@ -139,11 +188,12 @@ def _supertux() -> Game:
         # keeps mutter compositing so the screencast gets ~30 fps.
         launch_args=("--window",),
         replay_flag="--replay",
+        replay_flag_joins_value=False,       # "--replay <rec>" (separate args)
         replay_delay_flag="--replay-delay",
         # Must comfortably exceed window-appear + gamerv attach + event CLEAR, or
         # the CLEAR lands mid-replay and clips early events. The FIRST tape of a
         # run can take ~8-9s to attach; later tapes are sub-second.
-        replay_delay=12.0,
+        replay_delay=6.0,
         replay_margin=4.0,
         # constants.hpp LOGICAL_FPS = 1000/15, i.e. a fixed 15 ms logical step, so
         # a tape of N frames replays in N * 0.015 s.
@@ -157,9 +207,147 @@ def _supertux() -> Game:
     )
 
 
+def _supertuxkart() -> Game:
+    repo = Path("/home/sebastiao/stk/stk-code")
+    build = repo / "cmake_build"
+    return Game(
+        name="Super Tux Kart",
+        repo_dir=repo,
+        build_dir=build,
+        # CMAKE_RUNTIME_OUTPUT_DIRECTORY puts the binary under cmake_build/bin/.
+        binary=build / "bin" / "supertuxkart",
+        # TBD: STK currently has only `master`. The event-log-server instrumentation
+        # and the launch-time replay hook (mirroring SuperTux) will live on a `base`
+        # branch the user creates; the pipeline builds/records against it.
+        base_branch="base",
+        # Same two-step cmake configure+build as SuperTux. Re-running configure every
+        # build re-globs the checked-out tree (harmless if STK uses explicit source
+        # lists; safe if it does file(GLOB) like SuperTux).
+        build_commands=(
+            ("cmake", "-S", str(repo), "-B", str(build)),
+            ("cmake", "--build", str(build), f"-j{BUILD_JOBS}"),
+        ),
+        # Just the binary: ldd shows supertuxkart links only system libs (no
+        # build-local .so to snapshot, unlike SuperTux's libsimplesquirrel.so).
+        cache_artifacts=("bin/supertuxkart",),
+        # STK saves agent tapes under file_manager->getReplayDir() =
+        # ~/.local/share/supertuxkart/replay/ (gameplay_recorder.cpp). We point
+        # rec_dir at that replay/ dir so the per-branch tape folder is
+        # replay/<branch>/, mirroring SuperTux's layout. Tapes are *.stkagent
+        # (not *.rec) but still carry a `frames <N>` header line, so recordings.py
+        # reads their length unchanged (its glob comes from rec_glob).
+        rec_dir=Path.home() / ".local" / "share" / "supertuxkart" / "replay",
+        rec_glob="*.stkagent",
+        # STK -w/--windowed (main.cpp). Windowed for the same reason as SuperTux: a
+        # fullscreen surface makes GNOME/mutter direct-scan-out and starve gamerv's
+        # PipeWire *monitor* screencast; a composited window keeps ~30 fps capture.
+        launch_args=("--windowed",),
+        # STK's replay flag joins its value with '=' and takes a bare filename or
+        # full path (agent_config.cpp loadReplay resolves it, falling back to the
+        # replay dir): --agent-replay=<file>. It boots straight into the recorded
+        # race (main.cpp sets m_no_start_screen) — there is NO delay flag, so
+        # replay_delay_flag is None and replay_delay below is only the controller's
+        # stop-timer estimate of how long track-load + the race countdown take
+        # before the replay's events begin.
+        replay_flag="--agent-replay",
+        replay_flag_joins_value=True,
+        replay_delay_flag=None,
+        # STK has no --replay-delay to make the game wait for gamerv to attach; the
+        # natural launch->race-start latency (track load + "Ready/Set/Go" countdown)
+        # is what covers the attach. This value only drives the stop-timer math
+        # (finish_at = launch + replay_delay + replay_dur + margin) and the
+        # "attached late" warning; tune it if early race events get clipped.
+        replay_delay=5.0,
+        replay_margin=2.0,
+        # STK physics runs at a fixed 120 fps (stk_config.xml <physics fps="120">),
+        # and World::updateWorld captures one agent frame per physics update for
+        # every kart, so a tape of N frames (per kart; all karts share the same
+        # count) replays in N/120 s. Confirmed against real .stkagent tapes
+        # (24118 frames = ~201 s for a 3-lap cornfield race).
+        seconds_per_step=1.0 / 120.0,
+        # None yet: no always-on (baseline-contrast) mutations for STK so far.
+        baseline_contrast_branches=frozenset(),
+        # STK's replay snaps a drifting kart back onto the recorded transform; that
+        # correction masks any physics divergence between base and mutant (a fixed
+        # wall collision the tape recorded going through, etc.), so it is OFF by
+        # default. A row that needs the recorded trajectory reproduced exactly can
+        # re-enable it via the dataset "Replay Correct" column, which appends this.
+        replay_correct_flag="--agent-replay-correct",
+    )
+
+
+def _witchblast() -> Game:
+    repo = Path("/home/sebastiao/witchblast")
+    return Game(
+        name="Witch Blast",
+        repo_dir=repo,
+        # Witch Blast builds IN-SOURCE: CMakeCache.txt / Makefile / CMakeFiles/
+        # and the binary all land in the repo root (RUNTIME_OUTPUT_DIRECTORY =
+        # CMAKE_CURRENT_BINARY_DIR = the source dir). So build_dir == repo_dir.
+        # All build artifacts are gitignored, so this does not dirty the tree.
+        build_dir=repo,
+        binary=repo / "Witch_Blast",
+        # The event-log-server + agent (record/replay) instrumentation lives on a
+        # `base` branch (mirroring SuperTux), which mutant branches rebase onto.
+        base_branch="base",
+        # Same two-step cmake configure+build as SuperTux, and the configure step
+        # matters for the same reason: CMakeLists gathers sources with
+        # file(GLOB_RECURSE) and no CONFIGURE_DEPENDS, so a branch switch that
+        # adds/removes .cpp files needs a re-glob or the stale build links wrong.
+        # -S and -B are both the repo (in-source build).
+        build_commands=(
+            ("cmake", "-S", str(repo), "-B", str(repo)),
+            ("cmake", "--build", str(repo), f"-j{BUILD_JOBS}"),
+        ),
+        # Just the binary: ldd shows Witch_Blast links only system libs (SFML,
+        # libstdc++, …) — no build-local .so to snapshot.
+        cache_artifacts=("Witch_Blast",),
+        # Tapes are saved under agent::userDataDir() = the XDG data dir,
+        # ~/.local/share/WitchBlast/ (user_dir.cpp), as NAME.rec. Per-branch tapes
+        # go in a <branch>/ subfolder, mirroring the other games.
+        rec_dir=Path.home() / ".local" / "share" / "WitchBlast",
+        rec_glob="*.rec",
+        # No windowing flag: Witch Blast reads fullscreen from config.dat in its
+        # cwd (the repo root), where it is currently `fullscreen 0` (windowed).
+        # Windowed is required for the same reason as SuperTux/STK — a fullscreen
+        # surface makes mutter direct-scan-out and starve gamerv's PipeWire
+        # *monitor* screencast. Keep config.dat's `fullscreen 0`.
+        launch_args=(),
+        # Witch Blast replays a tape with `--replay <name-or-path>` (main.cpp;
+        # separate args, not joined). It resolves a bare name against the data dir
+        # or takes a full path, so we pass the tape's full path.
+        replay_flag="--replay",
+        replay_flag_joins_value=False,
+        # Like SuperTux, Witch Blast honours --replay-delay <s>: the replay boots
+        # straight into gameplay and fires its first events (enter-level, first
+        # room) the instant it is set up, so the game holds a blank window for this
+        # long first, letting gamerv attach and CLEAR the event channel before the
+        # replay begins (main.cpp --replay-delay -> setReplayDelay -> the pre-roll
+        # loop in startGame). The same value is the controller's stop-timer offset
+        # (finish_at = launch + replay_delay + replay_dur + replay_margin). Must
+        # comfortably exceed window-appear + gamerv attach + CLEAR; the first tape
+        # of a run can take ~8-9 s to attach, later tapes are sub-second.
+        replay_delay_flag="--replay-delay",
+        replay_delay=6.0,
+        replay_margin=4.0,
+        # The simulation runs a fixed logical timestep of 1/60 s
+        # (agent/determinism.hpp FIXED_DT = 1/60, LOGICAL_FPS = 60), one tape frame
+        # per step, so a tape of N frames replays in N/60 s.
+        seconds_per_step=1.0 / 60.0,
+        # No always-on (baseline-contrast) mutations for Witch Blast so far.
+        baseline_contrast_branches=frozenset(),
+        # Witch Blast's replay honours a `--frames N` budget (default 600) and
+        # self-closes when it is spent; a real tape can be longer (e.g. demo.rec is
+        # 1200 frames = 20 s), which the 600 budget would cut in half. Pass a
+        # budget larger than any tape so the tape-exhausted check ends the replay
+        # instead. (SuperTux/STK have no such budget, so they leave this empty.)
+        replay_extra_args=("--frames", "1000000"),
+    )
+
+
 # The game roster. Append a Game here to support a new game; its ``name`` must
 # match its gamerv config/games/<name> folder.
-_GAMES: tuple[Game, ...] = (_supertux(),)
+_GAMES: tuple[Game, ...] = (_supertux(), _supertuxkart(), _witchblast())
 GAMES: dict[str, Game] = {g.name: g for g in _GAMES}
 _GAMES_BY_KEY: dict[str, Game] = {g.name.strip().casefold(): g for g in _GAMES}
 
