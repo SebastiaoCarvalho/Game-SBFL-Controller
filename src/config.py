@@ -128,6 +128,12 @@ class Game:
     # SuperTux / Witch Blast: None — their replays are already pure input playback
     # with no drift snap-back, so a build's physics is always free to diverge.
     replay_correct_flag: str | None = None
+    # How long SIGTERM is given to end the game before we SIGKILL it. The default
+    # suits a game that just closes a window; raise it for one that has real work
+    # to do on the way out. FreeMiner flushes its world (a LevelDB map database)
+    # to disk over several seconds — killing it mid-write risks corrupting the
+    # very world every tape replays in.
+    shutdown_grace: float = 5.0
 
     def replay_args(self, rec_path: str, correct_drift: bool = False) -> list[str]:
         """CLI args appended to a launch so it replays the tape at ``rec_path``.
@@ -345,9 +351,156 @@ def _witchblast() -> Game:
     )
 
 
+def _asteroids() -> Game:
+    repo = Path("/home/sebastiao/asteroids")
+    build = repo / "build"
+    return Game(
+        name="Asteroids",
+        repo_dir=repo,
+        build_dir=build,
+        # Asteroids is a browser game — there is nothing to compile. The "binary"
+        # is a generated launcher (build/asteroids-run) that boots the bridge
+        # (predicates/bridge.py: serves the files + owns the UDP event channel) and
+        # a visible Chrome window on the game, then holds both alive until the
+        # controller SIGTERMs it. See agent/gamerv_launch.py.
+        binary=build / "asteroids-run",
+        # The event-log bridge, the agent (record/replay), the ?replay= auto-start
+        # hook and this launcher all live on `base`; mutant branches rebase onto it.
+        base_branch="base",
+        # No compile step: agent/build_launcher.sh just (re)generates
+        # build/asteroids-run, stamping it with the current source tree hash. That
+        # stamp is the whole point — the log cache keys on file_sha(binary), and a
+        # game that never compiles would otherwise hand it a constant hash that is
+        # blind to game.js edits (→ risk of restoring another revision's logs). The
+        # stamp gives the launcher a hash that tracks the game source, exactly like
+        # a compiled binary does for the other games. Re-run every build (cheap).
+        build_commands=(
+            ("bash", "agent/build_launcher.sh"),
+        ),
+        # The generated launcher is the only artifact to snapshot (it execs the
+        # committed agent/gamerv_launch.py, which the checked-out tree supplies).
+        cache_artifacts=("asteroids-run",),
+        # Tapes live outside the repo (mirroring the native games' data dirs), one
+        # subfolder per branch: ~/.local/share/asteroids/<branch>/*.demo.txt. The
+        # launcher copies the requested tape under the bridge's served root so the
+        # page can fetch it; the controller never needs it web-reachable itself.
+        rec_dir=Path.home() / ".local" / "share" / "asteroids",
+        rec_glob="*.demo.txt",
+        # No launch args: all browser flags (app window, throwaway profile, windowed
+        # — never fullscreen/kiosk, which starves GNOME's monitor screencast the
+        # same way it does the native games) are baked into the launcher.
+        launch_args=(),
+        # The launcher takes the tape as `--replay <path>` (separate args) and
+        # republishes it to the page as a URL parameter.
+        replay_flag="--replay",
+        replay_flag_joins_value=False,
+        # The launcher accepts `--replay-delay <s>` for parity but ignores it: the
+        # page starts the replay off GameRV's CLEAR (its "attached, channel reset"
+        # signal), not a fixed in-game pre-roll, so there is nothing to make the
+        # game wait for. This value is purely the controller's stop-timer estimate
+        # of launch → browser-up → gamerv-attach → CLEAR latency (finish_at =
+        # launch + replay_delay + replay_dur + replay_margin) and the "attached
+        # late" warning. The first tape's cold Chrome start pushes attach out, so
+        # keep it generous.
+        replay_delay_flag="--replay-delay",
+        replay_delay=12.0,
+        replay_margin=6.0,
+        # determinism.js fixes a 16 ms virtual step (DEFAULT_STEP_MS = 16; the tape
+        # header records `step 16`), one tape frame per step, so a tape of N frames
+        # replays in N * 0.016 s.
+        seconds_per_step=16.0 / 1000.0,
+        # No always-on (baseline-contrast) mutations for Asteroids so far.
+        baseline_contrast_branches=frozenset(),
+    )
+
+
+def _freeminer() -> Game:
+    repo = Path("/home/sebastiao/freeminer")
+    build = repo / "build"
+    return Game(
+        name="FreeMiner",
+        repo_dir=repo,
+        build_dir=build,
+        binary=build / "freeminer",
+        # The GameRV event-log server (src/client/predicates/), the record/replay
+        # agent (src/client/agent/) and the --replay-delay / --gamerv launch hooks
+        # all live on `base`; mutant branches rebase onto it.
+        base_branch="base",
+        # Same two-step cmake configure+build as the other native games. Unlike
+        # SuperTux, FreeMiner lists its sources explicitly (only *headers* are
+        # globbed), so a branch switch cannot silently drop a .cpp — but the
+        # configure is re-run anyway: it is cheap next to the compile and keeps
+        # a branch that does touch a CMakeLists honest.
+        build_commands=(
+            ("cmake", "-S", str(repo), "-B", str(build)),
+            ("cmake", "--build", str(build), f"-j{BUILD_JOBS}"),
+        ),
+        # Just the binary: ldd shows freeminer links only system libs (its
+        # in-tree deps — irrlicht, luajit, … — are static).
+        cache_artifacts=("freeminer",),
+        # Tapes live outside the repo (the game's own default record path is
+        # <repo>/records/, which we deliberately do not use — the controller
+        # aborts on a dirty tree). One subfolder per branch, as everywhere else:
+        # ~/.local/share/freeminer/<branch>/*.fmdemo. The .fmact action script
+        # the recorder writes next to each tape is ignored by rec_glob.
+        rec_dir=Path.home() / ".local" / "share" / "freeminer",
+        rec_glob="*.fmdemo",
+        # --go skips the main menu and --worldname picks the world the tapes were
+        # recorded in. That pair is what makes the world path the game computes
+        # (porting::path_user + "/worlds/<name>") byte-identical to the one in the
+        # tape header — AgentRuntime::restoreStartState refuses a tape recorded in
+        # a different world, comparing the two paths as strings.
+        #
+        # --gamerv turns the UDP event responder on for this run only (the
+        # gamerv_event_log setting is off by default, so without it the game
+        # answers nothing and every trace comes back empty).
+        #
+        # No fullscreen flag: windowed, for the same reason as every other game
+        # here — a fullscreen surface makes GNOME/mutter direct-scan-out and
+        # starve gamerv's PipeWire *monitor* screencast.
+        launch_args=("--go", "--worldname", "main", "--gamerv"),
+        replay_flag="--replay",
+        replay_flag_joins_value=False,       # "--replay <tape>" (separate args)
+        # FreeMiner honours --replay-delay <s>, but not as a plain sleep: it holds
+        # the autostarted tape until gamerv's CLEAR lands (the "attached, channel
+        # reset" signal) plus a 1 s settle, and only falls back to the flat delay
+        # if no CLEAR arrives — the Asteroids trigger rather than the SuperTux
+        # pre-roll. It has to be that way here because the wait starts when the
+        # WORLD is up, and how long the map/media load takes varies far too much
+        # to cover with a fixed number.
+        replay_delay_flag="--replay-delay",
+        # The controller's own stop-timer offset (finish_at = launch +
+        # replay_delay + replay_dur + replay_margin) and its "attached late"
+        # warning threshold: launch → world up → gamerv attach → CLEAR.
+        replay_delay=15.0,
+        replay_margin=10.0,
+        # Unlike the other games FreeMiner has NO fixed logical timestep: it
+        # renders as fast as it can and a tape stores each frame's real dtime, so
+        # a replay of N frames takes N / (frames per second actually achieved)
+        # seconds of wall clock — the recorded dtimes set how far the simulation
+        # moves, not how long that takes. This value is therefore a conservative
+        # floor of ~20 fps rather than a physical constant (a real tape recorded
+        # ~29 fps: 557 frames over 19.2 s of recorded dtime). Over-waiting is
+        # safe — the game freezes itself when the tape runs out, so the extra
+        # seconds add frozen frames, not events — whereas under-waiting truncates
+        # the trace, since a game that never exits gives the poll loop nothing to
+        # stop early on.
+        seconds_per_step=1.0 / 20.0,
+        # No always-on (baseline-contrast) mutations for FreeMiner so far.
+        baseline_contrast_branches=frozenset(),
+        # On SIGTERM the client disconnects, the embedded server shuts down and
+        # the world's LevelDB map database is flushed — measured at ~5-8 s, i.e.
+        # right at the default grace. A SIGKILL landing in the middle of that
+        # write can corrupt worlds/main, and every tape refuses to replay in any
+        # other world, so give it room.
+        shutdown_grace=25.0,
+    )
+
+
 # The game roster. Append a Game here to support a new game; its ``name`` must
 # match its gamerv config/games/<name> folder.
-_GAMES: tuple[Game, ...] = (_supertux(), _supertuxkart(), _witchblast())
+_GAMES: tuple[Game, ...] = (_supertux(), _supertuxkart(), _witchblast(),
+                            _asteroids(), _freeminer())
 GAMES: dict[str, Game] = {g.name: g for g in _GAMES}
 _GAMES_BY_KEY: dict[str, Game] = {g.name.strip().casefold(): g for g in _GAMES}
 

@@ -148,7 +148,12 @@ def launch(game: Game, extra_args: list[str] | None = None) -> subprocess.Popen:
 
 
 def shutdown(proc: subprocess.Popen | None, grace: float = 5.0) -> None:
-    """Terminate the game process, escalating to kill if it ignores SIGTERM."""
+    """Terminate the game process, escalating to kill if it ignores SIGTERM.
+
+    ``grace`` normally comes from the row's ``Game.shutdown_grace``: a game that
+    saves state on the way out (FreeMiner writes its world back to disk) needs
+    more of it than one that just closes a window.
+    """
     if proc is None or proc.poll() is not None:
         return
     proc.terminate()

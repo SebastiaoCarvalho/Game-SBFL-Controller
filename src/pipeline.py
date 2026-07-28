@@ -154,7 +154,7 @@ def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
     finally:
         if log is not None:
             gamerv.stop_log(log)   # 1.3 stop logging (1.4: not validated here)
-        repo.shutdown(proc)
+        repo.shutdown(proc, grace=game.shutdown_grace)
 
     if not ok:
         return None
