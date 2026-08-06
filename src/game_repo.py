@@ -14,6 +14,7 @@ import time
 
 import buildcache
 import config
+import instrument
 from config import Game
 
 
@@ -83,18 +84,32 @@ def return_to_base(game: Game) -> None:
     _git(game, "checkout", game.base_branch)
 
 
-def build(game: Game) -> None:
+def build(game: Game, instrument_source: bool = True) -> None:
     """Build the game, restoring a cached binary when the source is unchanged.
 
+    Step 2a runs first: unless the game opts out (``Game.instrument_src is None``)
+    or the caller passes ``instrument_source=False``, gamerv's source instrumenter
+    writes the local-variable reporting calls into the checked-out tree, the build
+    compiles *that*, and the edit is reverted immediately afterwards — pass or
+    fail — so the repo is clean again for the next checkout. See instrument.py.
+
     The build cache is keyed by the HEAD tree hash (an exact content key for the
-    checked-out source — see head_tree_hash / buildcache.py). On a hit the cached
-    binary is restored into the build dir and the expensive configure+build is
-    skipped; on a miss (or a corrupt slot) we build for real and snapshot the
-    result. The cache lives inside build() so every call site benefits — the normal
-    step-2 build and both builds of a baseline-contrast row.
+    checked-out source — see head_tree_hash / buildcache.py) **plus the digest of
+    the pending instrumentation**, since the instrumented bytes are what actually
+    get compiled and they do not move the tree hash. On a hit the cached binary is
+    restored into the build dir and both the instrumentation and the expensive
+    configure+build are skipped; on a miss (or a corrupt slot) we build for real
+    and snapshot the result. The cache lives inside build() so every call site
+    benefits — the normal step-2 build and both builds of a baseline-contrast row.
     """
     branch = current_branch(game)
+    pending = (instrument.plan(game)
+               if instrument_source and instrument.enabled(game) else None)
     key = head_tree_hash(game)
+    if pending is not None:
+        print(f"  [instrument] plan: {len(pending.keys)} key(s) across "
+              f"{pending.files} file(s)  (digest {pending.digest})")
+        key = f"{key}+i{pending.digest}"
     if buildcache.has(game, branch, key) and buildcache.restore(game, branch):
         print("  [build-cache] hit — restoring binary, skipping build")
         if game.binary.exists():
@@ -102,7 +117,11 @@ def build(game: Game) -> None:
         print("  [build-cache] restored slot incomplete — rebuilding")
     print("  [build-cache] miss — building")
     buildcache.invalidate(game, branch)
-    _configure_and_build(game)
+    if pending is None:
+        _configure_and_build(game)
+    else:
+        with instrument.applied(game, pending):
+            _configure_and_build(game)
     buildcache.store(game, branch, key)
 
 

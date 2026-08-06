@@ -37,10 +37,45 @@ HINTS_DIR = CONTROLLER_DIR / "hints"
 LOG_CACHE_DIR = CONTROLLER_DIR / "log_cache"
 # Content-addressed cache of built binaries, one slot per game+branch:
 # build_cache/<game>/<branch>/ holds the game binary + its build-local .so plus
-# meta.json (the HEAD tree hash). A matching tree hash lets game_repo.build() skip
-# the cmake configure+build and restore the binary; a source change → different
-# tree hash → miss → rebuild. See buildcache.py.
+# meta.json (the HEAD tree hash + the pending instrumentation's digest). A matching
+# key lets game_repo.build() skip the cmake configure+build and restore the binary;
+# a source change → different tree hash → miss → rebuild. See buildcache.py.
 BUILD_CACHE_DIR = CONTROLLER_DIR / "build_cache"
+
+# --- Source instrumentation (step 2a) -------------------------------------
+# Before compiling a branch, the controller runs gamerv's source instrumenter
+# (runners.source_instrument) over the game's source so the build reports its
+# function-local variables — fault localization can only refine over variables the
+# snapshot carries. The edit is transient: instrument → build → revert, all inside
+# game_repo.build(). See instrument.py.
+#
+# Master switch for the step; per game it also needs Game.instrument_src set (a
+# game with no instrumentation spec in gamerv leaves it None and is unaffected).
+# Overridable per run with --no-instrument.
+INSTRUMENT = True
+# Scratch dir for the instrumenter's manifests (one per game, alive only for the
+# duration of one build). It lives here rather than in the game repo because the
+# tool's default — <game-root>/.gamerv/ — would show up as an untracked directory
+# in `git status` and trip game_repo.ensure_clean.
+INSTRUMENT_DIR = CONTROLLER_DIR / "instrument"
+# libclang's own builtin headers (stddef.h, stdarg.h, the intrinsics …) — what
+# clang's -resource-dir names, passed to the instrumenter as $CLANG_RESOURCE_DIR.
+#
+# This is NOT optional. The libclang the tool loads is the PyPI `libclang` wheel,
+# which ships the .so and no headers at all, and this machine has no clang
+# install to fall back on. Without them every parse dies on the first
+# `#include <cstddef>`, and the failure is SILENT AND PARTIAL: the tool still
+# emits a plausible-looking set of keys, but every candidate is downgraded to
+# low-confidence and semantic detail as basic as "does this local have an
+# initializer" is lost — which is what hid `collision_static_constrains::movement`
+# (dataset row 1's whole refinement) from the snapshot. instrument.py therefore
+# treats a missing directory as a hard error rather than parsing degraded.
+#
+# Populated from Ubuntu's clang headers, matching the wheel's libclang 18:
+#   apt-get download libclang-common-18-dev        # no root needed
+#   dpkg-deb -x libclang-common-18-dev_*.deb x
+#   cp -r x/usr/lib/llvm-18/lib/clang/18 ~/.local/share/gamerv-clang/
+CLANG_RESOURCE_DIR = Path.home() / ".local" / "share" / "gamerv-clang" / "18"
 
 # --- Refinement decision path (step 8) -----------------------------------
 # How gamerv's compare_refinement decides whether phi is a valid refinement:
@@ -134,6 +169,19 @@ class Game:
     # to disk over several seconds — killing it mid-write risks corrupting the
     # very world every tape replays in.
     shutdown_grace: float = 5.0
+    # The source root gamerv's instrumenter rewrites before each build (step 2a),
+    # or None to skip the step for this game. Setting it needs BOTH: an
+    # instrumentation spec gamerv can resolve for the game (its
+    # config/games/<name>/source_instrument.json, or gamerv's built-in SuperTux
+    # default — whose scan_globs are SuperTux paths and mean nothing elsewhere),
+    # AND the reporting runtime (the REPORT_LOCAL macros) already present on the
+    # game's base branch, or the instrumented tree will not compile. See
+    # instrument.py.
+    instrument_src: Path | None = None
+    # Extra flags for that run, e.g. ("--max-keys-per-class", "8") to tighten the
+    # per-class key budget or ("--members",) to also report class members. Empty
+    # leaves every such choice to the game's spec.
+    instrument_extra_args: tuple[str, ...] = ()
 
     def replay_args(self, rec_path: str, correct_drift: bool = False) -> list[str]:
         """CLI args appended to a launch so it replays the tape at ``rec_path``.
@@ -176,8 +224,15 @@ def _supertux() -> Game:
         # so switching branches (mutations add/remove/rename .cpp files) silently
         # drops files from a stale glob. Re-configuring re-globs the checked-out
         # tree. See buildcache.py / the pipeline memory.
+        #
+        # CMAKE_EXPORT_COMPILE_COMMANDS keeps build/compile_commands.json current:
+        # the step-2a instrumenter parses the source with libclang and uses that
+        # database for each file's real compiler flags. Without it the parse falls
+        # back to the spec's synthesized flags, which resolve fewer types and so
+        # silently reject candidate variables.
         build_commands=(
-            ("cmake", "-S", str(repo), "-B", str(build)),
+            ("cmake", "-S", str(repo), "-B", str(build),
+             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"),
             ("cmake", "--build", str(build), f"-j{BUILD_JOBS}"),
         ),
         # The game binary plus the only build-local shared library it links at
@@ -210,6 +265,23 @@ def _supertux() -> Game:
         # base and the mutant into one logs/ dir; gamerv's cross-trace pool supplies
         # base's good states vs the mutant's violations. See pipeline.py.
         baseline_contrast_branches=frozenset({"change_music_config"}),
+        # Step 2a: gamerv's instrumenter rewrites this tree before every build so
+        # the binary reports its function-locals. SuperTux is the game it was
+        # written against — gamerv's built-in spec targets these paths
+        # (object/player.cpp, badguy/badguy.cpp, …) and the REPORT_LOCAL runtime
+        # already lives on `base` (supertux/game_object.hpp +
+        # predicates/local_report.hpp). The edit is reverted right after the
+        # compile; see instrument.py.
+        instrument_src=repo / "src",
+        # `--members` also reports *class members*, by extending each class's
+        # existing report_state override — not just function locals. Needed
+        # because a mutated flag is often a member: player_walk_on_water's
+        # m_wading is one, and without this the row's Target Phi names a field no
+        # trace carries. Which members are actually taken is scoped by the game's
+        # gamerv spec (config/games/Super Tux/source_instrument.json) — members
+        # outrank locals in the per-class key budget, so it vetoes all but the
+        # ones a row needs rather than letting them swap the locals out.
+        instrument_extra_args=("--members",),
     )
 
 
@@ -529,7 +601,8 @@ def get_game(name: str) -> Game:
 # binary directly skips activation, so we go through `conda activate` in a shell.
 CONDA_ENV = "gamerv"
 CONDA_SH = Path.home() / "miniconda3" / "etc" / "profile.d" / "conda.sh"
-GAMERV_WORKER = GAMERV_DIR / "src" / "gui" / "worker.py"
+GAMERV_SRC_DIR = GAMERV_DIR / "src"
+GAMERV_WORKER = GAMERV_SRC_DIR / "gui" / "worker.py"
 
 
 def gamerv_cmd(args: list[str]) -> list[str]:
@@ -558,5 +631,9 @@ GAMERV_GAME_ENV = "GAME"
 
 # --- Timeouts (seconds) ---------------------------------------------------
 BUILD_TIMEOUT = 60 * 30      # a clean cmake build can be slow
+# One source_instrument invocation (parse + select + emit + its libclang syntax
+# check). Seconds in practice for SuperTux; the ceiling is only there so a wedged
+# libclang fails the row instead of hanging the batch.
+INSTRUMENT_TIMEOUT = 60 * 15
 VALIDATE_TIMEOUT = 60 * 30   # gamerv validate fans out to LLM/DeepFace
 GAMERV_OP_TIMEOUT = 60 * 30

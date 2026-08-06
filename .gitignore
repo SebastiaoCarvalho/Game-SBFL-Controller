@@ -7,3 +7,4 @@ build_cache/
 hints/
 scripts/*.csv
 .properties_backup.json
+instrument/

@@ -9,6 +9,7 @@
     python run_experiment.py --row 4 --manual-auto   # replay cached manual answers
     python run_experiment.py --row 20 --refinement-mode symbolic --threshold-strategy weakest
     python run_experiment.py --row 20 --refinement-mode data-direct   # corroborate-only
+    python run_experiment.py --row 4 --no-instrument  # build the source as committed
 
 Backs up gamerv's properties.json for the duration and restores it at the end,
 writes results to results/results_<timestamp>.csv, and prints a summary table.
@@ -71,6 +72,13 @@ def main(argv: list[str]) -> int:
                          "midpoint of the violation->good gap, 'midpoints' = sampled "
                          "midpoints (search picks). Affects the symbolic path only. "
                          f"Default: {config.THRESHOLD_STRATEGY}.")
+    ap.add_argument("--no-instrument", dest="instrument", action="store_false",
+                    default=config.INSTRUMENT,
+                    help="skip step 2a: build each branch's source as committed "
+                         "instead of running gamerv's source instrumenter over it "
+                         "first. Fault localization then sees only the variables "
+                         "the game already reports (no function-locals). Games "
+                         "without an instrument_src are unaffected either way.")
     args = ap.parse_args(argv)
 
     cases = _select(read_cases(args.dataset), args.row, args.rows, args.game)
@@ -80,6 +88,8 @@ def main(argv: list[str]) -> int:
     print(f"Selected {len(cases)} case(s): rows {[c.row for c in cases]}")
     print(f"Refinement decision: mode={args.refinement_mode}  "
           f"threshold strategy={args.threshold_strategy}")
+    print(f"Source instrumentation (step 2a): "
+          f"{'on' if args.instrument else 'off'}")
 
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     gamerv.backup_properties()
@@ -93,7 +103,8 @@ def main(argv: list[str]) -> int:
             try:
                 res = run_case(case, manual_auto=args.manual_auto,
                                refinement_mode=args.refinement_mode,
-                               threshold_strategy=args.threshold_strategy)
+                               threshold_strategy=args.threshold_strategy,
+                               instrument_source=args.instrument)
             except DirtyTreeError as exc:
                 print(f"\nABORTING: {exc}", file=sys.stderr)
                 return 2

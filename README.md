@@ -25,6 +25,7 @@ that are not part of the pipeline itself live in `scripts/`.
 | `src/config.py` | Shared paths/constants **and** the per-game `Game` registry (`GAMES`, `get_game()`). |
 | `src/dataset.py` | Reads `dataset.csv` into `TestCase(game, specification, branch, phi)`. |
 | `src/game_repo.py` | git checkout, build, game launch/shutdown — each fn takes a `config.Game`. |
+| `src/instrument.py` | Step 2a: runs gamerv's source instrumenter over the branch before each compile, then reverts it. |
 | `src/gamerv.py` | Wrappers around gamerv's `worker.py` ops + logs/properties/active-game helpers. |
 | `src/manual_review.py` | Operator prompts for gamerv's manual visual/audio predicate values (step 6). |
 | `src/hints.py` | Caches the operator's manual answers per recording (`hints/`) so `--manual-auto` can replay them. |
@@ -62,8 +63,9 @@ branch name (e.g. `base`) without colliding.
 ## The 9 steps (`pipeline.run_case`)
 
 1. Read the dataset row (and resolve its `Game`).
-2. Checkout the branch and build (`game.build_commands`). The game is launched
-   per-tape in step 5, since the replay is triggered by a launch-time flag.
+2. Checkout the branch, **instrument its source (step 2a)**, and build
+   (`game.build_commands`). The game is launched per-tape in step 5, since the
+   replay is triggered by a launch-time flag.
 3. Set the spec (`G(<Specification>)`) as the **only** enabled gamerv property —
    guarded by `check_formula`, so an unaligned row fails loudly.
 4. Clear `gamerv/logs/`.
@@ -84,6 +86,58 @@ branch name (e.g. `base`) without colliding.
 Refinement mining is **generic** — gamerv auto-discovers candidate atoms from
 every logged variable. (The old per-row `Target Variables` "box-only" vocabulary
 and its `--use-target-variables` flag have been removed.)
+
+#### Step 2a — source instrumentation (local variables)
+
+Mining can only refine over variables the snapshot actually carries, and a
+function-local is invisible unless the source reports it. So **before every
+compile** the controller runs gamerv's source instrumenter over the checked-out
+tree (`runners.source_instrument`, gamerv branch `local_vars`): it parses the game
+with libclang, selects the locals worth reporting, and splices the `REPORT_LOCAL`
+calls in. The compiler then sees the instrumented source, and **the edit is
+reverted as soon as the build finishes** — pass or fail — so the repo is clean for
+the next checkout and the instrumentation never lands on a dataset branch.
+
+It lives inside `game_repo.build()` rather than beside it in `run_case`, because
+it has to wrap *every* compile: a baseline-contrast row builds twice (base and
+mutant, from step 5) and both must be instrumented identically or their traces
+would not share a vocabulary. Its cost shows up in the `build` phase timing.
+
+- **Per game, opt-in:** `Game.instrument_src` (the source root to rewrite);
+  `None` skips the step. On for **Super Tux** only today. A game can turn it on
+  once (a) gamerv resolves an instrumentation spec for it —
+  `config/games/<name>/source_instrument.json`, since gamerv's built-in default
+  spec scans SuperTux paths — and (b) its `base` carries the reporting runtime
+  (the `REPORT_LOCAL` macros), or the instrumented tree will not compile.
+  `Game.instrument_extra_args` passes extra flags (e.g.
+  `("--max-keys-per-class", "8")`).
+- **Container variables.** A local that is a `std::vector`, a `std::array` or a
+  C array is reported as one key whose value is a JSON array
+  (`REPORT_LOCAL_ARRAY`), which mining reads both whole and through paths into it
+  (`player.tiles[2] > 3`). This needs the *newer* runtime: SuperTux's `base`
+  carries those macros as of its "add array variables" commit, and the spec opts
+  in with `"array"` in `policy.emit_verdicts`. **Per branch, not per game** — each
+  dataset branch carries its own copy of `local_report.hpp`, so the instrumenter
+  probes the checkout it is about to write into and drops the container forms
+  (loudly, on stdout) where the macros are absent, instead of writing a call that
+  cannot compile and failing the whole row. Today that means only `base` reports
+  containers; `python scripts/prepare_branches.py --game "Super Tux"` rebases the
+  mutation branches onto it, after which base and mutant share the vocabulary
+  again. One array key costs its whole element list in **every** snapshot, so
+  length is what is budgeted, not key count (`policy.max_container_elements`).
+- **Off switch:** `--no-instrument` (or `config.INSTRUMENT = False`) builds each
+  branch as committed. Useful to A/B what the local variables actually buy.
+- **A failure fails the row** (`ERROR`) instead of quietly building an
+  uninstrumented binary — results that silently lack the variables the experiment
+  is about are worse than a loud row. If the instrumenter cannot be found (a
+  gamerv checkout without `src/runners/source_instrument/`), the message says so.
+- **Manifests** go to `instrument/<game>.manifest.json` *outside* the game repo —
+  the tool's own default is `<game-root>/.gamerv/`, whose untracked directory
+  would trip `ensure_clean`. They are deleted on revert; a stale one (left by a
+  crash) is cleared on the next instrumented build.
+- **Recovery.** If a crash ever leaves a tree instrumented, `ensure_clean` aborts
+  the next run with the diff in hand; `git -C <game-repo> checkout -- .` restores
+  it (the edits are never anything you wrote).
 
 #### Refinement decision path and threshold strategy (step 8)
 
@@ -161,6 +215,7 @@ sub-second. The first run is therefore interactive (pick the game/monitor).
 ./run_experiment.sh --game "Super Tux" # only that game's rows
 ./run_experiment.sh --row 4 --manual-auto   # replay cached manual answers
 ./run_experiment.sh --row 20 --refinement-mode data-direct --threshold-strategy weakest
+./run_experiment.sh --row 4 --no-instrument  # skip step 2a (build source as committed)
 ```
 
 Results are written to `results/results_<timestamp>.csv` (with a `game` column)
@@ -197,6 +252,12 @@ again.
    Conflicts are expected on diverged branches; those are reported `NEEDS-MANUAL`
    and must be rebased by hand. The rebase rewrites history vs origin — push with
    `--force-with-lease` if/when you choose.
+5. **Source instrumenter (step 2a), for games that enable it.** The gamerv
+   checkout must be on a branch carrying `src/runners/source_instrument/` (today:
+   `local_vars`) and its libclang must import in the `gamerv` conda env — the
+   controller runs `python -m runners.source_instrument` from `gamerv/src/`. A
+   gamerv checkout without it fails every row of an instrumented game with a
+   message saying so; `--no-instrument` builds without it in the meantime.
 
 ## Notes
 
@@ -208,7 +269,13 @@ again.
 - **Build cache (`build_cache/<game>/`).** `game_repo.build()` caches the compiled
   binary per game+branch, keyed by the HEAD **tree hash** (`git rev-parse
   HEAD^{tree}`) — an exact content key for the checked-out source (sound because
-  `ensure_clean` aborts a dirty run, so the tree hash captures every tracked file).
+  `ensure_clean` aborts a dirty run, so the tree hash captures every tracked file)
+  — **plus the digest of the pending step-2a instrumentation** (`<tree>+i<digest>`),
+  since those edits are what actually get compiled and they never move the tree
+  hash. `instrument.plan()` re-derives that digest on every build without writing
+  anything (a few seconds), so a change to the instrumenter or its spec misses the
+  cache and rebuilds instead of restoring a binary built with the previous
+  instrumentation. Turning `--no-instrument` on or off flips the key the same way.
   On a matching key the configure+build is skipped and the cached binary is
   restored; a source change yields a different hash → miss → rebuild
   (self-correcting, like the log cache). Each slot snapshots just the game binary

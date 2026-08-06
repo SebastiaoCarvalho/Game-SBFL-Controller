@@ -3,7 +3,7 @@
 ``run_case`` maps to the workflow:
 
   1. read row            (caller provides the TestCase)
-  2. checkout + build                 (game_repo.py)
+  2. checkout, instrument (2a), build (game_repo.py, instrument.py)
   3. set the ONLY safety property     (gamerv.py)
   4. clear previous logs              (gamerv.py)
   5. record traces via replay         (record_traces — launches the game per tape)
@@ -19,6 +19,13 @@ only that bundle (and gamerv's active-game selection, via the ``GAME`` env) vari
 Step 2 builds but does not launch — because the replay is triggered by the game's
 ``--replay`` startup hook, the game is (re)launched per recording inside step 5,
 which is where it is "opened".
+
+Step 2a — source instrumentation — sits *inside* ``game_repo.build``, not beside
+it in ``run_case``: it must wrap every compile, and a baseline-contrast row
+compiles twice from step 5. Before each compile gamerv's instrumenter writes the
+local-variable reporting calls into the checked-out source; the edit is reverted
+as soon as the compiler is done, so only the binary carries it. Its cost lands in
+the "build" phase timing. See instrument.py.
 """
 
 import os
@@ -185,7 +192,8 @@ def _record_or_restore(game: Game, case: TestCase) -> int:
     return n
 
 
-def _record_or_restore_baseline(game: Game, case: TestCase) -> int:
+def _record_or_restore_baseline(game: Game, case: TestCase,
+                                instrument_source: bool = True) -> int:
     """Step 5 for a baseline-contrast row, with the log cache.
 
     The exceptional path for always-on mutations (game.baseline_contrast_branches,
@@ -205,12 +213,16 @@ def _record_or_restore_baseline(game: Game, case: TestCase) -> int:
     resident, built last) then rebuild base and record it — mutant-then-base order
     is safe because last_invalid_run picks the latest VIOLATED run, and only the
     mutant violates. Returns the total number of traces recorded (base + mutant).
+
+    ``instrument_source`` is the row's step-2a setting, forwarded to both builds:
+    base and mutant must be instrumented identically or their traces would not
+    share a vocabulary, and the contrast in step 8 pools states from both.
     """
     shas = {}
     for build_branch in (game.base_branch, case.branch):
         print(f"    --- build {build_branch} (for cache key) ---")
         repo.checkout(game, build_branch)
-        repo.build(game)
+        repo.build(game, instrument_source=instrument_source)
         shas[build_branch] = logcache.file_sha(game.binary)
 
     key = logcache.compute_key([shas[game.base_branch], shas[case.branch]],
@@ -228,7 +240,7 @@ def _record_or_restore_baseline(game: Game, case: TestCase) -> int:
     # Bring base back and record it.
     print(f"    --- rebuild {game.base_branch} + record ---")
     repo.checkout(game, game.base_branch)
-    repo.build(game)
+    repo.build(game, instrument_source=instrument_source)
     total += record_traces(game, case.branch, record_label=game.base_branch)
     if total:
         logcache.store(game, case.branch, key, gamerv.run_dirs())
@@ -237,7 +249,8 @@ def _record_or_restore_baseline(game: Game, case: TestCase) -> int:
 
 def run_case(case: TestCase, manual_auto: bool = False,
              refinement_mode: str | None = None,
-             threshold_strategy: str | None = None) -> CaseResult:
+             threshold_strategy: str | None = None,
+             instrument_source: bool | None = None) -> CaseResult:
     """Execute the pipeline for one dataset row.
 
     The row's ``game`` (Game Name) is resolved to a :class:`config.Game`; an
@@ -253,6 +266,12 @@ def run_case(case: TestCase, manual_auto: bool = False,
     phi, and ``threshold_strategy`` (midpoints / weakest / gap-mean) how R's
     thresholds are placed. ``None`` defers to ``config.REFINEMENT_MODE`` /
     ``config.THRESHOLD_STRATEGY``.
+
+    ``instrument_source`` runs step 2a — gamerv's source instrumenter — before
+    each compile, so the built binary reports its function-local variables.
+    ``None`` defers to ``config.INSTRUMENT``; ``False`` builds the source as
+    committed (fault localization then sees only the variables the game already
+    reported). Games with no ``instrument_src`` are unaffected either way.
 
     Raises DirtyTreeError (the one fatal, experiment-wide precondition); every
     other failure is captured as an ERROR result so the batch keeps going.
@@ -283,6 +302,7 @@ def run_case(case: TestCase, manual_auto: bool = False,
     # set so an all-branches mutation configured in config.py still qualifies.
     baseline_contrast = (case.baseline_contrast
                          or case.branch in game.baseline_contrast_branches)
+    instr = config.INSTRUMENT if instrument_source is None else instrument_source
 
     try:
         # Preflight: gamerv must have a catalog bundle for this game, or it would
@@ -292,8 +312,11 @@ def run_case(case: TestCase, manual_auto: bool = False,
                 f"gamerv has no catalog for game {game.name!r} "
                 f"(config/games/{game.name}/); create it before running this row"))
 
-        # Step 2 — checkout + build (launch happens per-tape in step 5).
-        print(f"\n[2] checkout + build: {game.name} / {case.branch}")
+        # Step 2 — checkout + build (launch happens per-tape in step 5). The
+        # build instruments the source first (step 2a) unless the row opts out or
+        # the game has no instrument_src; the edit is undone before build returns.
+        print(f"\n[2] checkout + build: {game.name} / {case.branch}"
+              f"{'' if instr else '   (step 2a instrumentation off)'}")
         repo.ensure_clean(game)              # DirtyTreeError -> abort experiment
         if baseline_contrast:
             print("    baseline-contrast row: deferring build to step 5 "
@@ -301,7 +324,7 @@ def run_case(case: TestCase, manual_auto: bool = False,
         else:
             with _phase(timings, "build"):
                 repo.checkout(game, case.branch)
-                repo.build(game)
+                repo.build(game, instrument_source=instr)
 
         # Step 3 — make the spec the only safety property (guarded by check_formula).
         print(f"[3] set property: {case.formula}")
@@ -322,7 +345,7 @@ def run_case(case: TestCase, manual_auto: bool = False,
         print("[5] record traces (replay tapes under gamerv logging)")
         with _phase(timings, "record"):
             if baseline_contrast:
-                n = _record_or_restore_baseline(game, case)
+                n = _record_or_restore_baseline(game, case, instrument_source=instr)
             else:
                 n = _record_or_restore(game, case)
         if n == 0:

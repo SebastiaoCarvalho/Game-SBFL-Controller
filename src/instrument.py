@@ -1,0 +1,302 @@
+"""Step 2a — instrument the game's source so it reports its local variables.
+
+Fault localization can only refine an invariant over variables it can *see*, and
+a variable is only visible if the game's source reports it. gamerv's
+``runners.source_instrument`` (branch ``local_vars``) closes that gap: it parses
+the game's C++ with libclang, picks the function-locals worth reporting, and
+splices the ``REPORT_LOCAL`` calls in. This module is the controller's side of
+that tool — it runs it on the freshly checked-out branch **before** the compiler
+runs, so the binary every trace is recorded from reports its locals.
+
+The edits are **transient**. The source is instrumented, built, and immediately
+restored (:func:`applied`); nothing but the compiler ever sees the instrumented
+tree. That keeps the invariant the rest of the controller leans on — every game
+repo is clean at every branch switch (``game_repo.ensure_clean``) — and it keeps
+the instrumentation off the git branches the dataset names.
+
+Because the edit changes the compiled binary while leaving the git tree hash
+untouched, the build cache would otherwise go stale: :func:`plan` re-derives
+(*without* writing) exactly what the write pass would insert and digests it, so
+``game_repo.build`` can fold that digest into the cache key. A change to the
+instrumenter, its spec, or the source therefore misses the cache and rebuilds,
+rather than silently restoring a binary built with the previous instrumentation.
+
+Opt-in per game via ``Game.instrument_src`` (``None`` = the step is skipped for
+that game). Two things must be true before a game can turn it on:
+
+* gamerv must resolve an instrumentation spec for it — ``config/games/<name>/
+  source_instrument.json``, or gamerv's built-in SuperTux default, whose
+  ``scan_globs`` are SuperTux paths and mean nothing to another game;
+* the game's source must already carry the reporting runtime (the
+  ``REPORT_LOCAL`` macros and the ``GameObject`` plumbing behind them) on its
+  ``base`` branch, or the instrumented tree will not compile. Which macros
+  matters, not just that some exist: with ``"array"`` in the spec's
+  ``policy.emit_verdicts`` the instrumenter writes ``REPORT_LOCAL_ARRAY`` for a
+  container local, which SuperTux's ``base`` gained in its "add array variables"
+  commit. That is a *per-branch* property here — every dataset branch carries its
+  own copy of the reporting header — so the tool probes the checkout and skips the
+  container forms where the macros are absent rather than failing the row; the
+  branches that skip them are the ones ``prepare_branches.py`` has not yet rebased
+  onto ``base``.
+
+A failure here fails the row (an ``ERROR``) instead of quietly building an
+uninstrumented binary, which would produce results that silently lack the local
+variables the experiment is about. Turn the step off with
+``run_experiment.py --no-instrument`` (or ``config.INSTRUMENT = False``).
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+import config
+from config import Game
+
+
+class InstrumentError(RuntimeError):
+    """The source instrumenter failed, or left the game tree in a bad state."""
+
+
+# runners.source_instrument's exit codes (cli.py): OK / ERR / USAGE / FOLLOWUP.
+# FOLLOWUP means "written, and there is a suggested next step" — a success for us.
+_OK_EXITS = (0, 3)
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What the instrumenter *would* write to this checkout, without writing it.
+
+    ``digest`` is a content key over the exact insertions (file, offset, text), so
+    two checkouts with the same tree hash and the same digest compile to the same
+    binary — which is what lets the build cache key include it.
+    """
+    keys: tuple[str, ...]
+    files: int
+    insertions: int
+    digest: str
+
+    @property
+    def empty(self) -> bool:
+        return self.insertions == 0
+
+
+def enabled(game: Game) -> bool:
+    """True if this game opts into source instrumentation (``instrument_src``)."""
+    return game.instrument_src is not None
+
+
+def manifest_path(game: Game) -> Path:
+    """Where the instrumenter records what it wrote, so ``--revert`` is byte-exact.
+
+    Deliberately **outside** the game repo: the tool's own default is
+    ``<game-root>/.gamerv/``, and an untracked directory there shows up in ``git
+    status --porcelain``, which is exactly what ``game_repo.ensure_clean`` aborts
+    the experiment over. One slot per game is enough — the manifest never
+    outlives a single ``build()``.
+    """
+    return config.INSTRUMENT_DIR / f"{game.name}.manifest.json"
+
+
+def _tail(text: str, lines: int = 25) -> str:
+    return "\n".join((text or "").strip().splitlines()[-lines:])
+
+
+def _run(game: Game, args: list[str], what: str) -> subprocess.CompletedProcess:
+    """Invoke ``python -m runners.source_instrument`` in the activated gamerv env.
+
+    Run from gamerv's ``src/`` because ``-m`` resolves the package against the
+    working directory (gamerv's own worker is launched the same way, one level up).
+    """
+    module_dir = config.GAMERV_SRC_DIR / "runners" / "source_instrument"
+    if not module_dir.is_dir():
+        raise InstrumentError(
+            f"gamerv has no source instrumenter at {module_dir} — check out the "
+            f"branch that carries it (local_vars), or run with --no-instrument "
+            f"to build without local-variable reporting")
+    # Refuse to parse without libclang's builtin headers. A degraded parse does
+    # not fail — it quietly yields fewer and worse candidates — so the only way
+    # to keep the instrumentation reproducible is to make this a precondition.
+    if not (config.CLANG_RESOURCE_DIR / "include" / "stddef.h").is_file():
+        raise InstrumentError(
+            f"no libclang builtin headers at {config.CLANG_RESOURCE_DIR} — "
+            f"libclang would fail on the first #include and silently drop "
+            f"variables. See config.CLANG_RESOURCE_DIR for how to populate it")
+
+    manifest_path(game).parent.mkdir(parents=True, exist_ok=True)
+    cmd = config.gamerv_cmd([
+        "-m", "runners.source_instrument",
+        str(game.instrument_src),
+        "--game", game.name,                     # resolve THIS game's spec
+        "--build-dir", str(game.build_dir),      # for compile_commands.json
+        "--manifest", str(manifest_path(game)),
+        *game.instrument_extra_args,
+        *args,
+    ])
+    proc = subprocess.run(cmd, cwd=str(config.GAMERV_SRC_DIR),
+                          env={**os.environ,
+                               "CLANG_RESOURCE_DIR": str(config.CLANG_RESOURCE_DIR)},
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=config.INSTRUMENT_TIMEOUT)
+    if proc.returncode not in _OK_EXITS:
+        raise InstrumentError(
+            f"source instrumentation ({what}) failed with exit {proc.returncode}:\n"
+            f"{_tail(proc.stdout)}\n{_tail(proc.stderr, 10)}")
+    return proc
+
+
+# What the tool prints, instead of a JSON plan, when every candidate it found is
+# already reported in the source — an OK exit with nothing to emit (cli.main).
+_NOTHING_TO_DO = "Nothing to do."
+
+
+def _json_blob(text: str) -> dict | None:
+    """The instrumenter's ``--format json`` object, pulled out of its log output.
+
+    It is pretty-printed over many lines and sits between ordinary progress lines,
+    so this scans for the first ``{`` that decodes into an object carrying
+    ``insertions`` rather than reading a single line. ``None`` if there is none.
+    """
+    decoder = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, _ = decoder.raw_decode(text, i)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and "insertions" in obj:
+            return obj
+        i = text.find("{", i + 1)
+    return None
+
+
+def plan(game: Game) -> Plan:
+    """Derive the pending edit without touching the tree (the tool's dry run).
+
+    Cheap next to a build (a few seconds for SuperTux) and run on *every* build,
+    hit or miss, because its digest is part of the cache key.
+    """
+    out = _run(game, ["--dry-run", "--format", "json"], "plan").stdout
+    obj = _json_blob(out)
+    if obj is None:
+        # A tree whose candidates are all reported already emits no plan at all.
+        # That is a legitimate empty edit, not a parse failure — but only when the
+        # tool says so, so genuinely unreadable output still fails the row.
+        if _NOTHING_TO_DO in out:
+            obj = {}
+        else:
+            raise InstrumentError(
+                f"could not parse the instrumenter's plan (no JSON object in its "
+                f"output):\n{_tail(out)}")
+    insertions = obj.get("insertions") or []
+    keys = tuple(sorted(str(k) for k in (obj.get("keys") or [])))
+    # Sorted + projected to the fields that decide the compiled bytes, so the
+    # digest does not move with the tool's reporting order.
+    canonical = json.dumps({
+        "keys": list(keys),
+        "insertions": sorted((str(i.get("rel")), int(i.get("offset", -1)),
+                              str(i.get("text"))) for i in insertions),
+    }, sort_keys=True)
+    return Plan(
+        keys=keys,
+        files=len({str(i.get("rel")) for i in insertions}),
+        insertions=len(insertions),
+        digest=hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _git(game: Game, *args: str) -> str:
+    """A git call in the game repo.
+
+    This module deliberately does not import ``game_repo``: that module imports
+    *this* one (``build`` instruments before compiling), and the cycle would be a
+    genuine import-time one. Two git invocations are cheaper than the indirection.
+    """
+    proc = subprocess.run(["git", "-C", str(game.repo_dir), *args],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise InstrumentError(
+            f"git {' '.join(args)} failed:\n{(proc.stderr or proc.stdout).strip()}")
+    return (proc.stdout or "").strip()
+
+
+def _clear_stale(game: Game) -> None:
+    """Drop a manifest a previous run left behind (crash between write and revert).
+
+    The tree is clean at this point (``ensure_clean`` gates step 2), so the stale
+    manifest's insertions are already gone and its revert is expected to fail —
+    it is attempted only for the case where they are not, and the file is removed
+    either way so this pass starts from an empty manifest.
+    """
+    path = manifest_path(game)
+    if not path.exists():
+        return
+    print("  [instrument] stale manifest from an earlier run — clearing it")
+    try:
+        _run(game, ["--revert", "--write"], "stale revert")
+    except InstrumentError:
+        pass
+    path.unlink(missing_ok=True)
+
+
+def apply(game: Game, pending: Plan) -> None:
+    """Write the reporting calls into the checked-out source."""
+    _clear_stale(game)
+    if pending.empty:
+        print("  [instrument] nothing to add — source already reports its locals")
+        return
+    _run(game, ["--write"], "write")
+    print(f"  [instrument] wrote {len(pending.keys)} key(s) into "
+          f"{pending.files} file(s)")
+
+
+def revert(game: Game) -> None:
+    """Undo the edit and leave the repo pristine, or raise.
+
+    The manifest revert is byte-exact and is what normally restores the tree; the
+    git fallback is the safety net, because a tree left dirty here is not a local
+    problem — the next row's ``ensure_clean`` aborts the whole experiment. Both
+    are no-ops when nothing was written, so this is safe to call unconditionally.
+    """
+    path = manifest_path(game)
+    reverted = False
+    if path.exists():
+        try:
+            _run(game, ["--revert", "--write"], "revert")
+            reverted = True
+        except InstrumentError as exc:
+            print(f"  [instrument] [warn] revert failed, falling back to git: {exc}")
+        path.unlink(missing_ok=True)
+
+    dirty = _git(game, "status", "--porcelain")
+    if not dirty:
+        if reverted:
+            print("  [instrument] reverted — tree is clean")
+        return
+
+    print("  [instrument] [warn] tree still dirty after revert — "
+          "restoring tracked files with git checkout")
+    _git(game, "checkout", "--", ".")
+    dirty = _git(game, "status", "--porcelain")
+    if dirty:
+        raise InstrumentError(
+            f"{game.name} tree is still dirty after reverting the instrumentation "
+            f"— clean it by hand before rerunning:\n{dirty}")
+
+
+@contextmanager
+def applied(game: Game, pending: Plan):
+    """Instrument the source for the duration of the block, then restore it.
+
+    The revert runs even when the body raises (a failed build) *and* when the
+    write itself fails partway, so neither can leave the repo dirty for the next
+    row — which would abort the whole experiment at the next ``ensure_clean``.
+    """
+    try:
+        apply(game, pending)
+        yield pending
+    finally:
+        revert(game)
