@@ -3,19 +3,12 @@
 The CSV has these columns: ``Game Name`` (which game the row belongs to — selects
 a :class:`config.Game` bundle, and gamerv's active predicate catalog), ``Github
 Branch`` (the mutated branch of that game's repo), ``Specification`` (a ``P -> Q``
-safety-property body, no leading ``G``), ``Target Phi`` (the ground-truth
-refinement ``phi`` to test ``phi -> R``), and an optional ``Positive Source``
-(where the good ``P & Q`` states come from — see below).
+safety-property body, no leading ``G``), and ``Target Phi`` (the ground-truth
+refinement ``phi`` to test ``phi -> R``).
 
-``Positive Source`` picks step 5's recording strategy per row:
-  * ``mutant`` (default; also the value for a blank/absent cell) — record only the
-    mutant branch. Its trace supplies BOTH the good (P & Q) and violation (P & ~Q)
-    states, so phi is decided within the single mutant branch.
-  * ``base`` — record the SAME tapes on both the unmutated ``base`` binary and the
-    mutant, pooling both traces. base supplies the good states, the mutant the
-    violations. Needed for always-on mutations whose mutant trace has NO good
-    states to contrast (single-branch mining returns "no_positives"). This is the
-    "baseline-contrast" path in the pipeline.
+Every row is a mutant case: step 5 records the mutant branch alone, and its trace
+supplies BOTH the good (P & Q) and violation (P & ~Q) states, so phi is decided
+within that single branch.
 
 ``csv.DictReader`` handles the doubled-quote escaping in the file, so a cell
 written as ``"Walk -> ObjectPresent(""Tux"")"`` comes back as the plain string
@@ -36,19 +29,12 @@ class TestCase:
     branch: str               # github/mutation branch name
     phi: str                  # ground-truth refinement
     row: int                  # 1-based row number (after the header)
-    positive_source: str = "mutant"  # where P & Q comes from: "mutant" | "base"
     correct_drift: bool = False      # replay with drift correction on (see below)
 
     @property
     def formula(self) -> str:
         """The gamerv safety property: the spec wrapped in a global G(...)."""
         return f"G({self.specification})"
-
-    @property
-    def baseline_contrast(self) -> bool:
-        """True when the good (P & Q) states come from the base binary, so step 5
-        records the same tapes on base AND the mutant and pools both traces."""
-        return self.positive_source == "base"
 
 
 # Column headers, matched case-insensitively / whitespace-trimmed so a small
@@ -57,14 +43,6 @@ _GAME_KEYS = {"game name", "game"}
 _SPEC_KEYS = {"specification", "spec", "property"}
 _BRANCH_KEYS = {"github branch", "branch"}
 _PHI_KEYS = {"target phi", "phi", "ground truth"}
-_POSSRC_KEYS = {"positive source", "positive", "contrast"}
-
-# Accepted values for the Positive Source column, mapped to the canonical token.
-# Blank / unknown -> "mutant" (record the mutant alone, today's default).
-_POSSRC_VALUES = {
-    "mutant": "mutant", "self": "mutant", "": "mutant",
-    "base": "base", "baseline": "base", "base+mutant": "base",
-}
 
 
 _MISSING = object()
@@ -97,13 +75,9 @@ def read_cases(path: Path | None = None) -> list[TestCase]:
             spec = _pick(rowdict, _SPEC_KEYS)
             branch = _pick(rowdict, _BRANCH_KEYS)
             phi = _pick(rowdict, _PHI_KEYS)
-            # Optional column; absent header or blank cell -> "mutant" (record the
-            # mutant alone). Unrecognised values also fall back to "mutant".
-            pos_raw = _pick(rowdict, _POSSRC_KEYS, default="").lower()
-            positive_source = _POSSRC_VALUES.get(pos_raw, "mutant")
             if not (spec and branch):
                 continue  # skip blank / not-yet-filled lines
-            cases.append(TestCase(game, spec, branch, phi, i, positive_source))
+            cases.append(TestCase(game, spec, branch, phi, i))
     return cases
 
 

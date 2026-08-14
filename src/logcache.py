@@ -67,8 +67,13 @@ def compute_key(binary_shas: list[str], game: Game, branch: str) -> str:
     return h.hexdigest()
 
 
-def _slot(game: Game, branch: str) -> Path:
+def slot(game: Game, branch: str) -> Path:
+    """Where this branch's cached logs live (whether or not it exists)."""
     return config.LOG_CACHE_DIR / game.name / branch
+
+
+def _slot(game: Game, branch: str) -> Path:
+    return slot(game, branch)
 
 
 def _meta(game: Game, branch: str) -> Path:

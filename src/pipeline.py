@@ -21,11 +21,11 @@ Step 2 builds but does not launch — because the replay is triggered by the gam
 which is where it is "opened".
 
 Step 2a — source instrumentation — sits *inside* ``game_repo.build``, not beside
-it in ``run_case``: it must wrap every compile, and a baseline-contrast row
-compiles twice from step 5. Before each compile gamerv's instrumenter writes the
-local-variable reporting calls into the checked-out source; the edit is reverted
-as soon as the compiler is done, so only the binary carries it. Its cost lands in
-the "build" phase timing. See instrument.py.
+it in ``run_case``, so that it wraps every compile from a single place. Before
+each compile gamerv's instrumenter writes the local-variable reporting calls into
+the checked-out source; the edit is reverted as soon as the compiler is done, so
+only the binary carries it. Its cost lands in the "build" phase timing. See
+instrument.py.
 """
 
 import os
@@ -46,8 +46,7 @@ from game_repo import DirtyTreeError
 
 # Ordered phase labels for per-case timing. The single elapsed_s total is split
 # across these; not every phase runs for every row (e.g. an early INCONCLUSIVE
-# return leaves later phases unrecorded), and baseline-contrast rows fold their
-# builds into "record" (they build inside step 5, not step 2). See run_case.
+# return leaves later phases unrecorded). See run_case.
 PHASES = ("build", "record", "validate", "refine")
 
 
@@ -83,7 +82,7 @@ class CaseResult:
 # --------------------------------------------------------------------------
 # Step 5 — trace logging via replay.
 # --------------------------------------------------------------------------
-def record_traces(game: Game, branch: str, record_label: str | None = None) -> int:
+def record_traces(game: Game, branch: str) -> int:
     """Record one trace per .rec tape by replaying it under gamerv logging.
 
     Only the tapes in this test case's ``<game.rec_dir>/<branch>/`` folder are
@@ -96,9 +95,7 @@ def record_traces(game: Game, branch: str, record_label: str | None = None) -> i
     Each produced run dir is tagged with its manual-hint id (``hints.write_sidecar``)
     so step 6 can cache/replay the operator's image/audio answers per recording.
     The id is namespaced by game so two games can't collide on a shared branch/tape
-    name. ``record_label`` disambiguates the same tape replayed on different
-    binaries — used by baseline-contrast rows, which record on base AND the mutant —
-    so their hint files don't collide; left ``None`` for the normal single-binary path.
+    name.
     """
     recs = recordings.list_recordings(game, branch)
     if not recs:
@@ -113,8 +110,7 @@ def record_traces(game: Game, branch: str, record_label: str | None = None) -> i
         run_dir = _record_one(game, rec, dur)
         if run_dir is not None:
             recorded += 1
-            rel_id = rec.stem if record_label is None else f"{record_label}__{rec.stem}"
-            hints.write_sidecar(run_dir, f"{game.name}/{branch}/{rel_id}")
+            hints.write_sidecar(run_dir, f"{game.name}/{branch}/{rec.stem}")
     return recorded
 
 
@@ -192,61 +188,6 @@ def _record_or_restore(game: Game, case: TestCase) -> int:
     return n
 
 
-def _record_or_restore_baseline(game: Game, case: TestCase,
-                                instrument_source: bool = True) -> int:
-    """Step 5 for a baseline-contrast row, with the log cache.
-
-    The exceptional path for always-on mutations (game.baseline_contrast_branches,
-    e.g. change_music_config: the level's music is wrong on EVERY entry). The
-    mutant trace then holds only violation states (P & ~Q) with no good states
-    (P & Q) to contrast, so single-branch mining returns "no_positives" and phi
-    is never proven. Replaying the SAME tapes on the unmutated base supplies the
-    valid (P & Q) states; the mutant supplies the violations. Both land in the one
-    logs/ dir (this runs after step 4's single clear, with no clear in between),
-    so compare_refinement's pool — build_mining_pool spans every trace under
-    logs/ — sees base's good states and the mutant's violations and decides phi
-    across the branch contrast: base validates clean, the mutant violates.
-
-    The cache key needs BOTH binaries' hashes, and the build dir holds one branch
-    at a time, so both are built (two real builds — same as before; only the 2x
-    recording is saved on a hit). On a miss we record the mutant (currently
-    resident, built last) then rebuild base and record it — mutant-then-base order
-    is safe because last_invalid_run picks the latest VIOLATED run, and only the
-    mutant violates. Returns the total number of traces recorded (base + mutant).
-
-    ``instrument_source`` is the row's step-2a setting, forwarded to both builds:
-    base and mutant must be instrumented identically or their traces would not
-    share a vocabulary, and the contrast in step 8 pools states from both.
-    """
-    shas = {}
-    for build_branch in (game.base_branch, case.branch):
-        print(f"    --- build {build_branch} (for cache key) ---")
-        repo.checkout(game, build_branch)
-        repo.build(game, instrument_source=instrument_source)
-        shas[build_branch] = logcache.file_sha(game.binary)
-
-    key = logcache.compute_key([shas[game.base_branch], shas[case.branch]],
-                               game, case.branch)
-    if logcache.has(game, case.branch, key):
-        print("    [cache] hit — restoring base+mutant logs, skipping recording")
-        return logcache.restore(game, case.branch)
-
-    print("    [cache] miss — recording on base + mutant")
-    logcache.invalidate(game, case.branch)
-    # The mutant binary is currently resident (built last); record it first.
-    # Label the hints by the build branch so base and mutant traces of the same
-    # tape cache to distinct hint files (their predicate truths differ).
-    total = record_traces(game, case.branch, record_label=case.branch)
-    # Bring base back and record it.
-    print(f"    --- rebuild {game.base_branch} + record ---")
-    repo.checkout(game, game.base_branch)
-    repo.build(game, instrument_source=instrument_source)
-    total += record_traces(game, case.branch, record_label=game.base_branch)
-    if total:
-        logcache.store(game, case.branch, key, gamerv.run_dirs())
-    return total
-
-
 def run_case(case: TestCase, manual_auto: bool = False,
              refinement_mode: str | None = None,
              threshold_strategy: str | None = None,
@@ -295,13 +236,6 @@ def run_case(case: TestCase, manual_auto: bool = False,
     prev_game_env = os.environ.get(config.GAMERV_GAME_ENV)
     os.environ[config.GAMERV_GAME_ENV] = game.name
 
-    # Baseline-contrast rows record on base + mutant (step 5 builds both in turn),
-    # so step 2 only verifies the tree is clean and defers the build to step 5.
-    # The choice is per-row: the dataset's "Positive Source" column (base -> the
-    # good states come from base) drives it, OR'd with the game-level always-on
-    # set so an all-branches mutation configured in config.py still qualifies.
-    baseline_contrast = (case.baseline_contrast
-                         or case.branch in game.baseline_contrast_branches)
     instr = config.INSTRUMENT if instrument_source is None else instrument_source
 
     try:
@@ -318,13 +252,9 @@ def run_case(case: TestCase, manual_auto: bool = False,
         print(f"\n[2] checkout + build: {game.name} / {case.branch}"
               f"{'' if instr else '   (step 2a instrumentation off)'}")
         repo.ensure_clean(game)              # DirtyTreeError -> abort experiment
-        if baseline_contrast:
-            print("    baseline-contrast row: deferring build to step 5 "
-                  "(records on base + mutant)")
-        else:
-            with _phase(timings, "build"):
-                repo.checkout(game, case.branch)
-                repo.build(game, instrument_source=instr)
+        with _phase(timings, "build"):
+            repo.checkout(game, case.branch)
+            repo.build(game, instrument_source=instr)
 
         # Step 3 — make the spec the only safety property (guarded by check_formula).
         print(f"[3] set property: {case.formula}")
@@ -338,16 +268,11 @@ def run_case(case: TestCase, manual_auto: bool = False,
         print("[4] clear previous logs")
         gamerv.clear_logs(row=case.row)
 
-        # Step 5 — record traces by replaying each tape under logging. A
-        # baseline-contrast row records on base + mutant (the only way it gets
-        # both good and violation states to contrast); every other row records
-        # the mutant alone.
+        # Step 5 — record traces by replaying each tape under logging, on the
+        # mutant alone: its trace carries both the good and the violation states.
         print("[5] record traces (replay tapes under gamerv logging)")
         with _phase(timings, "record"):
-            if baseline_contrast:
-                n = _record_or_restore_baseline(game, case, instrument_source=instr)
-            else:
-                n = _record_or_restore(game, case)
+            n = _record_or_restore(game, case)
         if n == 0:
             return result("INCONCLUSIVE", notes="no traces recorded (no tapes / log failed)")
 

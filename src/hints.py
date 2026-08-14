@@ -61,8 +61,8 @@ def _is_exact(key: str) -> bool:
 def write_sidecar(run_dir: Path, rel_id: str) -> None:
     """Tag ``run_dir`` with the relative hint id of the tape that produced it.
 
-    ``rel_id`` is a ``<branch>/<recX>`` style path (``<branch>/<label>__<recX>``
-    for baseline-contrast rows); ``path_for`` turns it into the ``.hint`` file.
+    ``rel_id`` is a ``<branch>/<recX>`` style path; ``path_for`` turns it into the
+    ``.hint`` file.
     """
     (run_dir / SIDECAR).write_text(rel_id)
 

@@ -3,7 +3,8 @@
 When ``MANUAL_PREDICATES`` is active (set in ``gamerv/.env``), gamerv can't
 compute the visual (LLM) and audio predicates itself. Its ``validate`` worker
 instead dumps the exact frames/audio it would have judged under
-``<run_dir>/manual_assets/``, lists each undecided predicate in
+``<run_dir>/manual_assets/`` (plus, for a visual request, a ``clip.mp4`` of the
+same window — see ``_ask_one``), lists each undecided predicate in
 ``<run_dir>/manual_requests.json``, and exits ``NEEDS_MANUAL`` (3).
 
 This module is the controller's side of that handshake: it shows the evidence to
@@ -110,15 +111,30 @@ def _read_requests(path: Path) -> list[dict]:
 
 
 def _ask_one(run_dir: Path, request: dict) -> bool:
-    """Show one request's evidence (opening the frames/audio) and read t/f."""
+    """Show one request's evidence and read t/f.
+
+    A visual request carries a ``clip.mp4`` of the same window the frames were
+    sampled from, and that is the *only* thing popped open for it: the clip is
+    the form a human judges well, and spraying eight stills across the desktop
+    viewer on top of it is just windows to close. The frames' paths are still
+    printed (they are the record of what the automatic judge saw), and they are
+    opened when there is no clip — absent on manifests predating the clip, and on
+    windows too short to make a playable one.
+    """
     print(f"\n    Event #{request.get('event_index')} "
           f"({request.get('event_type')}) — {request.get('call')}")
     if request.get("question"):
         print(f"    {request['question']}")
+    clip = request.get("video")
+    if clip:
+        asset = run_dir / clip
+        print(f"      clip:  {asset}")
+        _open(asset)
     for rel in request.get("images", []):
         asset = run_dir / rel
         print(f"      frame: {asset}")
-        _open(asset)
+        if not clip:
+            _open(asset)
     if request.get("audio"):
         asset = run_dir / request["audio"]
         print(f"      audio: {asset}")
@@ -137,7 +153,7 @@ def _ask_bool() -> bool:
 
 
 def _open(asset: Path) -> None:
-    """Best-effort: pop the frame/audio open in the desktop viewer so the
+    """Best-effort: pop the clip/frame/audio open in the desktop viewer so the
     operator can actually judge it (the terminal can't render it). Failures
     (no xdg-open, no display) are silent — the printed path is the fallback."""
     try:

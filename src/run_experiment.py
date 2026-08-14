@@ -10,6 +10,7 @@
     python run_experiment.py --row 20 --refinement-mode symbolic --threshold-strategy weakest
     python run_experiment.py --row 20 --refinement-mode data-direct   # corroborate-only
     python run_experiment.py --row 4 --no-instrument  # build the source as committed
+    python run_experiment.py --row 4 --clean     # drop row 4's cached build + logs
 
 Backs up gamerv's properties.json for the duration and restores it at the end,
 writes results to results/results_<timestamp>.csv, and prints a summary table.
@@ -17,11 +18,14 @@ writes results to results/results_<timestamp>.csv, and prints a summary table.
 
 import argparse
 import csv
+import shutil
 import sys
 from datetime import datetime
 
+import buildcache
 import config
 import gamerv
+import logcache
 from dataset import read_cases
 from pipeline import PHASES, run_case
 from game_repo import DirtyTreeError
@@ -44,6 +48,68 @@ def _parse_rows(spec: str) -> tuple[int, int]:
     if not hi:
         return int(lo), int(lo)
     return int(lo), int(hi)
+
+
+def _dir_size(path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def _confirm(n: int) -> bool:
+    """Gate an unscoped ``--clean``, which is the one that can cost real time.
+
+    A scoped clean is cheap to undo — one branch rebuilds and re-records. Wiping
+    the whole dataset's log cache is not: re-recording every row means replaying
+    every tape, and the manual validation passes that go with them. So the bare
+    form asks, and refuses outright when there is nobody to ask (a script, a
+    pipe) unless it passed --yes.
+    """
+    if not sys.stdin.isatty():
+        print(f"Refusing to clean all {n} row(s) non-interactively. Scope it with "
+              f"--row/--rows/--game, or pass --yes to mean it.", file=sys.stderr)
+        return False
+    reply = input(f"Remove the cached build AND logs for all {n} row(s)? [y/N] ")
+    return reply.strip().lower() in ("y", "yes")
+
+
+def _clean(cases) -> int:
+    """Delete the selected rows' cached build artifacts and logs, then report.
+
+    Both caches are keyed by game+branch, not by row, so rows sharing a branch
+    (the same mutant tested against several properties) name the same two slots —
+    deduplicated here so each is reported once.
+
+    Only the two *caches* are touched. Deliberately left alone: ``hints/``, which
+    holds operator answers that cost a human to recreate; ``logs_archive/``, which
+    is the only copy of past runs' traces rather than a cache; and ``results/``.
+    Everything removed here is something the next run regenerates on its own.
+    """
+    seen, removed, freed = set(), 0, 0
+    for case in cases:
+        try:
+            game = config.get_game(case.game)
+        except config.UnknownGameError as exc:
+            print(f"  row {case.row}: {exc}")
+            continue
+        if (game.name, case.branch) in seen:
+            continue
+        seen.add((game.name, case.branch))
+        print(f"  {game.name} / {case.branch}")
+        for label, path in (("build", buildcache.slot(game, case.branch)),
+                            ("logs ", logcache.slot(game, case.branch))):
+            if not path.exists():
+                print(f"      {label}  — nothing cached")
+                continue
+            size = _dir_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            if path.exists():
+                print(f"      {label}  FAILED to remove {path}")
+                continue
+            removed += 1
+            freed += size
+            print(f"      {label}  removed {path}  ({size / 1e6:.1f} MB)")
+    print(f"\nChecked {len(seen)} game/branch pair(s): {removed} cache dir(s) "
+          f"removed, {freed / 1e6:.1f} MB freed.")
+    return removed
 
 
 def main(argv: list[str]) -> int:
@@ -72,6 +138,15 @@ def main(argv: list[str]) -> int:
                          "midpoint of the violation->good gap, 'midpoints' = sampled "
                          "midpoints (search picks). Affects the symbolic path only. "
                          f"Default: {config.THRESHOLD_STRATEGY}.")
+    ap.add_argument("--clean", action="store_true",
+                    help="delete the selected rows' build-cache and log-cache "
+                         "slots, then exit without running anything. Forces the "
+                         "next run of those rows to rebuild and re-record. Leaves "
+                         "hints/, logs_archive/ and results/ alone. Combine with "
+                         "--row/--rows/--game to scope it; unscoped it covers "
+                         "every row in the dataset and asks first.")
+    ap.add_argument("--yes", action="store_true",
+                    help="skip the confirmation an unscoped --clean asks for")
     ap.add_argument("--no-instrument", dest="instrument", action="store_false",
                     default=config.INSTRUMENT,
                     help="skip step 2a: build each branch's source as committed "
@@ -86,6 +161,18 @@ def main(argv: list[str]) -> int:
         print("No matching dataset rows.")
         return 1
     print(f"Selected {len(cases)} case(s): rows {[c.row for c in cases]}")
+
+    if args.clean:
+        # Before the properties backup and the results file: this runs nothing,
+        # so it should leave no trace of its own beyond the deletions.
+        scoped = any(v is not None for v in (args.row, args.rows, args.game))
+        if not scoped and not args.yes and not _confirm(len(cases)):
+            print("Nothing removed.")
+            return 1
+        print(f"\nCleaning cached builds and logs for {len(cases)} row(s):")
+        _clean(cases)
+        return 0
+
     print(f"Refinement decision: mode={args.refinement_mode}  "
           f"threshold strategy={args.threshold_strategy}")
     print(f"Source instrumentation (step 2a): "

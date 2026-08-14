@@ -34,8 +34,13 @@ import config
 from config import Game
 
 
-def _slot(game: Game, branch: str) -> Path:
+def slot(game: Game, branch: str) -> Path:
+    """Where this branch's cached artifacts live (whether or not it exists)."""
     return config.BUILD_CACHE_DIR / game.name / branch
+
+
+def _slot(game: Game, branch: str) -> Path:
+    return slot(game, branch)
 
 
 def _meta(game: Game, branch: str) -> Path:

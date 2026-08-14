@@ -26,9 +26,9 @@ CONTROLLER_DIR = Path(__file__).resolve().parent.parent
 DATASET = Path("/home/sebastiao/nii/fl/dataset.csv")
 RESULTS_DIR = CONTROLLER_DIR / "results"
 # Cached operator answers for the manual image/audio predicate prompts, one file
-# per recording: hints/<game>/<branch>/<recX>.hint (baseline-contrast rows
-# distinguish base vs mutant). Written whenever the operator answers a prompt;
-# replayed with run_experiment.py --manual-auto. See hints.py and manual_review.py.
+# per recording: hints/<game>/<branch>/<recX>.hint. Written whenever the operator
+# answers a prompt; replayed with run_experiment.py --manual-auto. See hints.py
+# and manual_review.py.
 HINTS_DIR = CONTROLLER_DIR / "hints"
 # Content-addressed cache of step-5 raw logs, one slot per game+branch:
 # log_cache/<game>/<branch>/ holds pristine run dirs + meta.json (the binary+tape
@@ -37,9 +37,9 @@ HINTS_DIR = CONTROLLER_DIR / "hints"
 LOG_CACHE_DIR = CONTROLLER_DIR / "log_cache"
 # Content-addressed cache of built binaries, one slot per game+branch:
 # build_cache/<game>/<branch>/ holds the game binary + its build-local .so plus
-# meta.json (the HEAD tree hash + the pending instrumentation's digest). A matching
-# key lets game_repo.build() skip the cmake configure+build and restore the binary;
-# a source change → different tree hash → miss → rebuild. See buildcache.py.
+# meta.json (the HEAD tree hash + the instrumenter's fingerprint). A matching key
+# lets game_repo.build() skip the cmake configure+build AND step 2a, restoring the
+# binary; a source change → different tree hash → miss → rebuild. See buildcache.py.
 BUILD_CACHE_DIR = CONTROLLER_DIR / "build_cache"
 
 # --- Source instrumentation (step 2a) -------------------------------------
@@ -147,7 +147,6 @@ class Game:
     replay_delay: float                         # seconds until the replay's events start
     replay_margin: float                        # extra wait after a replay's duration
     seconds_per_step: float                     # wall-clock seconds per logical frame
-    baseline_contrast_branches: frozenset[str]  # always-on mutations (record on base+mutant)
     # Extra fixed args appended after the replay flag on every replay launch, for
     # games that need one. Witch Blast's replay obeys a per-run frame budget
     # (``--frames N``, default 600) and self-closes when it is spent, which would
@@ -259,12 +258,6 @@ def _supertux() -> Game:
         # constants.hpp LOGICAL_FPS = 1000/15, i.e. a fixed 15 ms logical step, so
         # a tape of N frames replays in N * 0.015 s.
         seconds_per_step=15.0 / 1000.0,
-        # Always-on mutations: the mutation breaks its property on EVERY occurrence,
-        # so the mutant trace holds only violation states (P & ~Q) and no good
-        # states (P & Q). For these the controller records the row's tapes on BOTH
-        # base and the mutant into one logs/ dir; gamerv's cross-trace pool supplies
-        # base's good states vs the mutant's violations. See pipeline.py.
-        baseline_contrast_branches=frozenset({"change_music_config"}),
         # Step 2a: gamerv's instrumenter rewrites this tree before every build so
         # the binary reports its function-locals. SuperTux is the game it was
         # written against — gamerv's built-in spec targets these paths
@@ -299,10 +292,17 @@ def _supertuxkart() -> Game:
         # branch the user creates; the pipeline builds/records against it.
         base_branch="base",
         # Same two-step cmake configure+build as SuperTux. Re-running configure every
-        # build re-globs the checked-out tree (harmless if STK uses explicit source
-        # lists; safe if it does file(GLOB) like SuperTux).
+        # build re-globs the checked-out tree (STK's sources.cmake does use
+        # file(GLOB_RECURSE), so this is load-bearing here too).
+        #
+        # CMAKE_EXPORT_COMPILE_COMMANDS is what step 2a's instrumenter parses the
+        # source with: without the database libclang falls back to the spec's
+        # synthesized flags, which resolve fewer types and so silently reject
+        # candidate variables. cmake_build/ is gitignored, so the file it writes
+        # there never trips ensure_clean.
         build_commands=(
-            ("cmake", "-S", str(repo), "-B", str(build)),
+            ("cmake", "-S", str(repo), "-B", str(build),
+             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"),
             ("cmake", "--build", str(build), f"-j{BUILD_JOBS}"),
         ),
         # Just the binary: ldd shows supertuxkart links only system libs (no
@@ -343,14 +343,26 @@ def _supertuxkart() -> Game:
         # count) replays in N/120 s. Confirmed against real .stkagent tapes
         # (24118 frames = ~201 s for a 3-lap cornfield race).
         seconds_per_step=1.0 / 120.0,
-        # None yet: no always-on (baseline-contrast) mutations for STK so far.
-        baseline_contrast_branches=frozenset(),
         # STK's replay snaps a drifting kart back onto the recorded transform; that
         # correction masks any physics divergence between base and mutant (a fixed
         # wall collision the tape recorded going through, etc.), so it is OFF by
         # default. A row that needs the recorded trajectory reproduced exactly can
         # re-enable it via the dataset "Replay Correct" column, which appends this.
         replay_correct_flag="--agent-replay-correct",
+        # Step 2a, as for SuperTux: gamerv's instrumenter rewrites this tree before
+        # every build so the binary reports its function-locals, and the edit is
+        # reverted right after the compile (instrument.py). Both preconditions
+        # hold: the REPORT_LOCAL runtime lives on `base` (karts/moveable.hpp +
+        # predicates/local_report.hpp), and gamerv resolves a spec for this game
+        # (config/games/Super Tux Kart/source_instrument.json — the built-in
+        # default's scan globs are SuperTux paths and would find nothing here).
+        # Measured: 291 keys over 5 files, and the instrumented tree really
+        # compiles.
+        instrument_src=repo / "src",
+        # No `--members`, unlike SuperTux. Members are reported by extending each
+        # class's report_state override, and STK has none: the snapshot builder
+        # writes a kart's fields itself (event_log_server.cpp's write_kart), so
+        # there is no per-class hook for the instrumenter to extend.
     )
 
 
@@ -373,8 +385,15 @@ def _witchblast() -> Game:
         # file(GLOB_RECURSE) and no CONFIGURE_DEPENDS, so a branch switch that
         # adds/removes .cpp files needs a re-glob or the stale build links wrong.
         # -S and -B are both the repo (in-source build).
+        # CMAKE_EXPORT_COMPILE_COMMANDS is what step 2a's instrumenter parses the
+        # source with: without the database libclang falls back to the spec's
+        # synthesized flags, which resolve fewer types and so silently reject
+        # candidate variables. The database lands in the repo root here (the build
+        # is in-source) and is gitignored on `base`, so it does not trip
+        # ensure_clean.
         build_commands=(
-            ("cmake", "-S", str(repo), "-B", str(repo)),
+            ("cmake", "-S", str(repo), "-B", str(repo),
+             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"),
             ("cmake", "--build", str(repo), f"-j{BUILD_JOBS}"),
         ),
         # Just the binary: ldd shows Witch_Blast links only system libs (SFML,
@@ -412,14 +431,26 @@ def _witchblast() -> Game:
         # (agent/determinism.hpp FIXED_DT = 1/60, LOGICAL_FPS = 60), one tape frame
         # per step, so a tape of N frames replays in N/60 s.
         seconds_per_step=1.0 / 60.0,
-        # No always-on (baseline-contrast) mutations for Witch Blast so far.
-        baseline_contrast_branches=frozenset(),
         # Witch Blast's replay honours a `--frames N` budget (default 600) and
         # self-closes when it is spent; a real tape can be longer (e.g. demo.rec is
         # 1200 frames = 20 s), which the 600 budget would cut in half. Pass a
         # budget larger than any tape so the tape-exhausted check ends the replay
         # instead. (SuperTux/STK have no such budget, so they leave this empty.)
         replay_extra_args=("--frames", "1000000"),
+        # Step 2a, as for SuperTux: gamerv's instrumenter rewrites this tree before
+        # every build so the binary reports its function-locals, and the edit is
+        # reverted right after the compile (instrument.py). Both preconditions
+        # hold: the REPORT_LOCAL runtime lives on `base` (sfml_game/GameEntity.h +
+        # predicates/local_report.hpp), and gamerv resolves a spec for this game
+        # (config/games/Witch Blast/source_instrument.json — the built-in default's
+        # scan globs are SuperTux paths and would find nothing here). Measured: 766
+        # keys over 17 files, and the instrumented tree really compiles.
+        instrument_src=repo / "src",
+        # No `--members`: Witch Blast's entities already report their members
+        # through reportState overrides that the game itself maintains, and the
+        # instrumenter's member path would only duplicate them (its keys drop no
+        # prefix here — fields are plain x/y/velocity — so a member key could also
+        # collide with a reserved consumer key).
     )
 
 
@@ -481,8 +512,14 @@ def _asteroids() -> Game:
         # header records `step 16`), one tape frame per step, so a tape of N frames
         # replays in N * 0.016 s.
         seconds_per_step=16.0 / 1000.0,
-        # No always-on (baseline-contrast) mutations for Asteroids so far.
-        baseline_contrast_branches=frozenset(),
+        # instrument_src stays None, and not for want of a spec: gamerv's
+        # instrumenter is a libclang tool (runners.source_instrument parses C++ via
+        # clang.cindex and its spec's "language" is "cpp"), and this game is
+        # JavaScript. Its reporting runtime exists all the same — GameRV.local /
+        # localArray / localObject in predicates/local_report.js — so a local here
+        # is reported by writing the call at the site, the way SuperTux's
+        # player.cpp does by hand. Nothing about step 2a would fail for Asteroids;
+        # it simply has nothing to run.
     )
 
 
@@ -503,8 +540,14 @@ def _freeminer() -> Game:
         # globbed), so a branch switch cannot silently drop a .cpp — but the
         # configure is re-run anyway: it is cheap next to the compile and keeps
         # a branch that does touch a CMakeLists honest.
+        # CMAKE_EXPORT_COMPILE_COMMANDS is what step 2a's instrumenter parses the
+        # source with: without the database libclang falls back to the spec's
+        # synthesized flags, which resolve fewer types and so silently reject
+        # candidate variables. build/ is gitignored, so the file it writes there
+        # never trips ensure_clean.
         build_commands=(
-            ("cmake", "-S", str(repo), "-B", str(build)),
+            ("cmake", "-S", str(repo), "-B", str(build),
+             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"),
             ("cmake", "--build", str(build), f"-j{BUILD_JOBS}"),
         ),
         # Just the binary: ldd shows freeminer links only system libs (its
@@ -558,14 +601,31 @@ def _freeminer() -> Game:
         # the trace, since a game that never exits gives the poll loop nothing to
         # stop early on.
         seconds_per_step=1.0 / 20.0,
-        # No always-on (baseline-contrast) mutations for FreeMiner so far.
-        baseline_contrast_branches=frozenset(),
         # On SIGTERM the client disconnects, the embedded server shuts down and
         # the world's LevelDB map database is flushed — measured at ~5-8 s, i.e.
         # right at the default grace. A SIGKILL landing in the middle of that
         # write can corrupt worlds/main, and every tape refuses to replay in any
         # other world, so give it room.
         shutdown_grace=25.0,
+        # Step 2a, as for SuperTux: gamerv's instrumenter rewrites this tree before
+        # every build so the binary reports its function-locals, and the edit is
+        # reverted right after the compile (instrument.py). Both preconditions
+        # hold: the REPORT_LOCAL runtime lives on `base` (the predicates::LocalHost
+        # mixin on LocalPlayer and ClientActiveObject), and gamerv resolves a spec
+        # for this game (config/games/FreeMiner/source_instrument.json — the
+        # built-in default's scan globs are SuperTux paths and would find nothing
+        # here). Measured: 229 keys over 2 files, and the instrumented tree really
+        # compiles.
+        #
+        # That spec scans only localplayer.cpp and content_cao.cpp, deliberately:
+        # a FreeMiner snapshot spends its byte budget (gamerv_max_snapshot_bytes)
+        # on map-node pseudo-objects, and reported locals are written inside that
+        # budget — so every key here is paid for in nodes. Widening the globs is a
+        # trade against node coverage, not a free win.
+        instrument_src=repo / "src",
+        # No `--members`: the CAOs' members are already written by their own
+        # report_state overrides, and the local player's by snapshot.cpp directly
+        # (which is not a per-class hook the instrumenter can extend).
     )
 
 

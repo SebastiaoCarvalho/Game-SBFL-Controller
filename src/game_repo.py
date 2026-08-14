@@ -94,34 +94,46 @@ def build(game: Game, instrument_source: bool = True) -> None:
     fail — so the repo is clean again for the next checkout. See instrument.py.
 
     The build cache is keyed by the HEAD tree hash (an exact content key for the
-    checked-out source — see head_tree_hash / buildcache.py) **plus the digest of
-    the pending instrumentation**, since the instrumented bytes are what actually
-    get compiled and they do not move the tree hash. On a hit the cached binary is
-    restored into the build dir and both the instrumentation and the expensive
-    configure+build are skipped; on a miss (or a corrupt slot) we build for real
-    and snapshot the result. The cache lives inside build() so every call site
-    benefits — the normal step-2 build and both builds of a baseline-contrast row.
+    checked-out source — see head_tree_hash / buildcache.py) **plus a fingerprint
+    of the instrumenter**, since the instrumented bytes are what actually get
+    compiled and they do not move the tree hash. The fingerprint is not the plan's
+    digest: deriving that means running the instrumenter (a libclang parse of the
+    whole game), which is most of what the cache is here to skip. It hashes the
+    inputs that decide the plan instead — the tool's code, the game's spec, our
+    flags — so it is a few file reads and the lookup happens *before* step 2a.
+    See instrument.fingerprint.
+
+    On a hit the cached binary is restored into the build dir and both the
+    instrumentation and the expensive configure+build are skipped — which is what
+    makes the key's cost worth minding: step 2a is a libclang parse of the whole
+    game (~100 s for SuperTux), so a key that cannot be computed without running
+    it would pay for the thing it is meant to avoid.
+
+    On a miss (or a corrupt slot) we build for real and snapshot the result. The
+    instrumentation runs once, inside ``instrument.applied`` — the write pass
+    discovers what to insert as part of inserting it, so there is no dry run
+    first. The stale slot is left in place until the snapshot succeeds
+    (``buildcache.store`` replaces it), so a failed or interrupted build does not
+    throw away a binary the next run could still have used. The cache lives inside
+    build() so every call site benefits.
     """
     branch = current_branch(game)
-    pending = (instrument.plan(game)
-               if instrument_source and instrument.enabled(game) else None)
+    instrumenting = instrument_source and instrument.enabled(game)
     key = head_tree_hash(game)
-    if pending is not None:
-        print(f"  [instrument] plan: {len(pending.keys)} key(s) across "
-              f"{pending.files} file(s)  (digest {pending.digest})")
-        key = f"{key}+i{pending.digest}"
-    if buildcache.has(game, branch, key) and buildcache.restore(game, branch):
-        print("  [build-cache] hit — restoring binary, skipping build")
-        if game.binary.exists():
+    if instrumenting:
+        key = f"{key}+i{instrument.fingerprint(game)}"
+    if buildcache.has(game, branch, key):
+        if buildcache.restore(game, branch):
+            print("  [build-cache] hit — restoring binary, skipping build")
             return
         print("  [build-cache] restored slot incomplete — rebuilding")
-    print("  [build-cache] miss — building")
-    buildcache.invalidate(game, branch)
-    if pending is None:
-        _configure_and_build(game)
     else:
-        with instrument.applied(game, pending):
+        print("  [build-cache] miss — building")
+    if instrumenting:
+        with instrument.applied(game):
             _configure_and_build(game)
+    else:
+        _configure_and_build(game)
     buildcache.store(game, branch, key)
 
 

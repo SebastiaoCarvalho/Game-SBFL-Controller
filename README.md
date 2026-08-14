@@ -44,7 +44,7 @@ The roster is `config.GAMES`; **add a game by appending one `Game` to
 `build_commands` (cmake configure+build for SuperTux; a game on another build
 system supplies its own command list), `cache_artifacts`, `rec_dir`,
 `launch_args`, `replay_flag` / `replay_delay_flag` / `replay_delay` /
-`replay_margin`, `seconds_per_step`, and `baseline_contrast_branches`.
+`replay_margin`, and `seconds_per_step`.
 
 **gamerv catalog selection.** gamerv keeps a per-game catalog bundle in
 `config/games/<name>/` (`game_profile.json` + `event_types.json`) and picks the
@@ -98,10 +98,9 @@ calls in. The compiler then sees the instrumented source, and **the edit is
 reverted as soon as the build finishes** — pass or fail — so the repo is clean for
 the next checkout and the instrumentation never lands on a dataset branch.
 
-It lives inside `game_repo.build()` rather than beside it in `run_case`, because
-it has to wrap *every* compile: a baseline-contrast row builds twice (base and
-mutant, from step 5) and both must be instrumented identically or their traces
-would not share a vocabulary. Its cost shows up in the `build` phase timing.
+It lives inside `game_repo.build()` rather than beside it in `run_case`, so that
+it wraps *every* compile from a single place. Its cost shows up in the `build`
+phase timing.
 
 - **Per game, opt-in:** `Game.instrument_src` (the source root to rewrite);
   `None` skips the step. On for **Super Tux** only today. A game can turn it on
@@ -168,25 +167,16 @@ CLI flag):
   - `midpoints` — sample midpoints across the pooled values and let the mining
     search pick (gamerv's historical behaviour).
 
-### Baseline-contrast rows (record on `base` + mutant)
+### Every row is a mutant row (record on the mutant alone)
 
-Most mutants break their property only under some condition, so a single mutant
-trace contains both good (`P & Q`) and violation (`P & ~Q`) states and mining can
-contrast them. A few mutations are **always-on** for the level their property
-covers — e.g. `change_music_config` plays the wrong music on *every* entry to its
-level — so the mutant trace has only violations and no good states to contrast,
-and mining returns `no_positives` (reported INCONCLUSIVE).
+Step 5 records the row's tapes on the mutant branch only. A mutant that breaks
+its property under some condition yields a trace holding both good (`P & Q`) and
+violation (`P & ~Q`) states, which is what mining contrasts to decide phi.
 
-For the branches listed in the game's `baseline_contrast_branches`, step 5 instead
-records the row's tapes on **both** `base` and the mutant into the one `logs/`
-dir (step 4 still clears once, with no clear in between). `base` supplies the
-valid `P & Q` states, the mutant the `P & ~Q` violations, and
-`compare_refinement` pools every trace under `logs/` (`build_mining_pool`), so
-phi is decided across the branch contrast: `base` validates clean, the mutant
-violates, and phi is proven a sound refinement on the pooled good/violation
-states. No gamerv change is needed — its pool is already cross-trace. The same
-tapes drive both binaries, so only the code under test differs. Step 2 defers its
-build for these rows since step 5 builds `base` and the mutant in turn.
+A mutation that is **always-on** for the level its property covers — e.g.
+`change_music_config` plays the wrong music on *every* entry to its level —
+leaves a trace with only violations and no good states to contrast, so mining
+returns `no_positives` and the row is reported INCONCLUSIVE.
 
 ### Step 5 needs a game-side `--replay` hook (on `base`)
 
@@ -216,10 +206,21 @@ sub-second. The first run is therefore interactive (pick the game/monitor).
 ./run_experiment.sh --row 4 --manual-auto   # replay cached manual answers
 ./run_experiment.sh --row 20 --refinement-mode data-direct --threshold-strategy weakest
 ./run_experiment.sh --row 4 --no-instrument  # skip step 2a (build source as committed)
+./run_experiment.sh --row 4 --clean         # drop row 4's cached build + logs, then stop
 ```
 
 Results are written to `results/results_<timestamp>.csv` (with a `game` column)
 and summarized on stdout.
+
+`--clean` deletes the selected rows' `build_cache/<game>/<branch>/` and
+`log_cache/<game>/<branch>/` slots and exits **without running anything**, so the
+next run of those rows rebuilds and re-records from scratch. It takes the same
+`--row`/`--rows`/`--game` selection as a run; unscoped it covers the whole dataset
+and asks for confirmation first (`--yes`, or a scope, to skip the prompt — it
+refuses outright when stdin is not a terminal). It only ever removes the two
+caches, both of which the next run regenerates: `hints/` (operator answers that
+cost a human to recreate), `logs_archive/` (the only copy of past runs' traces,
+not a cache) and `results/` are left alone.
 
 `--manual-auto` replays previously recorded answers to the manual image/audio
 predicate prompts (see *Manual predicate values* below) so a re-run doesn't ask
@@ -270,12 +271,19 @@ again.
   binary per game+branch, keyed by the HEAD **tree hash** (`git rev-parse
   HEAD^{tree}`) — an exact content key for the checked-out source (sound because
   `ensure_clean` aborts a dirty run, so the tree hash captures every tracked file)
-  — **plus the digest of the pending step-2a instrumentation** (`<tree>+i<digest>`),
-  since those edits are what actually get compiled and they never move the tree
-  hash. `instrument.plan()` re-derives that digest on every build without writing
-  anything (a few seconds), so a change to the instrumenter or its spec misses the
+  — **plus a fingerprint of the step-2a instrumenter** (`<tree>+i<fp>`), since its
+  edits are what actually get compiled and they never move the tree hash.
+  `instrument.fingerprint()` hashes the inputs that decide those edits (the tool's
+  own source, the game's spec json, the flags we pass it, and the
+  `compile_commands.json` it parses with), so a change to any of them misses the
   cache and rebuilds instead of restoring a binary built with the previous
-  instrumentation. Turning `--no-instrument` on or off flips the key the same way.
+  instrumentation. It hashes those inputs rather than the edits themselves because
+  deriving the edits means parsing the whole game with libclang — the lookup has
+  to be cheap, or it costs what the cache saves. The compile database is in there
+  because a stale one silently produces *worse* instrumentation rather than
+  failing: the same SuperTux tree instrumented 11 files with a leftover database
+  and 68 after a fresh cmake configure regenerated it. Turning `--no-instrument`
+  on or off flips the key the same way.
   On a matching key the configure+build is skipped and the cached binary is
   restored; a source change yields a different hash → miss → rebuild
   (self-correcting, like the log cache). Each slot snapshots just the game binary
@@ -300,9 +308,8 @@ again.
   Leave `MANUAL_PREDICATES` empty/unset to keep validation fully automatic.
 - **Replaying manual answers (`hints/`).** Every answer the operator gives is
   cached under `hints/<game>/<branch>/<recX>.hint` — one file per `.rec`
-  recording, keyed by gamerv's stable `"<state_index>::<call>"` (baseline-contrast
-  rows tag base vs mutant traces as `base__<recX>` / `<mutant>__<recX>` so they
-  don't collide). Caching happens on *every* interactive run, so the cache builds
+  recording, keyed by gamerv's stable `"<state_index>::<call>"`. Caching happens
+  on *every* interactive run, so the cache builds
   itself. Pass `--manual-auto` to **replay** it: each recording's cached answers
   are merged into its `manual_answers.json` before validation, so gamerv only
   asks about predicates not yet recorded (or nothing at all). This is sound only
