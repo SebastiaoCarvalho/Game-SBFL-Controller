@@ -1,0 +1,208 @@
+{
+  "_comment": [
+    "Accepted findings of phi_overlap_lint.py — the spec entries that currently",
+    "name a variable some row's ground-truth phi refines over.",
+    "",
+    "This is a DEBT LIST, not an exemption list. Every entry names the generic",
+    "mechanism that removes the need for it; when that mechanism lands, the spec",
+    "entry is DELETED and its line here is deleted with it. `accepted debt: 0` is",
+    "the deliverable, and it is what makes the claim 'no per-game configuration",
+    "references any variable appearing in a ground-truth specification' something",
+    "the build checks rather than something the paper asserts.",
+    "",
+    "Adding a line here to make a new entry pass is the exact practice the lint",
+    "exists to stop. The only legitimate additions are (a) an entry that predates",
+    "the lint, and (b) an entry whose reason is a mechanism, with a plan.",
+    "",
+    "A reason is mandatory and is checked for emptiness, not for content — so the",
+    "convention is: name the mechanism, not the row."
+  ],
+  "accepted": [
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "class": "publish",
+      "name": "bullets_alive",
+      "reason": "CONSUMER-SIDE: a count of objects satisfying a predicate is not a member of anything. Retired by a counting quantifier in the atom language, not by any instrumenter change"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.PlayerStatusHUD",
+      "class": "publish",
+      "name": "game_time_ms",
+      "reason": "global reporting: g_game_time is file-scope, so it is outside the locals+members universe until namespace-scope variables of scanned TUs are included"
+    },
+    {
+      "game": "Super Tux",
+      "path": "policy.scale_overrides",
+      "class": "publish",
+      "name": "m_last_gain_time",
+      "reason": "derived scaling: the factor should come from an observation pass over a real trace (--suggest-scaling), not from a hand-named site"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player[bullets_alive]._comment",
+      "class": "cited",
+      "name": "",
+      "reason": "prose for the bullets_alive entry; deleted with it"
+    },
+    {
+      "game": "Witch Blast",
+      "path": "report_on_routes[sound_host_on_player]._comment",
+      "class": "cited",
+      "name": "",
+      "reason": "singleton roots: SoundManager becomes a reported object, so its locals need no host route"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "class": "publish",
+      "name": "hurt",
+      "reason": "accessor reporting: Player::is_hurt() IS m_post_damage_safety_timer.started(), and Timer publishes fields only, so the composed timer object carries period/cycle_start but not the predicate over them. Retired when the instrumenter reports a closure class's public const nullary accessors alongside its fields — which also retires the rest of this extra_keys block (dying, dead, invincible, swimming, stone, winning, facing) and BadGuy's (active, frozen, in_water). phi then respells to player.post_damage_safety_timer.started == false"
+    },
+    {
+      "game": "Super Tux",
+      "path": "_comment",
+      "class": "cited",
+      "name": "",
+      "reason": "HISTORICAL, not a live rule: the paragraph records that four policy.include pins which rescued four benchmark rows were DELETED once GET_META/GET_CHUNK removed the datagram budget that motivated them. Deleting the prose would delete the evidence that the debt was paid. Retired when the paper carries that history instead of the spec"
+    },
+    {
+      "game": "FreeMiner",
+      "path": "_comment",
+      "class": "cited",
+      "name": "",
+      "reason": "LIVE selection bias, the last one: scan_globs is two files and the prose justifies the choice by how many dataset rows each serves, and names the mutated files it leaves out. The real constraint behind it is real — build_snapshot() drops map-node objects once the snapshot passes gamerv_max_snapshot_bytes, so keys are paid for in nodes. Retired by measuring the widened scan against a real trace's node count, as Super Tux Kart's _scan_globs_comment does for its own globs, and then either widening or justifying the narrowing by the node budget alone"
+    }
+  ],
+  "_retired_comment": [
+    "Debt that HAS been retired, kept for provenance: each line is an entry that",
+    "was in `accepted` until the mechanism named in `retired_by` landed and the",
+    "spec entry it excused was deleted. The lint does not read this list.",
+    "Trajectory: 25 accepted -> 5, over the nested-composition work (member",
+    "closure, nested overrides, container members, enum-array elements, singleton",
+    "roots, auto-decomposition) plus geometry moving into the snapshot ABI."
+  ],
+  "_retired": [
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.MovingObject",
+      "name": "x",
+      "retired_by": "nested override through MovingObject::m_col -> Rectf (m_p1/m_size are private), plus a one-time `geometry` path declaration in the game's game_profile.json — the consumer's positional bbox reads now resolve a declared path instead of a flat key (game_profile.geometry_path), so geometry no longer has to stay flat"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.MovingObject",
+      "name": "y",
+      "retired_by": "nested override through MovingObject::m_col -> Rectf (m_p1/m_size are private), plus a one-time `geometry` path declaration in the game's game_profile.json — the consumer's positional bbox reads now resolve a declared path instead of a flat key (game_profile.geometry_path), so geometry no longer has to stay flat (as for 'x')"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.MovingObject",
+      "name": "w",
+      "retired_by": "nested override through MovingObject::m_col -> Rectf (m_p1/m_size are private), plus a one-time `geometry` path declaration in the game's game_profile.json — the consumer's positional bbox reads now resolve a declared path instead of a flat key (game_profile.geometry_path), so geometry no longer has to stay flat (as for 'x')"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.MovingObject",
+      "name": "h",
+      "retired_by": "nested override through MovingObject::m_col -> Rectf (m_p1/m_size are private), plus a one-time `geometry` path declaration in the game's game_profile.json — the consumer's positional bbox reads now resolve a declared path instead of a flat key (game_profile.geometry_path), so geometry no longer has to stay flat (as for 'x')"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "name": "bonus",
+      "retired_by": "container members: m_player_status.bonus is std::vector<BonusType>; needs the member-path array form plus depth-1 flattening of PlayerStatus"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "name": "pocket_item",
+      "retired_by": "container members: m_item_pockets is a vector, same mechanism as 'bonus'"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "name": "level_time",
+      "retired_by": "singleton roots: m_play_time is GameSession's, not Player's; phi respells to game_session.play_time"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "name": "animation_loops",
+      "retired_by": "nested override through m_sprite (Sprite::m_animation_loops is private); also retires the get_animation_loops() reader added to sprite.hpp on base"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "name": "floor_normal_x",
+      "retired_by": "record decomposition on the member path: m_floor_normal is a plain Vector member"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player",
+      "name": "floor_normal_y",
+      "retired_by": "record decomposition, as for 'floor_normal_x'"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.key_overrides",
+      "name": "on_ground",
+      "retired_by": "a published name differing from its field; retired by respelling phi over the field's own name (on_ground_flag) once no override table exists"
+    },
+    {
+      "game": "Super Tux",
+      "path": "policy._scan_globs_comment",
+      "name": "",
+      "retired_by": "scan set computed from the member closure of the root classes, which makes a hand-picked glob list unnecessary"
+    },
+    {
+      "game": "Super Tux",
+      "path": "policy._exclude_comment",
+      "name": "",
+      "retired_by": "UNDER REVIEW: the GameObject::update veto is a genuine key-collision fix, not a rescue, but its justification is written in terms of row 3 and must be restated in row-independent terms"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player[animation_loops]._comment",
+      "name": "",
+      "retired_by": "prose for the animation_loops entry; deleted with it"
+    },
+    {
+      "game": "Super Tux",
+      "path": "report_state.extra_keys.Player[floor_normal_x]._comment",
+      "name": "",
+      "retired_by": "prose for the floor_normal entry; deleted with it"
+    },
+    {
+      "game": "Witch Blast",
+      "path": "report_state.extra_keys.BaseCreatureEntity",
+      "name": "state_time",
+      "retired_by": "container members: specialState[] is a C array, so no slot reaches a snapshot on its own"
+    },
+    {
+      "game": "Witch Blast",
+      "path": "report_state.extra_keys.PlayerEntity",
+      "name": "has_boss_key",
+      "retired_by": "container members: equip[] is a C array. This is the entry whose own comment says 'add one per slot a row needs'"
+    },
+    {
+      "game": "Witch Blast",
+      "path": "report_state.extra_keys.PlayerEntity",
+      "name": "has_leather_boots",
+      "retired_by": "container members: equip[] is a C array, as for 'has_boss_key'"
+    },
+    {
+      "game": "Witch Blast",
+      "path": "report_state.extra_keys.PlayerEntity",
+      "name": "is_moving",
+      "retired_by": "accessor-free reporting: isMoving() is derived, so phi respells over the fields it reads"
+    },
+    {
+      "game": "Witch Blast",
+      "path": "report_state.extra_keys.GameEntity",
+      "name": "uid",
+      "retired_by": "identity emitted generically, the way report_state.emit_class_literal already emits 'class'"
+    }
+  ]
+}

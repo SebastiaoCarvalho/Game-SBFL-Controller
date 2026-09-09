@@ -15,6 +15,7 @@ import time
 import buildcache
 import config
 import instrument
+import progress
 from config import Game
 
 
@@ -62,6 +63,25 @@ def head_tree_hash(game: Game) -> str:
     return _git(game, "rev-parse", "HEAD^{tree}")
 
 
+def build_key(game: Game, instrument_source: bool = True) -> str:
+    """The content key for what a build of the checked-out source produces.
+
+    The HEAD tree hash, plus the instrumenter's fingerprint when step 2a is on
+    (the instrumented bytes are what get compiled and they do not move the tree
+    hash — see ``build``).
+
+    Only the build cache keys on this. The log cache keys on ``head_tree_hash``
+    plus the built artifacts' bytes, leaving the fingerprint out wherever the
+    artifacts went through a compiler and so carry it already; the exception is a
+    ``source_served_at_runtime`` game, whose artifacts cannot — see
+    ``pipeline._record_or_restore``.
+    """
+    key = head_tree_hash(game)
+    if instrument_source and instrument.enabled(game):
+        key = f"{key}+i{instrument.fingerprint(game)}"
+    return key
+
+
 def _branch_exists_local(game: Game, branch: str) -> bool:
     return subprocess.run(
         ["git", "-C", str(game.repo_dir),
@@ -94,9 +114,9 @@ def build(game: Game, instrument_source: bool = True) -> None:
     fail — so the repo is clean again for the next checkout. See instrument.py.
 
     The build cache is keyed by the HEAD tree hash (an exact content key for the
-    checked-out source — see head_tree_hash / buildcache.py) **plus a fingerprint
-    of the instrumenter**, since the instrumented bytes are what actually get
-    compiled and they do not move the tree hash. The fingerprint is not the plan's
+    checked-out source — see build_key / head_tree_hash / buildcache.py) **plus a
+    fingerprint of the instrumenter**, since the instrumented bytes are what
+    actually get compiled and they do not move the tree hash. The fingerprint is not the plan's
     digest: deriving that means running the instrumenter (a libclang parse of the
     whole game), which is most of what the cache is here to skip. It hashes the
     inputs that decide the plan instead — the tool's code, the game's spec, our
@@ -119,9 +139,7 @@ def build(game: Game, instrument_source: bool = True) -> None:
     """
     branch = current_branch(game)
     instrumenting = instrument_source and instrument.enabled(game)
-    key = head_tree_hash(game)
-    if instrumenting:
-        key = f"{key}+i{instrument.fingerprint(game)}"
+    key = build_key(game, instrument_source)
     if buildcache.has(game, branch, key):
         if buildcache.restore(game, branch):
             print("  [build-cache] hit — restoring binary, skipping build")
@@ -129,33 +147,54 @@ def build(game: Game, instrument_source: bool = True) -> None:
         print("  [build-cache] restored slot incomplete — rebuilding")
     else:
         print("  [build-cache] miss — building")
-    if instrumenting:
+    if instrumenting and not game.source_served_at_runtime:
         with instrument.applied(game):
-            _configure_and_build(game)
+            _configure_and_build(game, branch)
     else:
-        _configure_and_build(game)
+        # Either nothing to instrument, or a game whose SOURCE is what runs (see
+        # Game.source_served_at_runtime). In the second case the caller owns the
+        # instrumentation's lifetime and has already applied it — reverting here
+        # would strip the edit before the tape ever replays, which is exactly the
+        # bug this branch exists to avoid.
+        _configure_and_build(game, branch)
     buildcache.store(game, branch, key)
 
 
-def _configure_and_build(game: Game) -> None:
+def _configure_and_build(game: Game, branch: str) -> None:
     """Run the game's build commands in order. Binary lands at ``game.binary``.
 
     The commands (cmake configure, then build, for SuperTux) come from
     ``game.build_commands`` and are re-run in full on every build — for SuperTux
     the configure step re-globs sources so a branch switch that adds/removes .cpp
     files is picked up (file(GLOB) has no CONFIGURE_DEPENDS). See config.Game.
+
+    ``branch`` only names the build log; the tree it compiles is whatever is
+    checked out (the caller just switched to it).
     """
     for cmd in game.build_commands:
-        print(f"  [{game.name}] $ {' '.join(cmd)}")
-        _run_build(game, list(cmd))
+        _run_build(game, list(cmd), branch)
     if not game.binary.exists():
         raise GameError(f"build finished but {game.binary} is missing")
 
 
-def _run_build(game: Game, cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, cwd=str(game.repo_dir),
-                          text=True, timeout=config.BUILD_TIMEOUT)
-    if proc.returncode != 0:
+def _run_build(game: Game, cmd: list[str], branch: str) -> None:
+    """One build command, condensed to a single self-updating progress line.
+
+    The full output is not lost — it goes to ``config.build_log_path`` and, if
+    the command fails, its errors (or its tail) are printed. Set
+    CONTROLLER_BUILD_OUTPUT=raw to inherit the command's stdout instead, which is
+    what this used to do unconditionally; a build of a big game then floods the
+    terminal and buries the pipeline's own step headers. See progress.py.
+    """
+    if not config.BUILD_PROGRESS:
+        print(f"  [{game.name}] $ {' '.join(cmd)}")
+        rc = subprocess.run(cmd, cwd=str(game.repo_dir),
+                            text=True, timeout=config.BUILD_TIMEOUT).returncode
+    else:
+        rc = progress.run(cmd, cwd=game.repo_dir, timeout=config.BUILD_TIMEOUT,
+                          tag=game.name,
+                          log_path=config.build_log_path(game.name, branch))
+    if rc != 0:
         raise GameError(f"command failed: {' '.join(cmd)}")
 
 

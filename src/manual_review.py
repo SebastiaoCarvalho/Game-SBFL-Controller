@@ -14,6 +14,13 @@ next validate pass. It is the headless-controller analogue of the gamerv GUI's
 ``ManualPredicatesDialog``; ``gamerv.validate`` calls ``collect`` and re-invokes
 validate until the verdict is written.
 
+A prompt is the one step of the pipeline that cannot run unattended, so
+``collect`` has a third way out for an overnight batch: with ``skip`` set
+(``run_experiment.py --skip-manual``) it raises :class:`NeedsManualError` as soon
+as a request no hint covers turns up, and the row is reported ``NEEDS_MANUAL``
+instead of stopping the run on a question. Nothing is written for such a row —
+the operator re-runs it interactively later and the answers land in the hint then.
+
 The JSON layout (``manual_requests.json`` / ``manual_answers.json``) and the
 per-request ``key`` are gamerv's stable contract — see ``validation/manual.py``.
 Asset paths in a request are stored relative to the run dir.
@@ -27,10 +34,25 @@ from pathlib import Path
 import hints
 
 
+#: How many pending calls a skipped row's note names before summarising the rest.
+_NOTE_CALLS = 3
+
+
 class NoTTYError(RuntimeError):
     """Manual input is needed but there is no terminal to prompt the operator on
-    (e.g. a headless/CI controller run). Turn MANUAL_PREDICATES off, or run the
-    experiment interactively."""
+    (e.g. a headless/CI controller run). Turn MANUAL_PREDICATES off, run the
+    experiment interactively, or pass --skip-manual to have such rows skipped
+    (NEEDS_MANUAL) instead of failing."""
+
+
+class NeedsManualError(RuntimeError):
+    """Manual input is needed, no hint covers it, and the run asked for such rows
+    to be skipped (``run_experiment.py --skip-manual``).
+
+    The pipeline turns this into a ``NEEDS_MANUAL`` result for the row and carries
+    on with the next one, so an unattended batch never blocks on a prompt. The
+    message names the run dir and the calls still to judge, so the row can be
+    re-run interactively afterwards."""
 
 
 def manifest_path(run_dir: Path, worker_output: str) -> Path:
@@ -49,7 +71,8 @@ def manifest_path(run_dir: Path, worker_output: str) -> Path:
 
 def collect(run_dir: Path, worker_output: str,
             hint_path: Path | None = None,
-            defaults: dict[str, bool] | None = None) -> int:
+            defaults: dict[str, bool] | None = None,
+            skip: bool = False) -> int:
     """Resolve every pending manual predicate and persist the answers.
 
     Returns the number of answers gathered (0 when the manifest lists none).
@@ -58,13 +81,21 @@ def collect(run_dir: Path, worker_output: str,
     default (``defaults``, from ``hints.default_map`` — a bare-call entry in the
     tape hint or the branch ``_defaults.hint``) is auto-answered with no prompt,
     index-free, so it works across traces and re-recordings. Any request no
-    default covers is asked at the terminal — and raises ``NoTTYError`` only if
+    default covers is asked at the terminal, in trace order (by ``event_index``,
+    not gamerv's manifest order) — and raises ``NoTTYError`` only if
     such *unresolved* prompts remain and stdin is not a terminal (fully-defaulted
     traces need no TTY).
 
     When ``hint_path`` is given, the operator's *hand* answers are appended to that
     hint file so a later ``--manual-auto`` run can replay them; default-resolved
     answers are not baked in — the default stays the single source of truth.
+
+    ``skip`` is the unattended-batch mode: rather than ask (or raise ``NoTTYError``),
+    a request no default covers raises :class:`NeedsManualError` and no answers are
+    written at all — not even the defaulted ones, since a half-answered run dir
+    would only mislead the next pass. The row is then reported ``NEEDS_MANUAL`` and
+    the batch moves on. A trace the hints *do* cover is unaffected: it is answered
+    and validated exactly as under ``--manual-auto``.
     """
     requests = _read_requests(manifest_path(run_dir, worker_output))
     if not requests:
@@ -73,14 +104,25 @@ def collect(run_dir: Path, worker_output: str,
 
     resolved = {r["key"]: defaults[r["call"]]
                 for r in requests if r.get("call") in defaults}
-    to_prompt = [r for r in requests if r["key"] not in resolved]
+    to_prompt = sorted((r for r in requests if r["key"] not in resolved),
+                       key=_event_order)
 
+    # Skip before the TTY check: --skip-manual is meant to work both ways, on a
+    # detached batch (where the prompt is impossible) and on an interactive one
+    # left running overnight (where it is possible but nobody is there to answer).
+    if to_prompt and skip:
+        note = _pending_note(run_dir, to_prompt)
+        print(f"\n  [manual] {note}")
+        print("  [manual] --skip-manual: leaving this row unanswered "
+              "(reported NEEDS_MANUAL); re-run it interactively to classify.")
+        raise NeedsManualError(note)
     if to_prompt and not sys.stdin.isatty():
         raise NoTTYError(
             f"{len(to_prompt)} predicate value(s) need manual input, but the "
             f"controller has no TTY to prompt on. Add a per-call default to the "
             f"hint (bare-call key, or hints/<branch>/{hints.DEFAULTS_FILE}), run "
-            f"the experiment interactively, or turn MANUAL_PREDICATES off."
+            f"the experiment interactively, pass --skip-manual to skip such rows, "
+            f"or turn MANUAL_PREDICATES off."
         )
     if resolved:
         print(f"\n  [manual] auto-answered {len(resolved)} predicate value(s) "
@@ -102,6 +144,34 @@ def collect(run_dir: Path, worker_output: str,
 # --------------------------------------------------------------------------- #
 # internals
 # --------------------------------------------------------------------------- #
+
+def _pending_note(run_dir: Path, pending: list[dict]) -> str:
+    """One line naming what is still to be judged, for the skipped row's note.
+
+    Names the run dir (which recording of the row needs attention) and the first
+    few calls with their event index — enough to find them in the row's hint
+    without re-running validate. Kept short: it ends up in a results CSV cell.
+    """
+    shown = ", ".join(f"{r.get('call')} @ event {r.get('event_index')}"
+                      for r in pending[:_NOTE_CALLS])
+    more = (f", +{len(pending) - _NOTE_CALLS} more"
+            if len(pending) > _NOTE_CALLS else "")
+    return (f"{len(pending)} predicate value(s) in {run_dir.name} need manual "
+            f"judgement and no hint covers them ({shown}{more})")
+
+
+def _event_order(request: dict) -> tuple[int, float, str]:
+    """Sort key that walks the operator through the trace in event order.
+
+    gamerv lists requests in whatever order its validators produced them, which
+    can jump around (event 30 before event 20). Requests without a usable
+    ``event_index`` keep a stable spot at the end, ordered by call name.
+    """
+    try:
+        return (0, float(request.get("event_index")), request.get("call") or "")
+    except (TypeError, ValueError):
+        return (1, 0.0, request.get("call") or "")
+
 
 def _read_requests(path: Path) -> list[dict]:
     try:

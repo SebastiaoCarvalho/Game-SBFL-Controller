@@ -8,3 +8,6 @@ hints/
 scripts/*.csv
 .properties_backup.json
 instrument/
+list.txt
+build_logs/
+

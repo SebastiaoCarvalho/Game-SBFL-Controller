@@ -1,15 +1,25 @@
 """Content-addressed cache of step-5 raw logs, one slot per game+branch.
 
 A row's recorded traces (events/video/audio/predicate trace, *before* validation)
-depend only on the game binary and the ``.rec`` tapes — never on the property,
+depend only on the built game and the ``.rec`` tapes — never on the property,
 refinement mode, or threshold strategy, which are all applied later in steps 6/8.
-So when the same binary replays the same tapes again, the recording can be skipped:
+So when the same game replays the same tapes again, the recording can be skipped:
 the cached logs are restored into ``logs/`` and re-validated.
 
-The cache is keyed by a content hash (sha256 of the binary(ies) + the tapes) but
-stored under a per-game+branch slot, so only ONE entry per branch is ever kept
+"The built game" is *not* the binary alone. The game also loads assets and scripts
+straight from the source tree at runtime (FreeMiner's ``builtin/*.lua``, SuperTux's
+``data/levels/*.stl``), so a mutant living in one of those changes behaviour while
+compiling to a byte-identical binary. The caller therefore folds the HEAD tree
+hash — which covers every tracked file (``game_repo.head_tree_hash``) — into the
+key alongside the artifact hashes, and for a game whose source is what *runs*
+(Asteroids: no compiler, ``game.js`` served out of the repo) the step-2a
+fingerprint as well, since no artifact of that build carries it. See
+``compute_key`` and ``pipeline._record_or_restore``.
+
+The cache is keyed by a content hash (the tree hash + artifact shas + the tapes)
+but stored under a per-game+branch slot, so only ONE entry per branch is ever kept
 (bounded disk), games can't collide on a shared branch name, and a changed
-binary/tape simply deletes the slot and re-records:
+source/binary/tape simply deletes the slot and re-records:
 
     log_cache/<game>/<branch>/
         meta.json            # {"key": "<sha256>", "run_dirs": [...], "created": "..."}
@@ -17,8 +27,8 @@ binary/tape simply deletes the slot and re-records:
 
 The snapshot is taken at step 5, before validation, so the cache only ever holds
 pristine logs (no ``validation_result.json``); validation re-runs cleanly on every
-hit. Content hashing is self-correcting: any binary change → different hash → miss
-→ re-record.
+hit. Content hashing is self-correcting: any source or binary change → different
+hash → miss → re-record.
 """
 
 import hashlib
@@ -59,10 +69,15 @@ def tapes_sha(game: Game, branch: str) -> str:
     return h.hexdigest()
 
 
-def compute_key(binary_shas: list[str], game: Game, branch: str) -> str:
-    """Cache key from the binary hash(es) and the branch's tape hash."""
+def compute_key(build_parts: list[str], game: Game, branch: str) -> str:
+    """Cache key from the caller's build identifiers and the branch's tape hash.
+
+    ``build_parts`` is whatever identifies the built game: the source tree hash
+    followed by the artifact shas. Order matters — it is hashed as a joined list,
+    not a set.
+    """
     h = hashlib.sha256()
-    h.update("\n".join(binary_shas).encode())
+    h.update("\n".join(build_parts).encode())
     h.update(tapes_sha(game, branch).encode())
     return h.hexdigest()
 

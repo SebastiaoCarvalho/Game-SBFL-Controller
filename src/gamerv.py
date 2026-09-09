@@ -246,7 +246,8 @@ def run_dirs() -> list[Path]:
                   if d.is_dir() and (d / "events.jsonl").exists())
 
 
-def validate(run_dir: Path, auto: bool = False) -> subprocess.CompletedProcess:
+def validate(run_dir: Path, auto: bool = False,
+             skip_manual: bool = False) -> subprocess.CompletedProcess:
     """Validate a logged run, answering manual predicate prompts if gamerv asks.
 
     With MANUAL_PREDICATES active, gamerv can't compute the visual/audio
@@ -255,6 +256,13 @@ def validate(run_dir: Path, auto: bool = False) -> subprocess.CompletedProcess:
     looping until the verdict is written (exit 0). Each pass only asks about
     predicates still unanswered, so it converges (usually in one round). When
     manual mode is off this is a single pass, exactly as before.
+
+    The hint is first reconciled against this run's trace (``hints.reconcile``):
+    its per-state keys are positions in the event log, so a trace that gained or
+    lost an event since the answers were collected — a mutant tape, a re-recording
+    — would replay every later answer one state off. Reconciling re-anchors them
+    and drops the ones whose event is gone, so those are asked again rather than
+    silently mislabelled.
 
     ``auto`` replays cached operator answers: the run's hint file (if any) is
     merged into manual_answers.json before the first pass, so gamerv finds those
@@ -265,13 +273,26 @@ def validate(run_dir: Path, auto: bool = False) -> subprocess.CompletedProcess:
     prompting, index-free so they survive re-recording and reuse across traces.
     Every answer the operator does give is saved back to the hint, regardless of
     ``auto``, so a normal run builds the cache.
+
+    ``skip_manual`` makes the loop give up instead of prompting when the hints run
+    out: ``collect`` raises ``manual_review.NeedsManualError``, which ``run_case``
+    turns into a ``NEEDS_MANUAL`` row. That is what lets a batch run unattended —
+    every trace the hints cover still validates normally, and only the ones needing
+    a human are left for later.
     """
     hint_path = hints.path_for(run_dir)
     defaults: dict[str, bool] = {}
-    if auto and hint_path is not None:
-        if hint_path.exists():
-            hints.seed(run_dir, hint_path)
-        defaults = hints.default_map(hint_path)
+    if hint_path is not None:
+        # Always, not just under --manual-auto: the answers appended after a
+        # prompt are indexed by *this* trace, so the ones already in the file have
+        # to be talking about it too.
+        note = hints.reconcile(run_dir, hint_path)
+        if note:
+            print(f"  [hints] {note}")
+        if auto:
+            if hint_path.exists():
+                hints.seed(run_dir, hint_path)
+            defaults = hints.default_map(hint_path)
     while True:
         proc = _worker("validate", str(run_dir), timeout=config.VALIDATE_TIMEOUT)
         if proc.stdout:
@@ -279,7 +300,8 @@ def validate(run_dir: Path, auto: bool = False) -> subprocess.CompletedProcess:
         if proc.returncode == 0:
             return proc
         if proc.returncode == NEEDS_MANUAL_EXIT:
-            if manual_review.collect(run_dir, proc.stdout or "", hint_path, defaults) == 0:
+            if manual_review.collect(run_dir, proc.stdout or "", hint_path,
+                                     defaults, skip=skip_manual) == 0:
                 # Signalled NEEDS_MANUAL but listed nothing to answer: re-running
                 # would loop forever, so treat it as a failure.
                 raise GameRVError(
@@ -290,12 +312,18 @@ def validate(run_dir: Path, auto: bool = False) -> subprocess.CompletedProcess:
         raise GameRVError(f"validate {run_dir} failed:\n{proc.stderr}")
 
 
-def validate_all(auto: bool = False) -> list[Path]:
-    """Validate every recorded run. Returns the list of run dirs validated."""
+def validate_all(auto: bool = False, skip_manual: bool = False) -> list[Path]:
+    """Validate every recorded run. Returns the list of run dirs validated.
+
+    ``skip_manual`` propagates to each pass: the first run dir whose manual
+    predicates no hint covers aborts the whole row with
+    ``manual_review.NeedsManualError`` (a row's verdict is read off its traces
+    together, so validating the rest of them would decide phi against a partial
+    picture)."""
     dirs = run_dirs()
     for d in dirs:
         print(f"  [gamerv] validating {d.name} ...")
-        validate(d, auto=auto)
+        validate(d, auto=auto, skip_manual=skip_manual)
     return dirs
 
 
@@ -346,10 +374,115 @@ def fault_localize(run_dir: Path, terms: list[str] | None = None,
 
 @dataclass
 class Containment:
-    status: str             # SUCCESS | FAIL | NOT_FOUND | INCONCLUSIVE | ERROR
+    status: str             # SUCCESS | FAIL | REFINEMENT_NOT_FOUND
+                            # | VARIABLE_NOT_FOUND | INCONCLUSIVE | SKIPPED | ERROR
     r_text: str | None      # the mined refinement R, if printed
     stdout: str
     verdict: str | None = None   # gamerv's one-line "=> ..." conclusion, for notes
+
+
+def _split_depth0(s: str, sep: str) -> list[str]:
+    """Split ``s`` on ``sep`` at paren depth 0 only."""
+    parts, buf, depth, i = [], [], 0, 0
+    while i < len(s):
+        c = s[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0 and s.startswith(sep, i):
+            parts.append("".join(buf))
+            buf = []
+            i += len(sep)
+            continue
+        buf.append(c)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _unwrap(s: str) -> str:
+    """Drop one pair of parens that wraps the whole expression."""
+    s = s.strip()
+    if not (s.startswith("(") and s.endswith(")")):
+        return s
+    depth = 0
+    for i, c in enumerate(s):
+        depth += (c == "(") - (c == ")")
+        if depth == 0 and i < len(s) - 1:
+            return s                # the opening paren closes early: not a wrapper
+    return s[1:-1].strip()
+
+
+_REFINED_MARKER = "Refined invariant:"
+
+#: gamerv's corroborate refuses to score a phi that reads a quantity no pooled
+#: state carries ("Could not evaluate phi: phi reads <k>, which no logged state
+#: reports — the game does not export the quantity ..."). That is a fault in the
+#: game's exported vocabulary, not in the experiment, so it gets its own status
+#: (VARIABLE_NOT_FOUND) rather than being lumped in with ERROR.
+_UNEXPORTED_MARKER = "which no logged state reports"
+
+
+def mined_r(out: str) -> str | None:
+    """The mined R from fault_localize's ``Refined invariant:`` line, if it printed one.
+
+    The line reads ``Refined invariant:  G((P) & (R) -> (Q))``. Splitting at paren
+    depth 0 inside the ``G(...)`` isolates the antecedent ``(P) & (R)``, whose last
+    top-level conjunct is R — P's own ``&``s sit at depth 1, inside P's parens.
+    """
+    for line in reversed(out.splitlines()):
+        s = line.strip()
+        if not s.startswith(_REFINED_MARKER):
+            continue
+        body = s[len(_REFINED_MARKER):].strip()
+        if not (body.startswith("G(") and body.endswith(")")):
+            return None
+        antecedent = _split_depth0(body[2:-1], "->")[0]
+        return _unwrap(_split_depth0(antecedent, "&")[-1]) or None
+    return None
+
+
+def mine_only(run_dir: Path, terms: list[str] | None = None,
+              strategy: str | None = None) -> Containment:
+    """Mine R with no phi to judge it against — the SKIPPED path for a dataset row
+    whose ``Target Phi`` cell is empty.
+
+    There is no ground truth to compare, so there is no verdict to reach: the row
+    is reported ``SKIPPED`` rather than run through compare_refinement (which,
+    handed an empty phi, could only fail to evaluate it and come back ERROR).
+    Mining still runs, via fault_localize, because it is the half of step 8 that
+    does not depend on phi: it produces the same R_all a compare would have mined
+    and persists it (``fault_localization.json``), so the row still contributes its
+    mined R and candidate count — the numbers that let a ground truth be written
+    for it later. A mining failure keeps the row SKIPPED (the row was never going
+    to yield a verdict); the reason is carried in the note.
+    """
+    try:
+        out = fault_localize(run_dir, terms, strategy)
+    except GameRVError as exc:
+        return Containment("SKIPPED", None, str(exc),
+                           "no ground-truth phi (mining R failed)")
+    return Containment("SKIPPED", mined_r(out), out,
+                       "no ground-truth phi for this row — nothing to compare")
+
+
+def _unexported_note(out: str) -> str | None:
+    """The missing quantities from gamerv's unexported-variable message, as one line.
+
+    gamerv spells the reason out over four sentences (what it read, why it refuses
+    to score it, what to do about it); the full text stays in ``Containment.stdout``,
+    while the notes column keeps only the part that identifies the row: which
+    quantities phi reads that the game never exports.
+    """
+    for line in out.splitlines():
+        head, sep, tail = line.partition("phi reads ")
+        if not sep or _UNEXPORTED_MARKER not in tail:
+            continue
+        refs = tail.split(", " + _UNEXPORTED_MARKER)[0].strip()
+        return (f"phi reads {refs}, which the game does not export "
+                f"(no logged state reports it) — phi was not evaluated")
+    return None
 
 
 def parse_containment(out: str, mode: str = "auto") -> Containment:
@@ -359,23 +492,35 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
     when phi is raw-evaluable: it evaluates phi on the pooled good (P & Q) and
     violation (P & ~Q) states, independent of R's thresholds ("phi IS a sound
     refinement" / "is NOT sound" / "VACUOUS"). For a non-raw phi it instead decides
-    symbolic phi -> R_all containment ("IS CONTAINED" / "is NOT contained"), and in
-    ``symbolic`` mode it *also* appends that containment view (a "(symbolic view …)"
-    block) alongside the corroborate verdict. So in symbolic mode the output carries
-    BOTH conclusions.
+    symbolic containment — ``Exists R in R_all: phi -> R``, phi against each mined
+    refinement **on its own** ("IS CONTAINED in a single mined refinement" / "is NOT
+    contained in ANY single mined refinement") — and in ``symbolic`` mode it *also*
+    appends that containment view (a "(symbolic view …)" block) alongside the
+    corroborate verdict. So in symbolic mode the output carries BOTH conclusions.
+
+    The containment view is per-candidate on purpose: ``phi -> (R1 | … | Rn)`` against
+    their union passes as soon as several candidates *jointly* cover phi, which is not
+    a refinement any single mined R establishes. When that is what happened, gamerv
+    says so and the row is reported as the search having missed phi — the note carries
+    it, and ``metrics.Mining.union_only`` counts it.
 
     Classification therefore depends on ``mode``:
 
-    * ``symbolic`` — SUCCESS is decided by phi -> R_all containment ONLY. When R_all
-      does not establish phi (phi not contained, or no R_all was mined over phi's
-      variable) yet the data-direct corroborate test *does* show phi sound, the mined
-      R simply failed to *find* phi as a refinement even though the data says it is
-      one -> ``NOT_FOUND`` (distinct from both SUCCESS and FAIL). FAIL is reserved for
-      a phi that is genuinely unsound (keeps a violation) or not contained with no
-      corroboration.
+    * ``symbolic`` — SUCCESS is decided by the per-candidate containment ONLY. When no
+      single mined refinement establishes phi (phi not contained, or nothing was mined
+      over phi's variable) yet the data-direct corroborate test *does* show phi sound,
+      the mined R simply failed to *find* phi as a refinement even though the data says
+      it is one -> ``REFINEMENT_NOT_FOUND`` (distinct from both SUCCESS and FAIL). FAIL
+      is reserved for a phi that is genuinely unsound (keeps a violation) or not
+      contained with no corroboration.
     * ``auto`` / ``data-direct`` — the data-direct corroborate verdict is
       authoritative (gamerv's historical behaviour), with symbolic containment as the
       fallback for a non-raw phi.
+
+    Ahead of both paths sits ``VARIABLE_NOT_FOUND``: gamerv could not evaluate phi at
+    all because it reads a quantity no logged state reports. Nothing was decided about
+    phi — the game simply does not export the variable its ground truth is written
+    over — so the row is neither a verdict nor an experiment failure (``ERROR``).
 
     Pure string logic, separated out so it can be unit-tested without the worker.
     """
@@ -397,23 +542,41 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
                 sym_verdict = concl
 
     # Signals (mutually distinct substrings, so membership tests don't collide).
-    contained     = "IS CONTAINED" in out          # phi -> R_all holds
-    not_contained = "is NOT contained" in out       # phi -> R_all fails (witness)
+    contained     = "IS CONTAINED" in out           # some single R establishes phi
+    not_contained = "is NOT contained" in out       # no single R does (witness shown)
+    # phi is covered only by the *union* of several candidates — gamerv reports it on a
+    # miss, and it is the reason a row the old union test called found is now a miss.
+    union_only    = "established only by several mined refinements together" in out
     no_r_all      = ("not comparable by containment" in out
                      or "no mined refinement constrains" in out)
     data_sound    = "IS a sound refinement" in out  # corroborate: sound + informative
     data_unsound  = "is NOT sound" in out or "VACUOUS" in out
 
+    # Decided before either mode: phi was never scored, because the game exports
+    # none of the quantities it reads. Reported as its own outcome (a gap in the
+    # game's instrumentation) rather than as an ERROR (a broken experiment run).
+    if _UNEXPORTED_MARKER in out:
+        return Containment("VARIABLE_NOT_FOUND", r_text, out,
+                           _unexported_note(out) or verdict)
+
     if mode == "symbolic":
-        # SUCCESS comes from R_all containment only; everything else cross-references
-        # the data-direct verdict to separate NOT_FOUND (R missed a real refinement)
-        # from FAIL (phi genuinely not sound).
+        # SUCCESS comes from the per-candidate containment only; everything else
+        # cross-references the data-direct verdict to separate REFINEMENT_NOT_FOUND (R
+        # missed a real refinement) from FAIL (phi genuinely not sound).
         if contained:
-            status, note = "SUCCESS", (sym_verdict or verdict)
+            status = "SUCCESS"
+            # A phi *stronger* than the mined R it is contained in is sound whatever the
+            # data says about its informativeness, so a VACUOUS corroborate verdict (phi
+            # excludes every good state too) can survive into a SUCCESS. Say so in the
+            # note rather than letting such a row read as a clean find.
+            note = (f"[vacuous on the data] {sym_verdict or verdict}"
+                    if "VACUOUS" in out else (sym_verdict or verdict))
         elif (not_contained or no_r_all) and data_sound:
-            status = "NOT_FOUND"
-            note = ("phi not established by R_all (symbolic), but corroborated by the "
-                    "data — mined R did not find it")
+            status = "REFINEMENT_NOT_FOUND"
+            note = ("phi corroborated by the data, but no single mined refinement "
+                    "establishes it — the search did not find it"
+                    + (" (only the union of several candidates covers it)"
+                       if union_only else ""))
         elif not_contained or data_unsound:
             status, note = "FAIL", (sym_verdict or verdict)
         elif ("No sound refinement R was mined" in out or "Cannot compare phi" in out
@@ -451,7 +614,14 @@ def compare_refinement(run_dir: Path, phi: str,
 
     terms/mode/strategy are passed as fixed argv positions (terms as JSON, "null"
     when absent) so mode and strategy stay addressable even when no terms are set.
+
+    An empty ``phi`` (a dataset row with no ground truth) is not an error: it is
+    routed to :func:`mine_only`, which mines R and returns ``SKIPPED``.
     """
+    if not phi.strip():
+        # No ground truth to compare: gamerv would only report that it could not
+        # evaluate an empty phi, which reads as an ERROR. Mine R instead.
+        return mine_only(run_dir, terms, strategy)
     mode = mode or config.REFINEMENT_MODE
     strategy = strategy or config.THRESHOLD_STRATEGY
     args = ["compare_refinement", str(run_dir), phi,

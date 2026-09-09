@@ -5,6 +5,7 @@
 #
 #     ./run_experiment.sh --row 4
 #     ./run_experiment.sh --rows 4-9 --manual-auto
+#     ./run_experiment.sh --rows 1-60 --skip-manual   # unattended (overnight)
 #     ./run_experiment.sh --row 20 --refinement-mode symbolic --threshold-strategy weakest
 #
 set -euo pipefail

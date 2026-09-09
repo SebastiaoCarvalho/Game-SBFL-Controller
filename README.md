@@ -4,8 +4,23 @@ Automated controller for the GameRV fault-localization experiment. It is
 **multi-game**: each row of `dataset.csv` names a **Game** (the `Game Name`
 column), and for that row the controller builds the mutated game branch, verifies
 the row's safety property with `gamerv`, and checks whether the ground-truth
-refinement `phi` entails the mined refinement `R` (`phi -> R`). A row is
-**SUCCESS** when `phi -> R`, **FAIL** otherwise.
+refinement `phi` entails one of the mined refinements `R` (`phi -> R`). A row is
+**SUCCESS** when **some single mined `R`** satisfies `phi -> R`, **FAIL** otherwise.
+
+The quantifier matters, and it is the evaluation rule: mining returns a whole
+ranked set `R_all = R1, R2, …`, and the test is
+
+    ∃ R ∈ R_all . phi -> R
+
+not `phi -> (R1 | R2 | … | Rn)` against their union. A union covers `phi` as soon
+as several candidates *together* do, while no single refinement the tool would
+report actually implies it — that ground truth was not found, so it does not
+count. Rows in that position are reported separately (the `union_only` column and
+the report's `union` count), which is what makes the stricter rule's effect
+visible instead of hidden. The direction is `phi -> R` because a mined `R` is
+*less strict* than the ground truth in the threshold case: with
+`--threshold-strategy weakest` a candidate's split sits at the violation
+boundary, so a sound hand-written `phi` lies inside it.
 
 The nine-step flow is identical for every game — a mutant is always a git branch
 you compile, and a trace is always a `.rec` tape replayed through the game's
@@ -16,21 +31,25 @@ you compile, and a trace is always a `.rec` tape replayed through the game's
 
 The project root holds only the `run_experiment.sh` entrypoint and the data
 directories it writes (`results/`, `hints/`, `log_cache/`, `build_cache/`,
-`logs_archive/`). All Python modules live in `src/`; workflow helper scripts
+`build_logs/`, `logs_archive/`). All Python modules live in `src/`; workflow helper scripts
 that are not part of the pipeline itself live in `scripts/`.
 
 | File | Role |
 |------|------|
 | `run_experiment.sh` | Root entrypoint: thin wrapper that forwards its args to `src/run_experiment.py`. |
 | `src/config.py` | Shared paths/constants **and** the per-game `Game` registry (`GAMES`, `get_game()`). |
-| `src/dataset.py` | Reads `dataset.csv` into `TestCase(game, specification, branch, phi)`. |
+| `src/dataset.py` | Reads `dataset.csv` into `TestCase(game, specification, branch, phi, fault_type)` **and** owns the fault taxonomy (the twelve `Fault Type` categories and their two parents). |
 | `src/game_repo.py` | git checkout, build, game launch/shutdown — each fn takes a `config.Game`. |
 | `src/instrument.py` | Step 2a: runs gamerv's source instrumenter over the branch before each compile, then reverts it. |
+| `src/progress.py` | Renders a long subprocess (the compiles) as one self-updating progress line, with its full output kept in `build_logs/`. |
 | `src/gamerv.py` | Wrappers around gamerv's `worker.py` ops + logs/properties/active-game helpers. |
 | `src/manual_review.py` | Operator prompts for gamerv's manual visual/audio predicate values (step 6). |
 | `src/hints.py` | Caches the operator's manual answers per recording (`hints/`) so `--manual-auto` can replay them. |
 | `src/recordings.py` | Lists a game/branch's `.rec` tapes and computes a replay's duration from its frame count. |
 | `src/pipeline.py` | `run_case()` — the 9-step workflow incl. `record_traces` (step 5). |
+| `src/metrics.py` | Step 8's mining metrics per row: candidate-set size, the ground truth's rank in it, the match tier, and the `union_only` flag. |
+| `src/report.py` | Writes `report.txt` from a run's CSVs: classification counts, the same counts per game / bug category / parent category, the **per-game breakdown** (the whole analysis again over each game's own rows), and the per-case division (one line per dataset row); also a standalone CLI. |
+| `src/plots.py` | Draws a run's figures from its CSVs (candidate-count boxplot; candidates vs. ground-truth rank); also a standalone CLI. |
 | `src/run_experiment.py` | CLI implementation: select rows, loop, write `results/`. |
 | `scripts/prepare_branches.py` | **Secondary** maintenance: reconcile a game's branches with its `base`. |
 
@@ -80,8 +99,10 @@ branch name (e.g. `base`) without colliding.
 7. Select the last invalid trace. (Fault localization is intentionally skipped —
    `compare_refinement` re-mines `R` itself, so a separate pass would duplicate it.)
 8. Decide whether `phi` is a valid refinement (`worker.py compare_refinement`) —
-   symbolic `phi -> R` or data-direct, per `--refinement-mode` (see below).
-9. Emit SUCCESS / FAIL (plus NOT_FOUND / INCONCLUSIVE / ERROR for diagnostics).
+   symbolic `∃ R ∈ R_all . phi -> R` (each mined refinement checked on its own) or
+   data-direct, per `--refinement-mode` (see below).
+9. Emit SUCCESS / FAIL (plus REFINEMENT_NOT_FOUND / VARIABLE_NOT_FOUND /
+   INCONCLUSIVE / ERROR for diagnostics — see *Result statuses* below).
 
 Refinement mining is **generic** — gamerv auto-discovers candidate atoms from
 every logged variable. (The old per-row `Target Variables` "box-only" vocabulary
@@ -145,11 +166,16 @@ How step 8 decides `phi`, and where `R`'s split-points land, are configurable
 CLI flag):
 
 - `--refinement-mode {auto,data-direct,symbolic}` (default **symbolic**):
-  - `symbolic` — force the symbolic `phi -> R` containment check against the
-    mined `R`. Verdict reads *"phi IS / is NOT CONTAINED in R"*. `R`'s thresholds
-    matter here, so this is the mode that the threshold strategy below affects.
-    When `R` does not establish `phi` but the data-direct test does, the row is
-    classified **NOT_FOUND** (the mined `R` missed a real refinement).
+  - `symbolic` — force the symbolic containment check: `phi` as written against
+    **each mined refinement over its own variable(s), one at a time**, in ranked
+    order, stopping at the first that establishes it. Verdict reads *"phi IS
+    CONTAINED in a single mined refinement"* (with that refinement's rank) or
+    *"phi is NOT contained in ANY single mined refinement"*. `R`'s thresholds
+    matter here, so this is the mode the threshold strategy below affects. When no
+    single `R` establishes `phi` but the data-direct test does, the row is
+    classified **REFINEMENT_NOT_FOUND** (the search missed a real refinement) —
+    and the note says so explicitly when the *union* of several candidates would
+    have covered it.
   - `data-direct` — evaluate `phi` straight on the pooled good (`P & Q`) and
     violation (`P & ~Q`) states, independent of `R`. Verdict reads *"phi IS a
     sound refinement, corroborated by the data"*. Errors on a `phi` that reads a
@@ -162,10 +188,40 @@ CLI flag):
   not depend on `R`'s threshold):
   - `weakest` — the loosest sound separator: `> max(violation)` / `<
     min(violation)`. The most permissive `R`; symbolic `phi -> R` accepts the
-    most `phi`s.
+    most `phi`s. **This is the strategy the symbolic verdict is calibrated for**:
+    the split sits exactly at the violation boundary, so a sound hand-written
+    `phi` is contained in that candidate and the containment verdict agrees with
+    the data-direct one. Under the two strategies below a split can overshoot
+    into the underdetermined gap between the violation and good values, and a
+    sound `phi` is then reported REFINEMENT_NOT_FOUND (gamerv prints the
+    sound-threshold window the split sits inside).
   - `gap-mean` — the midpoint of the violation→nearest-good gap. A stricter `R`.
   - `midpoints` — sample midpoints across the pooled values and let the mining
     search pick (gamerv's historical behaviour).
+
+#### Result statuses (step 9)
+
+Every row ends on exactly one of these:
+
+| status | meaning |
+| --- | --- |
+| `SUCCESS` | `phi` is a valid refinement (contained in **a single** mined `R`, or corroborated by the data — per `--refinement-mode`). |
+| `FAIL` | `phi` was decided and rejected: it is unsound (still holds on a violation state) or not contained with no corroboration. |
+| `REFINEMENT_NOT_FOUND` | Symbolic mode only. The data says `phi` is a sound refinement, but no single mined `R` establishes it — **the search missed it**, `phi` is not wrong. Includes the rows only the *union* of several candidates covers (`union_only`). |
+| `VARIABLE_NOT_FOUND` | `phi` could not be evaluated at all: it reads a quantity **the game never exports**, so no logged state carries it. Nothing was decided about `phi`; the gap is in the game's reported vocabulary (see step 2a and gamerv's `report_state` coverage), not in the row. |
+| `INCONCLUSIVE` | Nothing to decide `phi` against — no tape recorded, no invalid trace, no positives to contrast, no `R` mined. |
+| `SKIPPED` | The row has no `Target Phi`; `R` is still mined and reported, but there is no ground truth to compare. |
+| `NEEDS_MANUAL` | `--skip-manual` only. Step 6 hit a manual visual/audio predicate the stored hints do not cover, so the row was left for a human instead of stopping the batch at a prompt. Nothing was decided; re-run the row interactively to classify it (see *Manual predicate values*). |
+| `ERROR` | The experiment itself broke on this row — unknown game, missing gamerv catalog, formula rejected, build/worker crash. **The only status that makes the run exit non-zero.** |
+
+`NEEDS_MANUAL` is not `ERROR` either: nothing broke, the row just has not been
+run yet. An unattended batch is *finished* only once its `NEEDS_MANUAL` rows have
+been re-run interactively — the closing summary lists them by row number.
+
+`VARIABLE_NOT_FOUND` and `REFINEMENT_NOT_FOUND` are deliberately *not* `ERROR`:
+both are outcomes of the method under test (an unexported variable, an
+incomplete mined `R`), and a batch of them is a finding to report, not a broken
+run.
 
 ### Every row is a mutant row (record on the mutant alone)
 
@@ -204,13 +260,77 @@ sub-second. The first run is therefore interactive (pick the game/monitor).
 ./run_experiment.sh --rows 4-9         # a range
 ./run_experiment.sh --game "Super Tux" # only that game's rows
 ./run_experiment.sh --row 4 --manual-auto   # replay cached manual answers
+./run_experiment.sh --skip-manual          # unattended: skip rows needing a human
 ./run_experiment.sh --row 20 --refinement-mode data-direct --threshold-strategy weakest
 ./run_experiment.sh --row 4 --no-instrument  # skip step 2a (build source as committed)
 ./run_experiment.sh --row 4 --clean         # drop row 4's cached build + logs, then stop
 ```
 
-Results are written to `results/results_<timestamp>.csv` (with a `game` column)
-and summarized on stdout.
+Build output is **condensed to a single self-updating line** per build command
+(`  [Super Tux] build  ████████░░░░░░░░  47%  3m04s  object/player.cpp`) — an
+inherited compile of a big game prints thousands of lines and scrolls the
+pipeline's own step headers off the screen. Nothing is dropped: the full output
+of a branch's last build is at `build_logs/<game>/<branch>.log`, compiler
+`error:` lines are echoed as they happen, and a failing command that said
+nothing error-shaped dumps its tail. Piped to a file (no TTY to redraw), the same
+line is printed once per 10% instead. To watch a raw build:
+
+```bash
+CONTROLLER_BUILD_OUTPUT=raw ./run_experiment.sh --row 4   # inherit the compiler's stdout
+```
+
+Results are written to one folder per run, `results/run_<timestamp>/`, and
+summarized on stdout. The closing stdout summary is **aggregate only** — the
+classification counts, the mining rates and the per-game / per-category divisions;
+every per-case number (verdict, note, mining metrics, phase timings) goes to
+`report.txt` and `full.csv`, so a 120-row batch's terminal output stays readable
+(the per-row progress printed *while* the run walks the rows is unaffected):
+
+| file | what it holds |
+|---|---|
+| `full.csv` | every column the pipeline produced (the dataset `row` number, fault type + parent category, phi, formula, notes, mining metrics, per-phase timings) — the archival record. |
+| `summary.csv` | the five columns a results table needs: game, branch, property, ground truth, refinement found. |
+| `mining.csv` | step 8's search metrics per row: how many candidate refinements were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. |
+| `report.txt` | the **aggregate** view: rows per classification, then the same counts per game, per **bug category** and per **parent category**, plus the mining rates for each — then `PER-GAME BREAKDOWN`, which repeats all of those cuts **over one game's rows at a time** (that game's classifications, category tables and mining numbers, with no other game in the denominators) — then the **per-case** division (`BY CASE`): one line per dataset row with its verdict, candidate count, ground-truth rank, match tier and note, followed by `BY CASE — TIMINGS` (per-case wall clock and phase seconds, with the run's totals). |
+| `candidates.png` | boxplot of the candidate count, one box per game, every row a point beside its box. |
+| `candidates_vs_rank.png` | the same candidate counts **beside** the ground truth's rank, over the rows where it was found — "we mined 128 candidates, and the ground truth was 3rd" in one figure. Both series share one axis (a set size and an index into that set), log-scaled when the spans are far apart. |
+
+Every artefact after the CSVs is derived *from* them, so each can be regenerated
+(or redrawn elsewhere) for any past run:
+
+```bash
+python src/report.py results/run_20260901_223129            # rewrite report.txt
+python src/report.py results/run_20260901_223129 --print    # ...and show it
+python src/plots.py  results/run_20260901_223129            # both figures
+python src/plots.py  results/run_20260901_223129 --figure ranks --out /tmp/r.png
+```
+
+Rows that never reached mining have a blank `candidates` cell and are excluded
+from the boxplots rather than counted as zero; the rank figure further excludes
+the mined rows whose ground truth was never found. Each figure's subtitle says
+how many. Plotting needs matplotlib, which lives in the `gamerv` conda env — when
+the controller's own env lacks it, `plots.py` re-runs itself in that env, and a
+run whose plots cannot be drawn still keeps its CSVs.
+
+### Bug categories
+
+Each dataset row carries a `Fault Type` — one of the benchmark's twelve bug
+categories — and the report groups them under two parents:
+
+| parent | categories |
+|---|---|
+| **Non-temporal fault** | Object out of bounds for any state · Object out of bounds for specific state · Invalid Graphical Representation · Invalid Value Change · Lack of information · Action when not allowed · Action not possible |
+| **Temporal fault** | Invalid position over time · Invalid context state over time · Invalid event occurrence over time · Interupted event · Implementation response issues |
+
+The split is the benchmark's own: the first seven are faults of a *single* state
+(the snapshot at one event is already wrong), the last five are faults of a state
+*sequence* (no single snapshot is wrong; the order or timing across states is).
+`dataset.py` owns the lists (`FAULT_TYPES`, `fault_class()`), matches the cell
+case- and whitespace-insensitively, and reports an unknown or blank cell under
+`(uncategorised)` rather than dropping the row — so a typo in the CSV shows up as
+a row to fix instead of leaving a total short. Both category tables are written
+to `report.txt` **and** printed under the run's stdout summary, next to the
+per-game table (printed whenever a run covers more than one game).
 
 `--clean` deletes the selected rows' `build_cache/<game>/<branch>/` and
 `log_cache/<game>/<branch>/` slots and exits **without running anything**, so the
@@ -225,6 +345,15 @@ not a cache) and `results/` are left alone.
 `--manual-auto` replays previously recorded answers to the manual image/audio
 predicate prompts (see *Manual predicate values* below) so a re-run doesn't ask
 again.
+
+`--skip-manual` (implies `--manual-auto`) never prompts at all: a row whose manual
+predicates the hints do not fully cover is reported `NEEDS_MANUAL` and the batch
+carries on with the next row. That is what makes a long run safe to leave
+unattended overnight — it cannot stop halfway waiting for a `t`/`f`. Rows the
+hints *do* cover run and are decided as usual; the skipped ones are listed by row
+number in the closing summary, and re-running just those interactively (with
+`--manual-auto`, without `--skip-manual`) both classifies them and caches the
+answers, so a second unattended pass covers them.
 
 ## Prerequisites (owned outside the controller)
 
@@ -304,8 +433,10 @@ again.
   re-runs validate until the verdict is written. This only triggers for rows
   whose property actually references a visual/audio predicate; everything else
   validates untouched. **Requires an interactive run** — with no TTY (CI /
-  detached) a row that needs manual input is reported `ERROR` (`NoTTYError`).
-  Leave `MANUAL_PREDICATES` empty/unset to keep validation fully automatic.
+  detached) a row that needs manual input is reported `ERROR` (`NoTTYError`),
+  unless `--skip-manual` was passed, which reports it `NEEDS_MANUAL` and moves on
+  (see below). Leave `MANUAL_PREDICATES` empty/unset to keep validation fully
+  automatic.
 - **Replaying manual answers (`hints/`).** Every answer the operator gives is
   cached under `hints/<game>/<branch>/<recX>.hint` — one file per `.rec`
   recording, keyed by gamerv's stable `"<state_index>::<call>"`. Caching happens

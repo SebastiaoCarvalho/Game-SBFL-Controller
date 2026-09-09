@@ -187,7 +187,10 @@ def _run(game: Game, args: list[str], what: str) -> subprocess.CompletedProcess:
     # Refuse to parse without libclang's builtin headers. A degraded parse does
     # not fail — it quietly yields fewer and worse candidates — so the only way
     # to keep the instrumentation reproducible is to make this a precondition.
-    if not (config.CLANG_RESOURCE_DIR / "include" / "stddef.h").is_file():
+    # Only for a game libclang actually parses: gamerv dispatches on its spec's
+    # "language", and the JS backend (esprima) never opens a system header.
+    if game.instrument_language == "cpp" and not (
+            config.CLANG_RESOURCE_DIR / "include" / "stddef.h").is_file():
         raise InstrumentError(
             f"no libclang builtin headers at {config.CLANG_RESOURCE_DIR} — "
             f"libclang would fail on the first #include and silently drop "
@@ -207,7 +210,15 @@ def _run(game: Game, args: list[str], what: str) -> subprocess.CompletedProcess:
         # a better error message: a broken edit now surfaces as a failed build
         # rather than "Syntax check FAILED". The tree is safe either way — the
         # revert in `applied` runs whether the build passes or fails.
-        "--compile-check", "off",
+        #
+        # NOT for a game with no compiler behind it. Asteroids' "build" only
+        # stamps a launcher, so nothing downstream would ever look at the edited
+        # source — a statement that does not parse would reach the browser, take
+        # the whole file down with it, and surface as a game that silently logs
+        # no events. There the tool's own re-parse is the only check there is,
+        # and it is cheap (esprima, a whole game in a fraction of a second)
+        # rather than the ~40 s libclang double-parse this exists to avoid.
+        *(("--compile-check", "off") if game.instrument_language == "cpp" else ()),
         *game.instrument_extra_args,
         *args,
     ])
@@ -292,19 +303,29 @@ def plan(game: Game) -> Plan:
     )
 
 
-def _git(game: Game, *args: str) -> str:
+def _git(game: Game, *args: str, raw: bool = False) -> str:
     """A git call in the game repo.
 
     This module deliberately does not import ``game_repo``: that module imports
     *this* one (``build`` instruments before compiling), and the cycle would be a
     genuine import-time one. Two git invocations are cheaper than the indirection.
+
+    ``raw`` keeps the output byte-exact. The default strips it, which is right for
+    a one-line answer and *wrong* for ``status --porcelain``: every line there
+    begins with a two-character status field, and an unstaged modification's is
+    " M", so stripping silently eats the first line's leading space and shifts its
+    path by one character. That produced a real failure — a revert fell back to
+    ``git checkout -- rc/items/bowling.cpp`` and aborted the row on a pathspec
+    error. It stayed hidden for a long time because the manifest revert normally
+    succeeds and the git fallback never runs.
     """
     proc = subprocess.run(["git", "-C", str(game.repo_dir), *args],
                           capture_output=True, text=True)
     if proc.returncode != 0:
         raise InstrumentError(
             f"git {' '.join(args)} failed:\n{(proc.stderr or proc.stdout).strip()}")
-    return (proc.stdout or "").strip()
+    out = proc.stdout or ""
+    return out if raw else out.strip()
 
 
 def _tracked_dirty(game: Game) -> frozenset[str]:
@@ -319,11 +340,15 @@ def _tracked_dirty(game: Game) -> frozenset[str]:
     a perfectly good revert look failed. Whether untracked files are tolerable at
     all is ``game_repo.ensure_clean``'s call, not this module's.
     """
-    out = _git(game, "status", "--porcelain", "--untracked-files=no")
+    out = _git(game, "status", "--porcelain", "--untracked-files=no", raw=True)
     paths = set()
     for line in out.splitlines():
         if not line.strip():
             continue
+        # "XY <path>" — a fixed two-character status field, then one space. Both
+        # characters can legitimately BE a space (" M" is an unstaged
+        # modification), so the path starts at a fixed offset and must not be
+        # found by splitting on whitespace either.
         path = line[3:]
         if " -> " in path:              # a rename: the live path is the target
             path = path.split(" -> ", 1)[1]

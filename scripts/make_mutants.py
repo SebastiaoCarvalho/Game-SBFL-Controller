@@ -43,8 +43,10 @@ answers (hints/<branch>/<stem>.hint) are usually identical. When the original ha
 a hint, each mutant gets a COPY of it (`<stem>_mut<i>.hint`) so `--manual-auto`
 can reuse it instead of re-collecting. This also makes the hint and rec counts
 line up, so a later `rename_recordings.py` folds both trees together (skip with
-`--no-hint`; where a changed initial condition shifts the trace, `--manual-auto`
-just re-prompts the states that differ and caches them). Recommended order:
+`--no-hint`). The hint's `.hint.trace` signature is copied along with it, so where
+a changed initial condition shifts the mutant's trace the controller diffs the two
+event sequences, re-anchors the answers that survived and re-prompts only the
+states that genuinely differ. Recommended order:
 collect the original's hint once, then `make_mutants.py ... --apply`, then
 `rename_recordings.py --apply`.
 
@@ -242,6 +244,7 @@ def main():
     hints_branch_dir = (args.hints_dir / args.game / branch if args.game
                         else args.hints_dir / branch)
     src_hint = hints_branch_dir / f"{stem}.hint"
+    src_trace = hints_branch_dir / f"{stem}.hint.trace"
     copy_hint = not args.no_hint and src_hint.is_file()
     if not args.no_hint and not src_hint.is_file():
         print(f"note: no hint {src_hint} to propagate (mutants get no .hint)")
@@ -275,6 +278,11 @@ def main():
             if copy_hint:
                 mutant_hint.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(src_hint, mutant_hint)
+                # The .trace signature travels with the answers: it says which
+                # trace their state indices refer to, and that is exactly what
+                # the controller needs to spot a mutant whose trace shifted.
+                if src_trace.is_file():
+                    shutil.copyfile(src_trace, Path(f"{mutant_hint}.trace"))
                 hints_copied += 1
 
     action = "wrote" if args.apply else "would write"

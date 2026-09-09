@@ -13,6 +13,7 @@ only these constants vary. Add a game by appending a :class:`Game` to
 :data:`_GAMES`; its ``name`` must match its gamerv ``config/games/<name>`` folder.
 """
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +24,26 @@ GAMERV_DIR = Path("/home/sebastiao/nii/fl/gamerv")
 # The code lives in src/; the data directories (results, hints, log_cache,
 # build_cache, logs_archive) sit in the project root, one level up.
 CONTROLLER_DIR = Path(__file__).resolve().parent.parent
-DATASET = Path("/home/sebastiao/nii/fl/dataset.csv")
+# The dataset, and the rest of the experiment's inputs (tapes, game state,
+# hints), are published separately -- see data/ (the fl-experiment-data repo,
+# added here as a submodule) and its sync_data.py. Read from, in order:
+# $FL_DATASET, $FL_DATA_DIR/dataset.csv, the working copy beside the controller,
+# and only then the submodule.
+#
+# The working copy comes BEFORE the submodule deliberately. It is the file that
+# gets edited, and data/dataset.csv is a published snapshot of it (refreshed by
+# sync_data.py collect, exactly like the tapes and hints) -- so preferring the
+# submodule would mean an edit here silently not taking effect. On any machine
+# without that path the submodule is what answers.
+_DATASET_CANDIDATES = (
+    Path(os.environ["FL_DATASET"]) if os.environ.get("FL_DATASET") else None,
+    Path(os.environ["FL_DATA_DIR"]) / "dataset.csv"
+    if os.environ.get("FL_DATA_DIR") else None,
+    Path("/home/sebastiao/nii/fl/dataset.csv"),
+    CONTROLLER_DIR / "data" / "dataset.csv",
+)
+DATASET = next((p for p in _DATASET_CANDIDATES if p and p.is_file()),
+               _DATASET_CANDIDATES[-1])
 RESULTS_DIR = CONTROLLER_DIR / "results"
 # Cached operator answers for the manual image/audio predicate prompts, one file
 # per recording: hints/<game>/<branch>/<recX>.hint. Written whenever the operator
@@ -41,6 +61,25 @@ LOG_CACHE_DIR = CONTROLLER_DIR / "log_cache"
 # lets game_repo.build() skip the cmake configure+build AND step 2a, restoring the
 # binary; a source change → different tree hash → miss → rebuild. See buildcache.py.
 BUILD_CACHE_DIR = CONTROLLER_DIR / "build_cache"
+
+# --- Build console output -------------------------------------------------
+# A compile is by far the noisiest thing the controller runs: inherited, a big
+# game's build output scrolls the pipeline's own step headers off the screen and
+# you lose track of where the experiment is. So game_repo pipes it through
+# progress.py, which renders it as one self-updating line and keeps the full
+# output here — one file per game+branch, overwritten by each build of that
+# branch (the last build's output is what anyone ever wants; the build cache
+# already answers "was it built"). Set CONTROLLER_BUILD_OUTPUT=raw to go back to
+# the unfiltered firehose, e.g. when debugging the build itself.
+BUILD_LOG_DIR = CONTROLLER_DIR / "build_logs"
+BUILD_PROGRESS = os.environ.get("CONTROLLER_BUILD_OUTPUT", "progress").lower() != "raw"
+
+
+def build_log_path(game_name: str, branch: str) -> Path:
+    """Where one branch's full build output is kept. Slashes are legal in a git
+    branch name and would otherwise nest directories, so they are flattened."""
+    return BUILD_LOG_DIR / game_name.replace("/", "_") / f"{branch.replace('/', '_')}.log"
+
 
 # --- Source instrumentation (step 2a) -------------------------------------
 # Before compiling a branch, the controller runs gamerv's source instrumenter
@@ -84,7 +123,10 @@ CLANG_RESOURCE_DIR = Path.home() / ".local" / "share" / "gamerv-clang" / "18"
 #                   Verdict reads "phi IS / is NOT CONTAINED in R". SUCCESS is
 #                   decided by phi -> R_all containment ONLY; when R_all does not
 #                   establish phi but the data-direct test does, the row is
-#                   classified NOT_FOUND (the mined R missed a real refinement).
+#                   classified REFINEMENT_NOT_FOUND (the mined R missed a real
+#                   refinement). Either mode reports VARIABLE_NOT_FOUND when phi
+#                   reads a quantity the game never exports, so nothing about phi
+#                   could be decided at all.
 #   "data-direct" — force the data-exact test: evaluate phi on the pooled
 #                   good (P & Q) / violation (P & ~Q) states, independent of R.
 #                   Verdict reads "phi IS a sound refinement, corroborated by
@@ -156,11 +198,23 @@ class Game:
     replay_extra_args: tuple[str, ...] = ()
     # CLI flag that turns ON closed-loop drift correction during replay (snap the
     # kart back onto the recorded transform when it diverges), or None if the game
-    # has no such knob. Correction is OFF game-side by default; the pipeline
-    # appends this flag only for rows whose dataset "Replay Correct" cell asks for
-    # it (see TestCase.correct_drift). SuperTuxKart: "--agent-replay-correct".
-    # SuperTux / Witch Blast: None — their replays are already pure input playback
-    # with no drift snap-back, so a build's physics is always free to diverge.
+    # has no such knob. Correction is OFF game-side by default, and the pipeline
+    # now appends this flag for EVERY row (TestCase.correct_drift defaults True;
+    # a falsy dataset "Replay Correct" cell opts a row out).
+    #
+    # It used to be opt-in, to keep a diverging build's physics observable: back
+    # then one recording was replayed against both `base` and the mutant, and the
+    # snap would drag the mutant back onto the base trajectory and hide the very
+    # difference under test. A row now records and replays the SAME mutant branch
+    # (see dataset.py), so there is no cross-build divergence left for the snap to
+    # hide -- what it removes is the replay's own drift: FP sensitivity that the
+    # graphics path amplifies, plus the state a tape cannot carry (per-wheel
+    # suspension at the launch). Measured on the snowtuxpeak tape of row 41: 132 m
+    # max / 57 m mean drift without it (the kart leaves the track entirely) vs
+    # 0.30 m max / 0.11 m mean with it, over the whole 7287-tick race.
+    #
+    # SuperTuxKart: "--agent-replay-correct". SuperTux / Witch Blast: None — their
+    # replays are already pure input playback with no drift snap-back.
     replay_correct_flag: str | None = None
     # How long SIGTERM is given to end the game before we SIGKILL it. The default
     # suits a game that just closes a window; raise it for one that has real work
@@ -181,8 +235,28 @@ class Game:
     # per-class key budget or ("--members",) to also report class members. Empty
     # leaves every such choice to the game's spec.
     instrument_extra_args: tuple[str, ...] = ()
+    #: Which of gamerv's discovery backends this game's spec selects. Mirrors
+    #: ``"language"`` in ``config/games/<name>/source_instrument.json`` and must
+    #: agree with it. Named here as well because two of step 2a's preconditions
+    #: are language-specific and the controller has to know *before* it runs the
+    #: tool: libclang's builtin headers (meaningless without libclang) and
+    #: whether the compile that follows is a real check (see instrument._run).
+    instrument_language: str = "cpp"
+    #: Does the game read its *source* at run time, rather than a build artifact?
+    #:
+    #: False for a compiled game: the compiler bakes step 2a's edit into the
+    #: binary, so reverting the tree the moment the build ends costs nothing and
+    #: keeps every repo clean at each branch switch.
+    #:
+    #: True for an interpreted one, where that revert is fatal — Asteroids'
+    #: bridge (predicates/bridge.py, ROOT = the repo root) serves game.js and
+    #: predicates/event_log.js straight to Chrome when the tape replays, which is
+    #: *after* the build. The instrumentation has to stay applied until the
+    #: recordings are done, so game_repo.build cannot own its lifetime; see
+    #: pipeline.run_case and instrument.applied.
+    source_served_at_runtime: bool = False
 
-    def replay_args(self, rec_path: str, correct_drift: bool = False) -> list[str]:
+    def replay_args(self, rec_path: str, correct_drift: bool = True) -> list[str]:
         """CLI args appended to a launch so it replays the tape at ``rec_path``.
 
         Encodes the per-game differences in "how to call a replay": whether the
@@ -193,9 +267,9 @@ class Game:
         controller's estimate of the launch->first-event latency for the stop-timer
         math); and any fixed trailing args the game needs (``replay_extra_args``).
 
-        ``correct_drift`` (from the row's TestCase) requests drift correction; it
-        only adds an arg when the game actually has a ``replay_correct_flag``, so a
-        row can safely ask for it on a game that has no such knob (it's a no-op).
+        ``correct_drift`` (from the row's TestCase, on by default) requests drift
+        correction; it only adds an arg when the game actually has a
+        ``replay_correct_flag``, so it is a no-op on a game without that knob.
         """
         if self.replay_flag_joins_value:
             args = [f"{self.replay_flag}={rec_path}"]
@@ -343,11 +417,9 @@ def _supertuxkart() -> Game:
         # count) replays in N/120 s. Confirmed against real .stkagent tapes
         # (24118 frames = ~201 s for a 3-lap cornfield race).
         seconds_per_step=1.0 / 120.0,
-        # STK's replay snaps a drifting kart back onto the recorded transform; that
-        # correction masks any physics divergence between base and mutant (a fixed
-        # wall collision the tape recorded going through, etc.), so it is OFF by
-        # default. A row that needs the recorded trajectory reproduced exactly can
-        # re-enable it via the dataset "Replay Correct" column, which appends this.
+        # STK's replay snaps a drifting kart back onto the recorded transform. On
+        # for every row now (see the field's doc above); a row can opt out with a
+        # falsy dataset "Replay Correct" cell.
         replay_correct_flag="--agent-replay-correct",
         # Step 2a, as for SuperTux: gamerv's instrumenter rewrites this tree before
         # every build so the binary reports its function-locals, and the edit is
@@ -359,10 +431,21 @@ def _supertuxkart() -> Game:
         # Measured: 291 keys over 5 files, and the instrumented tree really
         # compiles.
         instrument_src=repo / "src",
-        # No `--members`, unlike SuperTux. Members are reported by extending each
-        # class's report_state override, and STK has none: the snapshot builder
-        # writes a kart's fields itself (event_log_server.cpp's write_kart), so
-        # there is no per-class hook for the instrumenter to extend.
+        # `--members` reports class members, not just function locals. It used to
+        # be off here for a real reason: members were written by *extending* a
+        # hand-written report_state override, and STK has none — its snapshot is
+        # built by free functions (event_log_server.cpp's write_kart), so there was
+        # no per-class hook to extend and every member was rejected.
+        #
+        # The instrumenter now GENERATES the override instead of only extending
+        # one, so that no longer holds. It needs two things from the game, both in
+        # place: the empty virtual `Moveable::report_state` (karts/moveable.hpp) to
+        # dispatch through, and `report_state.dispatch` in this game's
+        # source_instrument.json, which splices the call into write_kart /
+        # write_projectile. Without `--members` a mutated field like
+        # `Kart::m_min_nitro_ticks` (dataset row 31) is in no snapshot and its phi
+        # cannot be decided.
+        instrument_extra_args=("--members",),
     )
 
 
@@ -446,11 +529,19 @@ def _witchblast() -> Game:
         # scan globs are SuperTux paths and would find nothing here). Measured: 766
         # keys over 17 files, and the instrumented tree really compiles.
         instrument_src=repo / "src",
-        # No `--members`: Witch Blast's entities already report their members
-        # through reportState overrides that the game itself maintains, and the
-        # instrumenter's member path would only duplicate them (its keys drop no
-        # prefix here — fields are plain x/y/velocity — so a member key could also
-        # collide with a reserved consumer key).
+        # `--members`. This was off because Witch Blast "already reports its
+        # members through reportState overrides the game maintains" — but the
+        # instrumenter could not see those overrides at all: it matched a method
+        # literally spelled `report_state`, and this game's is `reportState`. So
+        # nothing was duplicated and nothing was reported; all 1087 keys were
+        # function locals, and a mutated field appeared in no snapshot.
+        #
+        # The method name is spec-driven now (report_state.method in this game's
+        # source_instrument.json), so the chain is found, extended where it exists
+        # and generated where it does not. The duplicate-key worry is handled
+        # precisely rather than by staying off: inherited_keys() refuses any key
+        # GameEntity::reportState and its descendants already write.
+        instrument_extra_args=("--members",),
     )
 
 
@@ -471,12 +562,13 @@ def _asteroids() -> Game:
         # hook and this launcher all live on `base`; mutant branches rebase onto it.
         base_branch="base",
         # No compile step: agent/build_launcher.sh just (re)generates
-        # build/asteroids-run, stamping it with the current source tree hash. That
-        # stamp is the whole point — the log cache keys on file_sha(binary), and a
-        # game that never compiles would otherwise hand it a constant hash that is
-        # blind to game.js edits (→ risk of restoring another revision's logs). The
-        # stamp gives the launcher a hash that tracks the game source, exactly like
-        # a compiled binary does for the other games. Re-run every build (cheap).
+        # build/asteroids-run, stamping it with the current source tree hash, so the
+        # launcher's own hash tracks the game source exactly like a compiled binary
+        # does for the other games. The log cache no longer depends on that stamp to
+        # stay correct — it keys on the source tree hash as well as the artifact
+        # bytes, which is what makes every non-compiled game safe, this one
+        # included. Kept anyway: it costs nothing, and it keeps the launcher an
+        # honest fingerprint of the revision that produced it. Re-run every build.
         build_commands=(
             ("bash", "agent/build_launcher.sh"),
         ),
@@ -512,14 +604,26 @@ def _asteroids() -> Game:
         # header records `step 16`), one tape frame per step, so a tape of N frames
         # replays in N * 0.016 s.
         seconds_per_step=16.0 / 1000.0,
-        # instrument_src stays None, and not for want of a spec: gamerv's
-        # instrumenter is a libclang tool (runners.source_instrument parses C++ via
-        # clang.cindex and its spec's "language" is "cpp"), and this game is
-        # JavaScript. Its reporting runtime exists all the same — GameRV.local /
-        # localArray / localObject in predicates/local_report.js — so a local here
-        # is reported by writing the call at the site, the way SuperTux's
-        # player.cpp does by hand. Nothing about step 2a would fail for Asteroids;
-        # it simply has nothing to run.
+        # Step 2a, as for the native games — but through gamerv's JavaScript
+        # backend (runners.source_instrument.discover_js, esprima) rather than the
+        # libclang one, selected by "language": "js" in this game's spec. The
+        # source root is the REPO root, not a src/ subdirectory: the spec's
+        # scan_globs are game.js / ipad.js and its report_state.dispatch names
+        # predicates/event_log.js, all of which live at the top level.
+        instrument_src=repo,
+        instrument_language="js",
+        # No compiler to bake step 2a in: bridge.py serves game.js from the repo
+        # root at replay time, so the instrumentation must outlive the build.
+        source_served_at_runtime=True,
+        # Members as well as locals, same as every other game. It matters more
+        # here than anywhere: a mutant routinely introduces its own Ship state
+        # (collision_hit_border_missing_sometimes_2's wrapHeld / wrapCounter are
+        # the whole fault condition), and describe() writes a FIXED field list, so
+        # without this pass such a member never reaches a snapshot and the miner
+        # cannot see the variable the fault turns on. The generated
+        # gamerv_report_state overrides are spliced onto each sprite prototype and
+        # called from describe() via the spec's report_state.dispatch.
+        instrument_extra_args=("--members",),
     )
 
 
@@ -623,9 +727,15 @@ def _freeminer() -> Game:
         # budget — so every key here is paid for in nodes. Widening the globs is a
         # trade against node coverage, not a free win.
         instrument_src=repo / "src",
-        # No `--members`: the CAOs' members are already written by their own
-        # report_state overrides, and the local player's by snapshot.cpp directly
-        # (which is not a per-class hook the instrumenter can extend).
+        # `--members`. Previously off because "the CAOs' members are already
+        # written by their own report_state overrides" — but only GenericCAO has
+        # one, so every other reported class contributed no member at all, and the
+        # instrumenter could not have extended the const signature anyway (it was
+        # hardcoded non-const). Both are spec-driven now (report_state.const in
+        # this game's source_instrument.json), so the chain is extended where it
+        # exists and generated where it does not, and snapshot.cpp's own writes
+        # are protected by report_state.external_keys rather than by staying off.
+        instrument_extra_args=("--members",),
     )
 
 

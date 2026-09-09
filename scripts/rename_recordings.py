@@ -58,6 +58,10 @@ DEFAULT_DIR = Path.home() / ".local/share/supertux2"
 # The hints tree lives in this repo, alongside scripts/.
 DEFAULT_HINTS_DIR = Path(__file__).resolve().parent.parent / "hints"
 
+# Files named after a hint rather than after a recording: the trace signature its
+# per-state answers are anchored to, and the backup kept when they get re-anchored.
+HINT_SIDECAR_SUFFIXES = (".trace", ".bak")
+
 # Header key that marks the last line before the recorded body.
 BODY_MARKER = "frames"
 
@@ -146,8 +150,17 @@ def plan_hints(hints_case: Path, rec_plan):
         return [], (f"{len(hint_files)} hint(s) but {len(rec_plan)} recording(s) "
                     f"-- names don't line up, skipping hints")
     recs_sorted = sorted(rec_plan, key=lambda ps: natural_key(ps[0].name))
-    return [(h, f"{stem}.hint")
-            for h, (_rec, stem) in zip(hint_files, recs_sorted)], None
+    renames = []
+    for hint, (_rec, stem) in zip(hint_files, recs_sorted):
+        renames.append((hint, f"{stem}.hint"))
+        # A hint's sidecars (.hint.trace, .hint.bak) are addressed by the hint's
+        # own name, so they have to move with it -- a .trace left behind would
+        # claim the answers of whichever hint inherits the old name.
+        for suffix in HINT_SIDECAR_SUFFIXES:
+            sidecar = hint.with_name(hint.name + suffix)
+            if sidecar.exists():
+                renames.append((sidecar, f"{stem}.hint{suffix}"))
+    return renames, None
 
 
 def report(title, renames):

@@ -20,25 +20,35 @@ Step 2 builds but does not launch — because the replay is triggered by the gam
 ``--replay`` startup hook, the game is (re)launched per recording inside step 5,
 which is where it is "opened".
 
-Step 2a — source instrumentation — sits *inside* ``game_repo.build``, not beside
-it in ``run_case``, so that it wraps every compile from a single place. Before
-each compile gamerv's instrumenter writes the local-variable reporting calls into
-the checked-out source; the edit is reverted as soon as the compiler is done, so
-only the binary carries it. Its cost lands in the "build" phase timing. See
-instrument.py.
+Step 2a — source instrumentation — normally sits *inside* ``game_repo.build``, not
+beside it in ``run_case``, so that it wraps every compile from a single place.
+Before each compile gamerv's instrumenter writes the local-variable reporting
+calls into the checked-out source; the edit is reverted as soon as the compiler is
+done, so only the binary carries it. Its cost lands in the "build" phase timing.
+See instrument.py.
+
+A game with no compiler behind it cannot work that way: the thing that runs IS the
+checked-out source, so an edit reverted at the end of ``build`` never reaches the
+game. ``Game.source_served_at_runtime`` marks that case, ``build`` leaves the
+apply to its caller, and ``_source_instrumented`` here holds it open across the
+build AND the replay (step 5), reverting once the traces are recorded.
 """
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import config
+import dataset
 import game_repo as repo
 import gamerv
 import hints
+import instrument
 import logcache
+import manual_review
+import metrics
 import recordings
 from config import Game
 from dataset import TestCase
@@ -67,11 +77,25 @@ class CaseResult:
     specification: str
     phi: str
     formula: str
-    status: str               # SUCCESS | FAIL | NOT_FOUND | INCONCLUSIVE | ERROR
+    status: str               # SUCCESS | FAIL | NOT_FOUND | INCONCLUSIVE
+                              # | NEEDS_MANUAL | SKIPPED | ERROR
     r_text: str | None = None
     notes: str = ""
     elapsed_s: float = 0.0     # wall-clock seconds for the whole pipeline
     timings: dict[str, float] = field(default_factory=dict)  # per-phase seconds
+    fault_type: str = ""       # the row's Fault Type (bug category)
+    #: The 1-based dataset row this case came from, so a per-case results table can
+    #: name the case the way the dataset does (0 when the result was built without
+    #: one). See report._case_table.
+    row: int = 0
+    #: Step 8's search metrics: candidate count, the ground truth's rank among them,
+    #: the match tier (see metrics.py). Blank on a row that never reached step 8.
+    mining: metrics.Mining = field(default_factory=metrics.Mining)
+
+    @property
+    def fault_class(self) -> str:
+        """The row's parent category — "Non-temporal fault" / "Temporal fault"."""
+        return dataset.fault_class(self.fault_type)
 
     def phase_cells(self) -> dict[str, str]:
         """Per-phase seconds as display strings, '-' for phases that didn't run."""
@@ -166,17 +190,78 @@ def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
 
 
 # --------------------------------------------------------------------------
-# Step 5 — log cache: skip recording when the same binary replays the same tapes.
+# Step 2a — the instrumentation's lifetime, for a game that runs from its source.
 # --------------------------------------------------------------------------
-def _record_or_restore(game: Game, case: TestCase) -> int:
+@contextmanager
+def _source_instrumented(game: Game, instrument_source: bool,
+                         timings: dict[str, float]):
+    """Hold step 2a applied across the build AND the replay, for the games that need it.
+
+    ``game_repo.build`` reverts the instrumentation the moment the compile is done,
+    which is the right lifetime for a compiled game: the reporting calls are in the
+    binary, so the source can go back to how it was before the tape ever replays.
+
+    A game whose SOURCE is what runs has no such handoff. Asteroids' "build" only
+    stamps a launcher; ``predicates/bridge.py`` serves ``game.js`` straight out of
+    the repo when the browser asks for it, in step 5. An edit reverted at the end of
+    ``build`` is gone by then, and the trace comes back carrying only the reporting
+    the branch already had written into it by hand — every generated member and
+    local silently absent, which reads downstream as ``VARIABLE_NOT_FOUND`` on every
+    row whose phi names one. ``build`` therefore skips the apply for such a game
+    (``Game.source_served_at_runtime``) and leaves it to this block, which spans the
+    replay and reverts after it.
+
+    A no-op — yielding False — for every other game and whenever step 2a is off, so
+    the compiled games keep the single apply inside ``build``. The apply's cost lands
+    in the "build" phase timing, as it does there.
+    """
+    if not (instrument_source and game.source_served_at_runtime
+            and instrument.enabled(game)):
+        yield False
+        return
+    print("  [instrument] step 2a held applied across the replay "
+          "(this game's source is what runs)")
+    # Entered inside the phase so the apply's cost is billed to "build" as it is
+    # inside build(); the revert then runs when the caller's block ends, through
+    # the stack, which is what forwards an exception from the body to it.
+    stack = ExitStack()
+    with _phase(timings, "build"):
+        stack.enter_context(instrument.applied(game))
+    with stack:
+        yield True
+
+
+# --------------------------------------------------------------------------
+# Step 5 — log cache: skip recording when the same build replays the same tapes.
+# --------------------------------------------------------------------------
+def _record_or_restore(game: Game, case: TestCase,
+                       instrument_source: bool = True) -> int:
     """Step 5 for a normal row: restore cached logs on a hit, else record + store.
 
-    The raw logs depend only on the (already-built) binary and the row's tapes, so
+    The raw logs depend only on the (already-built) game and the row's tapes, so
     a content-hash hit lets us skip recording entirely and re-validate the cached
     traces. A miss deletes any stale slot, records fresh, and snapshots the pristine
     run dirs (before step 6 validates them). See logcache.py.
+
+    "The built game" is not the artifact bytes alone (see logcache.py): the HEAD tree
+    hash goes in first, because a mutant can live in a file the game loads at run
+    time rather than compiles — four of FreeMiner's branches change only
+    ``builtin/game/*.lua`` — and produce a byte-identical binary the artifact sha
+    cannot distinguish.
+
+    The step-2a fingerprint follows, but only for a game that runs from its source.
+    Everywhere else the instrumentation's effect is *in* the artifact bytes already
+    (it went through a compiler), so keying on it would re-record over a change to
+    the instrumenter that did not change its output. For Asteroids it is the only
+    signal there is: the launcher its "build" stamps carries ``HEAD^{tree}``, which
+    is blind to a working-tree edit, so an instrumented and an uninstrumented replay
+    of the same branch would otherwise share a key.
     """
-    key = logcache.compute_key([logcache.file_sha(game.binary)], game, case.branch)
+    build_parts = [repo.head_tree_hash(game), logcache.file_sha(game.binary)]
+    if (instrument_source and game.source_served_at_runtime
+            and instrument.enabled(game)):
+        build_parts.append(instrument.fingerprint(game))
+    key = logcache.compute_key(build_parts, game, case.branch)
     if logcache.has(game, case.branch, key):
         print("    [cache] hit — restoring logs, skipping recording")
         return logcache.restore(game, case.branch)
@@ -191,7 +276,8 @@ def _record_or_restore(game: Game, case: TestCase) -> int:
 def run_case(case: TestCase, manual_auto: bool = False,
              refinement_mode: str | None = None,
              threshold_strategy: str | None = None,
-             instrument_source: bool | None = None) -> CaseResult:
+             instrument_source: bool | None = None,
+             skip_manual: bool = False) -> CaseResult:
     """Execute the pipeline for one dataset row.
 
     The row's ``game`` (Game Name) is resolved to a :class:`config.Game`; an
@@ -201,12 +287,20 @@ def run_case(case: TestCase, manual_auto: bool = False,
 
     When ``manual_auto`` is set, step 6 replays cached operator answers for the
     manual image/audio predicates (``hints/``) instead of re-prompting for ones
-    already recorded.
+    already recorded. ``skip_manual`` adds the unattended-batch escape: a row whose
+    manual predicates the hints do *not* cover returns ``NEEDS_MANUAL`` at step 6
+    rather than stopping the batch at a prompt (or erroring out with no TTY), so it
+    can be re-run interactively later. Steps 7-9 are not reached for such a row —
+    its traces have no verdict, so there is nothing to decide phi against.
 
     ``refinement_mode`` (auto / data-direct / symbolic) selects how step 8 decides
     phi, and ``threshold_strategy`` (midpoints / weakest / gap-mean) how R's
     thresholds are placed. ``None`` defers to ``config.REFINEMENT_MODE`` /
     ``config.THRESHOLD_STRATEGY``.
+
+Alongside the verdict, step 8's search metrics are attached to the result
+    (:class:`metrics.Mining`): the candidate count, the ground truth's rank among the
+    ranked candidates and the match tier.
 
     ``instrument_source`` runs step 2a — gamerv's source instrumenter — before
     each compile, so the built binary reports its function-local variables.
@@ -219,11 +313,15 @@ def run_case(case: TestCase, manual_auto: bool = False,
     """
     t_start = time.time()
     timings: dict[str, float] = {}
+    # Filled once step 8 has mined (see below); a row that returns before then
+    # carries blank metrics rather than a zero candidate count.
+    mining = metrics.Mining()
 
     def result(status: str, r_text: str | None = None, notes: str = "") -> CaseResult:
         return CaseResult(case.game, case.branch, case.specification, case.phi,
                           case.formula, status, r_text, notes,
-                          elapsed_s=time.time() - t_start, timings=dict(timings))
+                          elapsed_s=time.time() - t_start, timings=dict(timings),
+                          fault_type=case.fault_type, mining=mining, row=case.row)
 
     # Resolve the game before touching any game state; an unknown Game Name is a
     # per-row ERROR, not a crash.
@@ -248,38 +346,46 @@ def run_case(case: TestCase, manual_auto: bool = False,
 
         # Step 2 — checkout + build (launch happens per-tape in step 5). The
         # build instruments the source first (step 2a) unless the row opts out or
-        # the game has no instrument_src; the edit is undone before build returns.
+        # the game has no instrument_src; the edit is undone before build returns
+        # — except for a game whose SOURCE is what runs, where _source_instrumented
+        # below owns it instead and holds it open through step 5.
         print(f"\n[2] checkout + build: {game.name} / {case.branch}"
               f"{'' if instr else '   (step 2a instrumentation off)'}")
         repo.ensure_clean(game)              # DirtyTreeError -> abort experiment
         with _phase(timings, "build"):
             repo.checkout(game, case.branch)
-            repo.build(game, instrument_source=instr)
 
-        # Step 3 — make the spec the only safety property (guarded by check_formula).
-        print(f"[3] set property: {case.formula}")
-        ok, err = gamerv.check_formula(case.formula)
-        if not ok:
-            return result("ERROR", notes=f"formula rejected by gamerv: {err}")
-        gamerv.set_single_property(name=case.branch, formula=case.formula,
-                                   description=f"dataset row {case.row}")
+        # Step 2a for a source-served game: applied here, over the build AND the
+        # replay, and reverted when the block ends. See _source_instrumented.
+        with _source_instrumented(game, instr, timings):
+            with _phase(timings, "build"):
+                repo.build(game, instrument_source=instr)
 
-        # Step 4 — clear previous logs (archived under the row number).
-        print("[4] clear previous logs")
-        gamerv.clear_logs(row=case.row)
+            # Step 3 — make the spec the only safety property (guarded by check_formula).
+            print(f"[3] set property: {case.formula}")
+            ok, err = gamerv.check_formula(case.formula)
+            if not ok:
+                return result("ERROR", notes=f"formula rejected by gamerv: {err}")
+            gamerv.set_single_property(name=case.branch, formula=case.formula,
+                                       description=f"dataset row {case.row}")
 
-        # Step 5 — record traces by replaying each tape under logging, on the
-        # mutant alone: its trace carries both the good and the violation states.
-        print("[5] record traces (replay tapes under gamerv logging)")
-        with _phase(timings, "record"):
-            n = _record_or_restore(game, case)
+            # Step 4 — clear previous logs (archived under the row number).
+            print("[4] clear previous logs")
+            gamerv.clear_logs(row=case.row)
+
+            # Step 5 — record traces by replaying each tape under logging, on the
+            # mutant alone: its trace carries both the good and the violation states.
+            print("[5] record traces (replay tapes under gamerv logging)")
+            with _phase(timings, "record"):
+                n = _record_or_restore(game, case, instr)
         if n == 0:
             return result("INCONCLUSIVE", notes="no traces recorded (no tapes / log failed)")
 
         # Step 6 — validate all logs (replaying cached manual answers if --manual-auto).
         print("[6] validate all logs")
         with _phase(timings, "validate"):
-            validated = gamerv.validate_all(auto=manual_auto)
+            validated = gamerv.validate_all(auto=manual_auto,
+                                            skip_manual=skip_manual)
         if not validated:
             return result("INCONCLUSIVE", notes="no traces to validate")
 
@@ -306,12 +412,28 @@ def run_case(case: TestCase, manual_auto: bool = False,
             cont = gamerv.compare_refinement(run_dir, case.phi, None,
                                              mode=mode, strategy=strategy)
 
+        # The search metrics for the row: how many candidate refinements the miner
+        # produced and where the ground truth sits among them, read off the records
+        # step 8 just persisted in the run dir (metrics.py).
+        mining = metrics.read(run_dir, case.formula, case.phi)
+        if mining.candidates is not None:
+            rank = ("not among them" if mining.gt_rank is None
+                    else f"ground truth at rank {mining.gt_rank}")
+            tier = f" ({mining.gt_match})" if mining.gt_match else ""
+            union = " [union-only]" if mining.union_only else ""
+            print(f"    mined {mining.candidates} candidate refinement(s) — "
+                  f"{rank}{tier}{union}")
+
         # Step 9 — emit result, carrying gamerv's one-line verdict as the note.
         return result(cont.status, r_text=cont.r_text,
                       notes=cont.verdict or "see compare_refinement output")
 
     except DirtyTreeError:
         raise
+    except manual_review.NeedsManualError as exc:
+        # Not an ERROR: nothing broke, the row simply needs a human at step 6 and
+        # --skip-manual asked for it to be left for one. See manual_review.collect.
+        return result("NEEDS_MANUAL", notes=str(exc))
     except Exception as exc:  # keep the batch going; record the failure
         return result("ERROR", notes=f"{type(exc).__name__}: {exc}")
     finally:
