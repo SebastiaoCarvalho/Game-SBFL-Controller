@@ -2,10 +2,14 @@
 """Plots for the evaluation step: how big the mined candidate set was, and how deep
 in it the ground truth sat.
 
-Step 8 records, per row, how many sound candidate refinements the miner produced and
-where the ground-truth phi ranked among them (``metrics.Mining``); ``run_experiment``
-writes both columns into the run's ``mining.csv``. This module turns them into the two
-figures a results section wants:
+Step 8 records, per row, how many **top-scored** sound candidate refinements the miner
+produced and where the ground-truth phi ranked among them (``metrics.Mining``);
+``run_experiment`` writes both columns into the run's ``mining.csv``. Both quantities
+are over the top-scored tier of gamerv's ranked list only — the refinements a user
+actually reads before reaching the fix; the lower-scoring sound separators are kept in
+``refinement_separators.log`` and deliberately excluded here, since a count that mixed
+score tiers would answer no question about the method (see metrics.py). This module
+turns them into the two figures a results section wants:
 
   candidates.png        a **boxplot of the candidate-set size**, one box per game,
                         with every row drawn as a point beside its box so the shape of
@@ -25,8 +29,9 @@ figures a results section wants:
 Only rows that actually mined are plotted: a blank ``candidates`` cell means the row
 never reached the point of persisting a mining record (see metrics.read), and counting
 it as zero would claim the miner came back empty-handed. The rank figure further keeps
-only the rows whose ground truth *was* found (a blank ``gt_rank``  has no position to
-draw). How many rows were dropped either way is printed in each figure's subtitle, so
+only the rows whose ground truth *was* found among the top-scored candidates (a blank
+``gt_rank`` has no position to draw — including a ``below_top`` row, whose ground truth
+sits outside the plotted set). How many rows were dropped either way is printed in each figure's subtitle, so
 a box is never read as covering more rows than it does.
 
 Written after the CSVs, from the CSVs — so the same code re-plots an old run:
@@ -99,11 +104,16 @@ class MinedRow:
     gt_rank: int | None      # None when the ground truth was not found
 
 
-def read_mining(run_dir: Path) -> tuple[list[MinedRow], int]:
-    """``(rows that mined, dropped)`` from a run's ``mining.csv``.
+def read_mining(run_dir: Path) -> tuple[list[MinedRow], int, bool]:
+    """``(rows that mined, dropped, top_scored)`` from a run's ``mining.csv``.
 
     ``dropped`` counts the rows whose ``candidates`` cell is blank or unreadable —
     rows that never mined — which are excluded from every box.
+
+    ``top_scored`` says whether the counts are over the top-scored tier: the
+    ``below_top`` column is what a run written since that change carries, so a CSV
+    without it holds the older whole-list counts and is labelled as such rather than
+    captioned with a scope it does not have.
     """
     path = Path(run_dir) / MINING_CSV
     rows: list[MinedRow] = []
@@ -116,14 +126,16 @@ def read_mining(run_dir: Path) -> tuple[list[MinedRow], int]:
             return None
 
     with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        top_scored = "below_top" in (reader.fieldnames or [])
+        for row in reader:
             n = _int(row.get("candidates"))
             if n is None:
                 dropped += 1
                 continue
             rows.append(MinedRow((row.get("game") or "?").strip(), n,
                                  _int(row.get("gt_rank"))))
-    return rows, dropped
+    return rows, dropped, top_scored
 
 
 def _by_median_candidates(groups: dict[str, list[MinedRow]]) -> list[str]:
@@ -210,7 +222,11 @@ def _chrome(ax, ylabel: str, title: str, subtitle: str) -> None:
     for side in ("left", "bottom"):
         ax.spines[side].set_color(BASELINE)
         ax.spines[side].set_linewidth(0.8)
-    ax.set_title(title, loc="left", pad=34, fontsize=13, color=INK)
+    # The subtitle grows upward from the axes top, so the title's pad has to clear it:
+    # a fixed pad sized for two lines is overrun the moment a third is added (the
+    # pre-tier scope note), and the title lands on top of the caption.
+    lines = subtitle.count("\n") + 1
+    ax.set_title(title, loc="left", pad=8 + 13 * lines, fontsize=13, color=INK)
     ax.annotate(subtitle, xy=(0, 1), xycoords="axes fraction",
                 xytext=(0, 8), textcoords="offset points", linespacing=1.5,
                 fontsize=9.5, color=INK_MUTED, ha="left", va="bottom")
@@ -229,8 +245,10 @@ def _save(fig, out_path: Path) -> Path:
 # --------------------------------------------------------------------------
 # Figure 1 — candidate-set size
 # --------------------------------------------------------------------------
-def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
-    """Boxplot of the candidate count, one box per game (matplotlib must import)."""
+def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str,
+                    top_scored: bool = True) -> Path:
+    """Boxplot of the top-scored candidate count, one box per game (matplotlib must
+    import)."""
     import statistics
 
     groups = _grouped(rows)
@@ -257,8 +275,10 @@ def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path
     ax.set_xticklabels([f"{g}\nn={len(v)}" for g, v in zip(labels, series)],
                        fontsize=10, color=INK_SECONDARY)
     log = _log_if_wide(ax, [v for vals in series for v in vals], headroom=2.0)
-    _chrome(ax, "candidate refinements mined" + (" (log scale)" if log else ""),
-            "Candidate refinements per row", subtitle)
+    scope = "Top-scored candidate" if top_scored else "Candidate"
+    _chrome(ax, ("top-scored candidate refinements" if top_scored
+                 else "candidate refinements mined") + (" (log scale)" if log else ""),
+            f"{scope} refinements per row", subtitle)
     return _save(fig, out_path)
 
 
@@ -281,7 +301,8 @@ def _rank_groups(rows: list[MinedRow]) -> list[tuple[str, list[int], list[int]]]
     return out
 
 
-def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
+def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str,
+               top_scored: bool = True) -> Path:
     """Paired boxplot: the candidate count and the ground truth's rank, per game.
 
     Only the rows whose ground truth was found are drawn — a row with no rank has no
@@ -313,7 +334,8 @@ def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
     # One axis for both series (never two scales): log it when the spread demands.
     # The headroom keeps the largest candidate count clear of the legend.
     log = _log_if_wide(ax, [v for vals in cands + ranks for v in vals], headroom=3.0)
-    ylabel = "candidates / ground-truth rank" + (" (log scale)" if log else "")
+    scope = "top-scored candidates" if top_scored else "candidates"
+    ylabel = f"{scope} / ground-truth rank" + (" (log scale)" if log else "")
 
     # Medians outside the outer edge of each box, so neither label sits on an
     # outline, on the jittered points, or on its neighbour.
@@ -332,12 +354,13 @@ def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
     ax.set_xticks(positions)
     ax.set_xticklabels([f"{g}\nn={len(c)}" for g, c in zip(labels, cands)],
                        fontsize=10, color=INK_SECONDARY)
-    _chrome(ax, ylabel, "Candidates mined vs. rank of the ground truth", subtitle)
+    _chrome(ax, ylabel,
+            f"{scope.capitalize()} vs. rank of the ground truth", subtitle)
 
     # Two series, so a legend is always present (identity is never colour-alone).
     import matplotlib.patches as mpatches
     ax.legend(handles=[mpatches.Patch(facecolor=ACCENT_FILL, edgecolor=ACCENT,
-                                      label="candidates mined"),
+                                      label=scope),
                        mpatches.Patch(facecolor=ACCENT2_FILL, edgecolor=ACCENT2,
                                       label="rank of ground truth")],
               loc="upper right", frameon=False, fontsize=9,
@@ -349,6 +372,13 @@ def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
 # Subtitles
 # --------------------------------------------------------------------------
 _BOX_LEGEND = "box = median and IQR · whiskers 1.5×IQR · one point per row"
+
+
+def _scope_note(top_scored: bool) -> str:
+    """The caption line naming what the counts are over. A run written before the
+    metric was narrowed to the top-scored tier is captioned as the whole ranked list,
+    so an old figure is never read as a new one (see read_mining)."""
+    return "" if top_scored else "\ncounts over the whole ranked list (pre-tier run)"
 
 
 def _candidates_subtitle(rows: list[MinedRow], dropped: int) -> str:
@@ -367,20 +397,26 @@ def _ranks_subtitle(ranked: list[MinedRow], mined: int) -> str:
 # --------------------------------------------------------------------------
 # Entry points
 # --------------------------------------------------------------------------
-def _render_candidates(rows: list[MinedRow], dropped: int, out: Path) -> Path | None:
+def _render_candidates(rows: list[MinedRow], dropped: int, out: Path,
+                       top_scored: bool = True) -> Path | None:
     if not rows:
         print("    no mined rows in this run — candidates boxplot skipped")
         return None
-    return draw_candidates(rows, out, _candidates_subtitle(rows, dropped))
+    return draw_candidates(rows, out,
+                           _candidates_subtitle(rows, dropped) + _scope_note(top_scored),
+                           top_scored)
 
 
-def _render_ranks(rows: list[MinedRow], _dropped: int, out: Path) -> Path | None:
+def _render_ranks(rows: list[MinedRow], _dropped: int, out: Path,
+                  top_scored: bool = True) -> Path | None:
     ranked = [r for r in rows if r.gt_rank]
     if not ranked:
         print("    no row's ground truth was ranked — candidates-vs-rank boxplot "
               "skipped")
         return None
-    return draw_ranks(ranked, out, _ranks_subtitle(ranked, len(rows)))
+    return draw_ranks(ranked, out,
+                      _ranks_subtitle(ranked, len(rows)) + _scope_note(top_scored),
+                      top_scored)
 
 
 #: ``figure name -> (renderer, default file name)``. ``render`` draws them all; the
@@ -393,12 +429,12 @@ FIGURES = {
 
 def _render_here(run_dir: Path, figures: list[str],
                  out: Path | None) -> list[Path]:
-    rows, dropped = read_mining(run_dir)
+    rows, dropped, top_scored = read_mining(run_dir)
     written = []
     for name in figures:
         renderer, filename = FIGURES[name]
         target = Path(out) if out else Path(run_dir) / filename
-        path = renderer(rows, dropped, target)
+        path = renderer(rows, dropped, target, top_scored)
         if path is not None:
             written.append(path)
     return written

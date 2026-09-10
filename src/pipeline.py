@@ -412,17 +412,19 @@ Alongside the verdict, step 8's search metrics are attached to the result
             cont = gamerv.compare_refinement(run_dir, case.phi, None,
                                              mode=mode, strategy=strategy)
 
-        # The search metrics for the row: how many candidate refinements the miner
-        # produced and where the ground truth sits among them, read off the records
-        # step 8 just persisted in the run dir (metrics.py).
+        # The search metrics for the row: how many top-scored candidate refinements
+        # the miner produced and where the ground truth sits among them, read off the
+        # records step 8 just persisted in the run dir (metrics.py). Lower-scoring
+        # sound refinements stay in gamerv's log and out of the metrics.
         mining = metrics.read(run_dir, case.formula, case.phi)
         if mining.candidates is not None:
             rank = ("not among them" if mining.gt_rank is None
                     else f"ground truth at rank {mining.gt_rank}")
             tier = f" ({mining.gt_match})" if mining.gt_match else ""
             union = " [union-only]" if mining.union_only else ""
-            print(f"    mined {mining.candidates} candidate refinement(s) — "
-                  f"{rank}{tier}{union}")
+            below = " [below the top score]" if mining.below_top else ""
+            print(f"    mined {mining.candidates} top-scored candidate refinement(s) "
+                  f"— {rank}{tier}{union}{below}")
 
         # Step 9 — emit result, carrying gamerv's one-line verdict as the note.
         return result(cont.status, r_text=cont.r_text,

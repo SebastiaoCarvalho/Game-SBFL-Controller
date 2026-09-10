@@ -8,23 +8,46 @@ refinements, each a ``[[[key, want], ...], support, size]`` triple. That file is
 the machine-readable twin of the ``refinement_separators.log`` the same run
 writes, so the metrics here are read off it rather than scraped from stdout.
 
-Three numbers per case:
+**Only the top-scored tier counts.** ``shown`` holds *every* sound candidate, at
+every score: a candidate's score is its good-state support (the log's ``holds in
+k/n good states``, flagged ``[perfect separator]`` at ``k == n``), and gamerv ranks
+by that support descending, then by fewest literals. Counting the whole list would
+answer a question nobody asks — the point of the metric is how many refinements a
+user has to work through before reaching the fix, and a user works down from the
+best score. So the candidate set here is the **leading tier of the ranked list: the
+candidates sharing the best support** (:func:`_top_tier`), and a ground truth that
+ranks below that tier is *not found* (see the caveat under "Where the rank comes
+from").
 
-  candidates  how many sound candidate refinements the miner produced.
-  gt_rank     the 1-based position of the ground-truth phi in that ranked list,
-              blank when phi is not among the candidates.
+Four numbers per case:
+
+  candidates  how many top-scored sound candidate refinements the miner produced.
+  gt_rank     the 1-based position of the ground-truth phi in that top tier,
+              blank when phi is not among those candidates.
   union_only  phi is established only by several candidates *together* — the case
               the single-candidate rule below rejects.
+  below_top   phi *is* established by a single mined candidate, but one scoring
+              below the top tier — so this row's gamerv status can read SUCCESS
+              while the mining metrics count it as a miss. The flag is what keeps
+              that difference visible instead of silent.
 
 **Where the rank comes from.** gamerv decides phi against the mined refinements one
 at a time — ``Exists R in R_all: phi -> R``
 (``runners.fault_localization.check_phi_refinement``) — and persists that verdict to
 ``<run_dir>/phi_refinement.json``: the rank of the first candidate that establishes
 phi, the match tier, and whether the union of candidates would have covered a phi no
-single one does (``union_only``). That semantic verdict is authoritative here, because
-it is the same decision the row's SUCCESS/FAIL status came from: reading it off the
-file keeps the rank in a results table and the verdict in the status column from ever
-disagreeing.
+single one does (``union_only``). That semantic verdict is authoritative on *whether*
+a single candidate establishes phi, and its rank indexes the same ranked list — so it
+is reused here rather than re-derived.
+
+The rank is kept only when it falls inside the top tier. gamerv now decides phi
+against that tier itself (``_top_tier`` there), so a fresh verdict's rank is always
+inside it — but a verdict **persisted before that change** ranks phi over the whole
+list, and one ranking it below the tier is recorded as ``below_top`` and reported as
+not found. The row can then read SUCCESS in the status column (that older run did find
+a single R establishing phi) and a miss in the mining table (that R is not one of the
+candidates the tool would show). The flag is the join between the two readings, and
+what lets an archived run be re-read without its numbers silently mixing tiers.
 
 It is missing only when the containment view never ran — a ``data-direct`` (or
 ``auto`` with a raw phi) run, where the verdict comes from corroborate instead. Then
@@ -72,21 +95,24 @@ _FLOAT_SUFFIX = re.compile(r"(?<=[0-9.])[fF](?![0-9A-Za-z_.])")
 
 #: The CSV header for :meth:`Mining.cells`, so the columns and the cells that fill
 #: them are declared in one place.
-COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only")
+COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only", "below_top")
 
 
 @dataclass
 class Mining:
     """Step 8's mining metrics for one case (all-``None`` when no record was found)."""
-    candidates: int | None = None   # size of the ranked candidate set
-    gt_rank: int | None = None      # 1-based position of phi, None if not mined
+    candidates: int | None = None   # size of the top-scored tier of the ranked set
+    gt_rank: int | None = None      # 1-based position of phi in it, None if not there
     gt_match: str = ""              # see the module docstring's tier list ("" = none)
     union_only: bool = False        # only the union of candidates establishes phi
+    below_top: bool = False         # a single candidate establishes phi, but a
+                                    # lower-scoring one than the top tier
 
     @property
     def found(self) -> bool:
-        """Was the ground truth found — by a single candidate, or by phi's own
-        region? (The tier says which; ``union_only`` is deliberately not it.)"""
+        """Was the ground truth found — by a single top-scored candidate, or by phi's
+        own region? (The tier says which; ``union_only`` and ``below_top`` are
+        deliberately not it: both are ways of *missing*.)"""
         return bool(self.gt_match)
 
     def cells(self) -> list[str]:
@@ -94,7 +120,8 @@ class Mining:
         return ["" if self.candidates is None else str(self.candidates),
                 "" if self.gt_rank is None else str(self.gt_rank),
                 self.gt_match,
-                "yes" if self.union_only else ""]
+                "yes" if self.union_only else "",
+                "yes" if self.below_top else ""]
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +243,27 @@ def _term_key(expr: str) -> tuple[str, str] | None:
 # --------------------------------------------------------------------------
 # Reading gamerv's mining record
 # --------------------------------------------------------------------------
+def _top_tier(shown: list) -> list:
+    """The leading tier of gamerv's ranked candidate list: the candidates sharing the
+    best score (good-state support). Everything below it is a strictly worse separator
+    that a user reading the list from the top would never have to reach, so it is not
+    part of the candidate set these metrics report (see the module docstring).
+
+    Taken as the leading *run* rather than by filtering the whole list on the best
+    score: the list is support-descending, and a prefix is what "how many before the
+    fix" means even if a future ranking key reorders ties.
+    """
+    if not shown:
+        return []
+    best = shown[0][1]
+    n = 0
+    for item in shown:
+        if item[1] != best:
+            break
+        n += 1
+    return shown[:n]
+
+
 def _combo_formula(combo) -> str:
     """Render a persisted combo the way gamerv prints it (``_conj_to_formula``)."""
     return " & ".join(key if want else f"~({key})" for key, want in combo)
@@ -251,9 +299,10 @@ def _phi_verdict(run_dir: Path, formula: str, phi: str) -> dict | None:
 def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     """Mining metrics for one case, read from ``run_dir``'s persisted records.
 
-    The candidate count comes from the mining cache, the ground truth's rank and tier
-    from gamerv's phi verdict beside it — falling back to textual matching over the
-    same ranked list when no verdict was persisted (see the module docstring).
+    The candidate count is the size of the mining cache's **top-scored tier**, the
+    ground truth's rank and tier come from gamerv's phi verdict beside it — falling
+    back to textual matching over that same tier when no verdict was persisted (see
+    the module docstring).
 
     Returns an empty :class:`Mining` when the run has no mining record (mining never
     reached the point of persisting: an unparseable property, no violation states, no
@@ -269,7 +318,8 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     shown = entry.get("shown")
     if shown is None:
         return Mining()
-    m = Mining(candidates=len(shown))
+    top = _top_tier(shown)            # the reported candidate set — see _top_tier
+    m = Mining(candidates=len(top))
     if not phi.strip():
         return m                      # no ground truth on this row to look for
 
@@ -278,20 +328,26 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
         m.union_only = bool(verdict.get("union_only"))
         rank, match = verdict.get("rank"), (verdict.get("match") or "")
         if match == "implication" and rank:
+            rank = int(rank)
+            if rank > len(top):
+                # gamerv's rank indexes the whole ranked list: phi is established, but
+                # by a candidate scoring below the top tier. Not found here, and
+                # flagged so the miss and the row's SUCCESS status can be reconciled.
+                m.below_top = True
+                return m
             # Name the tier the way a results table reads it: a candidate that is
             # *spelled* like phi is an exact match, one that merely implies it is not.
-            m.gt_rank = int(rank)
-            m.gt_match = ("exact" if _same_formula(shown, int(rank), phi)
-                          else "implication")
+            m.gt_rank = rank
+            m.gt_match = "exact" if _same_formula(top, rank, phi) else "implication"
         elif match:
             m.gt_match = match        # "region": established, but by no candidate
         return m
 
     # No persisted verdict (data-direct / auto with a raw phi): fall back to textual
-    # matching, at its own two tiers.
+    # matching, at its own two tiers — over the top tier only, for the same reason.
     want, want_term = _canonical(phi), _term_key(phi)
     threshold_rank = None
-    for i, item in enumerate(shown, start=1):
+    for i, item in enumerate(top, start=1):
         combo = item[0]
         cand = _combo_formula(combo)
         if _canonical(cand) == want:
@@ -305,11 +361,11 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     return m
 
 
-def _same_formula(shown: list, rank: int, phi: str) -> bool:
-    """Is the candidate at 1-based ``rank`` phi itself (canonically)? Ranks index the
-    same ranked list gamerv scanned, so an out-of-range rank means the two files were
-    written by different runs — reported as "not the same formula" rather than
-    guessing."""
-    if not (1 <= rank <= len(shown)):
+def _same_formula(top: list, rank: int, phi: str) -> bool:
+    """Is the candidate at 1-based ``rank`` phi itself (canonically)? ``top`` is the
+    top tier, a prefix of the list gamerv ranked, so an in-tier rank indexes it
+    directly; an out-of-range rank means the two files were written by different runs
+    — reported as "not the same formula" rather than guessing."""
+    if not (1 <= rank <= len(top)):
         return False
-    return _canonical(_combo_formula(shown[rank - 1][0])) == _canonical(phi)
+    return _canonical(_combo_formula(top[rank - 1][0])) == _canonical(phi)

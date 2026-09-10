@@ -369,6 +369,10 @@ def _summary(results, out) -> None:
         if union_only:
             print(f"              {union_only} further row(s) are covered only by the "
                   f"union of several candidates — not counted as found")
+        below_top = sum(1 for r in mined if r.mining.below_top)
+        if below_top:
+            print(f"              {below_top} further row(s) are covered by a single "
+                  f"candidate scoring below the top tier — not counted as found")
     # The same aggregation report.txt is written from, so the two cannot disagree.
     print()
     for line in report.terminal_lines(report.rows_from_results(results)):

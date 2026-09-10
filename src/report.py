@@ -21,9 +21,11 @@ beside the CSVs:
                     ``dataset.FAULT_TYPES``). This is the cut that says whether the
                     method is weaker on temporal faults than on non-temporal ones,
                     which no per-row table shows.
-  mining            how often the ground truth was found among the mined candidates,
-                    how big the candidate set was, and where the ground truth ranked
-                    inside it — overall, per game and per category.
+  mining            how often the ground truth was found among the *top-scored*
+                    mined candidates, how big that candidate set was, and where the
+                    ground truth ranked inside it — overall, per game and per
+                    category. Lower-scoring sound refinements are in gamerv's log but
+                    not in these numbers (see metrics.py).
   by case           one line per dataset case (one row of the dataset): its verdict,
                     its mining numbers and the note the pipeline left, followed by
                     the per-case timing table. This is the per-case detail the run's
@@ -100,6 +102,10 @@ class Row:
     gt_rank: int | None
     gt_match: str
     union_only: bool
+    #: phi is established, but by a candidate scoring below the top-scored tier the
+    #: metrics report — a miss here that can still be SUCCESS in ``status``
+    #: (see metrics.py).
+    below_top: bool = False
     #: The dataset row this case came from (1-based), None for a run written before
     #: the column existed — the per-case table then falls back to branch order.
     case: int | None = None
@@ -168,6 +174,7 @@ def row_from_dict(d: dict) -> Row:
                candidates=_int(d.get("candidates")), gt_rank=_int(d.get("gt_rank")),
                gt_match=cell("gt_match"),
                union_only=cell("union_only").lower() in ("yes", "true", "1"),
+               below_top=cell("below_top").lower() in ("yes", "true", "1"),
                case=_int(d.get("row")), notes=cell("notes"),
                elapsed_s=_float(d.get(_TOTAL_COLUMN)), phases=_phase_cells(d))
 
@@ -180,6 +187,7 @@ def row_from_result(res) -> Row:
                fault_type=res.fault_type, candidates=res.mining.candidates,
                gt_rank=res.mining.gt_rank, gt_match=res.mining.gt_match,
                union_only=res.mining.union_only,
+               below_top=res.mining.below_top,
                case=getattr(res, "row", None) or None, notes=res.notes,
                elapsed_s=res.elapsed_s,
                phases=tuple(res.phase_cells().items()))
@@ -283,7 +291,8 @@ def _status_table(groups: list[tuple[str, list[Row]]], head: str,
 
 def _mining_table(groups: list[tuple[str, list[Row]]], head: str) -> list[str]:
     """Per group: how many rows mined, how often the ground truth was found among the
-    candidates, and the median candidate count / ground-truth rank of those rows."""
+    top-scored candidates, and the median candidate count / ground-truth rank of
+    those rows."""
     label_w = max([len(head)] + [len(label) for label, _ in groups])
     out = [f"  {head:<{label_w}}  {'mined':>5}  {'found':>5}  {'found%':>7}  "
            f"{'union':>5}  {'med.cand':>8}  {'med.rank':>8}"]
@@ -326,6 +335,12 @@ def _mining_summary(rows: list[Row]) -> list[str]:
     out.append(
         f"  rejected by the single-refinement rule: {len(union)}  "
         f"(only the union of several candidates covers phi)")
+    below = [r for r in mined if r.below_top]
+    if below:
+        out.append(
+            f"  rejected as below the top score: {len(below)}  "
+            f"(a single mined candidate covers phi, but one scoring below the "
+            f"top-scored tier — such a row can still be SUCCESS in the status column)")
     if cands:
         out.append(f"  candidates per row:  median {statistics.median(cands):g}   "
                    f"min {min(cands)}   max {max(cands)}")
@@ -365,7 +380,8 @@ def _case_table(rows: list[Row]) -> list[str]:
     gw = max([4] + [len(r.game or "?") for r in ordered])
     bw = max([6] + [len(r.branch or "?") for r in ordered])
     sw = max([6] + [len(r.status or "?") for r in ordered])
-    mw = max([5] + [len(r.gt_match) for r in ordered])
+    mw = max([5] + [len(r.gt_match) for r in ordered]
+             + [9 for r in ordered if r.below_top])   # "below-top"
     out = [f"  {'row':>3}  {'game':<{gw}}  {'branch':<{bw}}  {'status':<{sw}}  "
            f"{'cand':>5}  {'rank':>5}  {'match':<{mw}}  {'time':>8}"]
     for r in ordered:
@@ -375,7 +391,7 @@ def _case_table(rows: list[Row]) -> list[str]:
             f"{r.status or '?':<{sw}}  "
             f"{'-' if r.candidates is None else r.candidates:>5}  "
             f"{'-' if r.gt_rank is None else r.gt_rank:>5}  "
-            f"{r.gt_match or '-':<{mw}}  "
+            f"{r.gt_match or ('below-top' if r.below_top else '-'):<{mw}}  "
             f"{'-' if r.elapsed_s is None else f'{r.elapsed_s:.1f}s':>8}")
         out += _wrap(r.notes, " " * 7)
     return out
@@ -503,7 +519,10 @@ def render(rows: list[Row], title: str = "") -> str:
               "  found  = a single mined refinement establishes phi (or phi's own",
               "           core region does, for a conjunctive phi with no rank)",
               "  union  = only the union of several candidates covers phi, so the",
-              "           ground truth counts as not found (see metrics.py)"]
+              "           ground truth counts as not found (see metrics.py)",
+              "  cand   = the top-scored tier of the ranked candidate set (the",
+              "           refinements a user reads from the top); a phi established",
+              "           only below that tier counts as not found too"]
 
     # Then the same analysis per game, so each game's own numbers can be read
     # (and quoted) without the rest of the run diluting them.
