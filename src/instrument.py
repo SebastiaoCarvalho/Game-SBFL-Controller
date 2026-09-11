@@ -59,6 +59,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -154,6 +155,20 @@ def fingerprint(game: Game) -> str:
     h.update(repr((str(game.instrument_src), game.instrument_extra_args))
              .encode("utf-8"))
     return h.hexdigest()[:16]
+
+
+def keys_path(game: Game) -> Path:
+    """Where the manifest is *kept* after the instrumentation is reverted.
+
+    :func:`revert` deletes the live manifest — it describes edits that no longer
+    exist, and leaving it behind would make the next run think the tree is still
+    instrumented. But the key records inside it are not about the edits: they are the
+    game's ``source identifier -> reported key`` table, which stays true as long as
+    the source does, and is what :mod:`term_rules` needs to read the game's own
+    arithmetic (see :mod:`runners.source_keys`). So a copy is kept here, outside the
+    game repo, keyed by game like the manifest itself.
+    """
+    return config.INSTRUMENT_DIR / f"{game.name}.keys.json"
 
 
 def manifest_path(game: Game) -> Path:
@@ -390,6 +405,7 @@ def apply(game: Game) -> None:
     """
     _clear_stale(game)
     out = _run(game, ["--write"], "write").stdout
+    _keep_key_table(game)
     wrote = _WROTE.search(out)
     if wrote:
         print(f"  [instrument] wrote {wrote.group(1)} key(s) into "
@@ -401,6 +417,23 @@ def apply(game: Game) -> None:
         # whole point of the step is the keys, so do not let it pass silently.
         print(f"  [instrument] [warn] the write pass reported neither keys nor "
               f"'{_NOTHING_TO_DO}':\n{_tail(out, 5)}")
+
+
+def _keep_key_table(game: Game) -> None:
+    """Copy the fresh manifest to :func:`keys_path` before the revert deletes it.
+
+    Best effort by design: a missing key table costs the term-rules step its
+    precision, never the run its correctness.
+    """
+    src = manifest_path(game)
+    if not src.is_file():
+        return
+    try:
+        dst = keys_path(game)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+    except OSError as exc:
+        print(f"  [instrument] [warn] could not keep the key table: {exc}")
 
 
 def revert(game: Game, baseline: frozenset[str] = frozenset()) -> None:

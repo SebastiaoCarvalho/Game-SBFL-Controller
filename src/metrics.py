@@ -8,20 +8,41 @@ refinements, each a ``[[[key, want], ...], support, size]`` triple. That file is
 the machine-readable twin of the ``refinement_separators.log`` the same run
 writes, so the metrics here are read off it rather than scraped from stdout.
 
-**Only the top-scored tier counts.** ``shown`` holds *every* sound candidate, at
-every score: a candidate's score is its good-state support (the log's ``holds in
-k/n good states``, flagged ``[perfect separator]`` at ``k == n``), and gamerv ranks
-by that support descending, then by fewest literals. Counting the whole list would
-answer a question nobody asks — the point of the metric is how many refinements a
-user has to work through before reaching the fix, and a user works down from the
-best score. So the candidate set here is the **leading tier of the ranked list: the
-candidates sharing the best support** (:func:`_top_tier`), and a ground truth that
-ranks below that tier is *not found* (see the caveat under "Where the rank comes
-from").
+**Only the top tier counts.** ``shown`` holds *every* sound candidate, at every
+score: a candidate's score is its good-state support (the log's ``holds in k/n good
+states``, flagged ``[perfect separator]`` at ``k == n``), and gamerv ranks by that
+support descending, then by fewest literals. Counting the whole list would answer a
+question nobody asks — the point of the metric is how many refinements a user has to
+work through before reaching the fix, and a user works down from the best score. So
+the candidate set here is the **leading tier of the ranked list: the candidates
+sharing the best support and the fewest literals**, with the redundant threshold
+spellings inside it folded away (:func:`_top_tier`), and a ground truth that ranks
+below that tier is *not found* (see the caveat under "Where the rank comes from").
+
+Two things are excluded from the tier because they are implied by something already
+in it, not because they are uninteresting:
+
+  * a **longer conjunction** at the same support. ``_search_conjunctions`` builds a
+    pair only when neither literal separates alone, so a size-2 candidate sitting
+    beside a sound single says "these two together exclude the violations" where the
+    single already did it by itself.
+  * a **tighter or differently-spelled split** of a bound the tier already carries:
+    ``Forall(e.h < 22)``, ``Forall(e.h < 58)`` and ``~(Exists(e.h > 116))`` are three
+    spellings of one cap on ``max(e.h)``, and the loosest implies the other two.
+
+Both are kept in ``refinement_separators.log``, under their own dividers. Dropping
+implied candidates cannot change a verdict — the test is ``Exists R: phi -> R``, and
+the retained candidate is the weaker one, so it accepts at least as many phis — but it
+does move the count and a ground truth's rank, which is the point. It can also move
+``gt_match`` from ``exact`` to ``implication`` when phi was spelled at a tighter split
+than the retained candidate: that tighter spelling is not a refinement the tool would
+show.
 
 Four numbers per case:
 
   candidates  how many top-scored sound candidate refinements the miner produced.
+              Independent of the candidate ordering: the tier is a *set*, and the
+              sort only permutes it (see gamerv's runners.candidate_sort).
   gt_rank     the 1-based position of the ground-truth phi in that top tier,
               blank when phi is not among those candidates.
   union_only  phi is established only by several candidates *together* — the case
@@ -37,8 +58,16 @@ at a time — ``Exists R in R_all: phi -> R``
 ``<run_dir>/phi_refinement.json``: the rank of the first candidate that establishes
 phi, the match tier, and whether the union of candidates would have covered a phi no
 single one does (``union_only``). That semantic verdict is authoritative on *whether*
-a single candidate establishes phi, and its rank indexes the same ranked list — so it
-is reused here rather than re-derived.
+a single candidate establishes phi, so it is reused here rather than re-derived.
+
+The rank is a **position in the order gamerv's run reported**, which its candidate
+sort decides (gamerv's ``runners.candidate_sort``; the controller's
+``--candidate-sort``) — that is the point of the knob: the same candidate *set*, read
+in a different order, puts the ground truth at a different rank. The mining cache read
+here holds the miner's own canonical order instead, so the two must never be crossed:
+nothing below indexes the tier by ``rank``. The tier is used only for its **size**
+(a set, identical under every sort), and the exact/implication distinction comes off
+the verdict's own ``r_text``.
 
 The rank is kept only when it falls inside the top tier. gamerv now decides phi
 against that tier itself (``_top_tier`` there), so a fresh verdict's rank is always
@@ -54,7 +83,10 @@ It is missing only when the containment view never ran — a ``data-direct`` (or
 the rank falls back to **textual** matching over the same ranked list, on a canonical
 form (see `_canonical`): whitespace, C float suffixes (``0.f``), quote style, numeric
 spelling (``369`` / ``369.0``), conjunct order, and negation (``~(a == b)`` vs
-``a != b``) are all normalised away.
+``a != b``) are all normalised away. That fallback ranks over the **miner's** order —
+it is the only order this side has — so in those modes a candidate sort does not move
+the number. The symbolic mode the experiment runs under always persists a verdict, so
+it always reports the sorted rank.
 
 ``gt_match`` says which tier ``gt_rank`` refers to, so tiers are never silently mixed
 in a results table:
@@ -243,25 +275,131 @@ def _term_key(expr: str) -> tuple[str, str] | None:
 # --------------------------------------------------------------------------
 # Reading gamerv's mining record
 # --------------------------------------------------------------------------
+#: An outer quantifier wrapping a whole atom — ``Forall(enemy.x < 5)``. The
+#: comparison lives *inside* the parentheses, so the quantifier is stripped before
+#: the comparison is read.
+_QUANT_WRAP_RE = re.compile(r"^(Forall|Exists)\(\s*(.*?)\s*\)$", re.S)
+#: The comparison itself: an arithmetic term, an ordered operator, a number.
+#: Deliberately base-agnostic — gamerv builds its own atom regexes from the active
+#: game profile, which this side has no access to. Anchoring the number at the end
+#: is what keeps it off the equality atoms (a string or container literal) that carry
+#: no ordering.
+_BOUND_RE = re.compile(r"^(.+?)\s*(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)$", re.S)
+#: Which per-state aggregate a quantified threshold constrains (gamerv's
+#: ``raw_atoms._BOUND_AGGREGATE``): ``Forall(t < T)`` / ``Exists(t > T)`` bound the
+#: per-state max of ``t``, ``Forall(t > T)`` / ``Exists(t < T)`` the min.
+_BOUND_AGGREGATE = {("Forall", "<"): "max", ("Exists", ">"): "max",
+                    ("Forall", ">"): "min", ("Exists", "<"): "min"}
+_NEGATED_OP = {"<": ">=", "<=": ">", ">": "<=", ">=": "<"}
+_FLIP_QUANT = {"Forall": "Exists", "Exists": "Forall"}
+
+
+def _threshold_bound(key: str, want: bool):
+    """The half-line a threshold literal constrains, or ``None`` for anything else.
+
+    Returns ``((quantity, aggregate, side), (value, strict))`` — the offline twin of
+    gamerv's ``raw_atoms.threshold_bound``, which is the authority on the mapping and
+    carries its full reasoning. Reimplemented rather than imported: this module reads a
+    persisted JSON cache with no gamerv process, no game profile and no venv, and
+    gamerv's own atom regexes are built from the active profile's bases.
+    """
+    text = key.strip()
+    quant = None
+    wrap = _QUANT_WRAP_RE.match(text)
+    if wrap is not None:
+        quant, text = wrap.group(1), wrap.group(2)
+    m = _BOUND_RE.match(text)
+    if m is None:
+        return None
+    term, op, num = m.group(1), m.group(2), m.group(3)
+    if _QUANT_WRAP_RE.match(term):               # a nested quantifier is not a term
+        return None
+    if not want:                                 # read the negated literal positively
+        op = _NEGATED_OP[op]
+        if quant is not None:
+            quant = _FLIP_QUANT[quant]
+    if quant is None:
+        aggregate = "value"
+    else:
+        aggregate = _BOUND_AGGREGATE.get((quant, op[0]))
+        if aggregate is None:
+            return None
+    side = "upper" if op[0] == "<" else "lower"
+    return (term, aggregate, side), (float(num), len(op) == 1)
+
+
+def _bound_contains(side: str, outer: tuple, inner: tuple) -> bool:
+    """Does half-line ``outer`` contain ``inner``? (gamerv's ``raw_atoms.bound_contains``)"""
+    (vo, so), (vi, si) = outer, inner
+    if vo != vi:
+        return vo > vi if side == "upper" else vo < vi
+    return si or not so
+
+
+def _fold_threshold_bounds(tier: list) -> list:
+    """Drop the tier candidates a retained one already implies — gamerv's
+    ``fault_localization._fold_threshold_bounds``, on the persisted list.
+
+    Within one ``(quantity, aggregate, side)`` group the candidates are half-lines
+    over one aggregate, hence totally ordered by inclusion, so the loosest implies
+    every other and reporting it alone loses no refinement — only repetitions of one
+    (``Forall(e.h < 22)``, ``Forall(e.h < 58)``, ``~(Exists(e.h > 116))`` are three
+    spellings of one cap on ``max(e.h)``). The two polarities fold separately and a
+    negated representative may absorb a positive one but never the reverse: a positive
+    literal reads False where its quantity is missing or non-numeric, its negation
+    True. See gamerv's twin for the full argument.
+    """
+    groups: dict[tuple, list] = {}
+    for i, item in enumerate(tier):
+        combo = item[0]
+        if len(combo) != 1:
+            continue
+        key, want = combo[0][0], bool(combo[0][1])
+        parsed = _threshold_bound(key, want)
+        if parsed is None:
+            continue
+        family, bound = parsed
+        groups.setdefault(family, []).append((i, want, bound))
+    if not groups:
+        return tier
+
+    drop: set[int] = set()
+    for (_term, _aggregate, side), members in groups.items():
+        widest: dict[bool, tuple] = {}
+        for i, want, bound in members:
+            held = widest.get(want)
+            if held is None or _bound_contains(side, bound, held[1]):
+                widest[want] = (i, bound)
+        drop.update(i for i, want, _b in members if widest[want][0] != i)
+        lax, strict = widest.get(False), widest.get(True)
+        if lax and strict and _bound_contains(side, lax[1], strict[1]):
+            drop.add(strict[0])
+    return [item for i, item in enumerate(tier) if i not in drop]
+
+
 def _top_tier(shown: list) -> list:
-    """The leading tier of gamerv's ranked candidate list: the candidates sharing the
-    best score (good-state support). Everything below it is a strictly worse separator
-    that a user reading the list from the top would never have to reach, so it is not
-    part of the candidate set these metrics report (see the module docstring).
+    """The reported candidate set: gamerv's ranked list cut to its leading run of equal
+    **support and size**, with the redundant threshold spellings inside it folded away
+    (:func:`_fold_threshold_bounds`).
+
+    Everything below is a strictly worse separator (lower support) or a strictly less
+    general one (same support, more literals) that a user reading the list from the top
+    would never have to reach, so it is not part of the candidate set these metrics
+    report (see the module docstring).
 
     Taken as the leading *run* rather than by filtering the whole list on the best
-    score: the list is support-descending, and a prefix is what "how many before the
-    fix" means even if a future ranking key reorders ties.
+    score: the list is support-descending then size-ascending, and a prefix is what
+    "how many before the fix" means even if a future ranking key reorders ties.
     """
     if not shown:
         return []
-    best = shown[0][1]
+    best, size = shown[0][1], shown[0][2]
     n = 0
     for item in shown:
-        if item[1] != best:
+        if item[1] != best or item[2] != size:
             break
         n += 1
-    return shown[:n]
+    return _fold_threshold_bounds(shown[:n])
 
 
 def _combo_formula(combo) -> str:
@@ -338,7 +476,8 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
             # Name the tier the way a results table reads it: a candidate that is
             # *spelled* like phi is an exact match, one that merely implies it is not.
             m.gt_rank = rank
-            m.gt_match = "exact" if _same_formula(top, rank, phi) else "implication"
+            m.gt_match = ("exact" if _same_formula(verdict.get("r_text"), phi)
+                          else "implication")
         elif match:
             m.gt_match = match        # "region": established, but by no candidate
         return m
@@ -361,11 +500,13 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     return m
 
 
-def _same_formula(top: list, rank: int, phi: str) -> bool:
-    """Is the candidate at 1-based ``rank`` phi itself (canonically)? ``top`` is the
-    top tier, a prefix of the list gamerv ranked, so an in-tier rank indexes it
-    directly; an out-of-range rank means the two files were written by different runs
-    — reported as "not the same formula" rather than guessing."""
-    if not (1 <= rank <= len(top)):
-        return False
-    return _canonical(_combo_formula(top[rank - 1][0])) == _canonical(phi)
+def _same_formula(r_text: str | None, phi: str) -> bool:
+    """Is the refinement that established phi phi itself (canonically)?
+
+    Read off the verdict's own ``r_text`` rather than by indexing the tier at
+    ``rank``: the rank is a position in the order *gamerv's run* reported (which the
+    candidate sort decides), while the mining cache holds the miner's canonical
+    order, so indexing one with the other would name a different candidate. ``r_text``
+    is the refinement the verdict is actually about, whatever the order was.
+    """
+    return bool(r_text) and _canonical(r_text) == _canonical(phi)

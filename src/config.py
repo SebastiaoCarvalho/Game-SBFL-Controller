@@ -150,6 +150,29 @@ REFINEMENT_MODES = ("auto", "data-direct", "symbolic")
 THRESHOLD_STRATEGY = "weakest"
 THRESHOLD_STRATEGIES = ("midpoints", "weakest", "gap-mean")
 
+# --- Candidate ordering ---------------------------------------------------
+# gamerv scores every sound candidate refinement by its good-state support and
+# reports the top-scored tier: the leading run of candidates sharing the best
+# support. Inside that tier every candidate separates the fault equally well, so
+# the order a reader meets them in — and hence the ground truth's rank, the
+# `gt_rank` column — is decided by the miner's own tie-break (fewest literals,
+# then generation order). This selects that within-tier order:
+#   "none"       — the miner's order, unchanged. The baseline.
+#   "type"       — by the kind of value the atom compares against: a boolean flag
+#                  first, then a parity/modulo test, then a categorical (string /
+#                  container) equality, then a numeric threshold. The premise is
+#                  reading cost: a flag states a fact, a threshold makes the
+#                  reader judge a number.
+#   "popularity" — by how often the atom's quantities are mentioned in the game's
+#                  own source (the per-variable count step 7a's digest writes to
+#                  gamerv's config/games/<game>/fl_var_popularity.json). Needs
+#                  that file: without it gamerv says so and keeps the mined order.
+# Support is always the primary key, so the tier boundaries, the candidate count
+# and below_top mean the same under every sort and results stay comparable.
+# Overridable per run with --candidate-sort.
+CANDIDATE_SORT = "none"
+CANDIDATE_SORTS = ("none", "type", "popularity")
+
 # --- Build parallelism ----------------------------------------------------
 # Parallelism for `cmake --build`. Kept modest to avoid OOM on heavy TUs. Shared
 # default; a Game's build_commands may bake in a different -j.

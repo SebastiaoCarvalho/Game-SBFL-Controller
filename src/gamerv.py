@@ -347,19 +347,27 @@ def last_invalid_run() -> Path | None:
 
 
 def fault_localize(run_dir: Path, terms: list[str] | None = None,
-                   strategy: str | None = None) -> str:
+                   strategy: str | None = None,
+                   candidate_sort: str | None = None) -> str:
     """Localize the fault in ``run_dir``, mining a refinement R.
 
     When ``terms`` is given, mining is focused on exactly those raw game-state
     variables (the box-only vocabulary); otherwise gamerv discovers candidates
     generically from every logged variable. Terms are handed to the worker as a
     single JSON list so values with spaces/parens survive argv intact. ``strategy``
-    selects how R's thresholds are placed (midpoints / weakest / gap-mean); when
-    given, terms occupies a fixed argv slot ("null" if absent) so strategy follows.
+    selects how R's thresholds are placed (midpoints / weakest / gap-mean) and
+    ``candidate_sort`` how the mined candidates are ordered within one score tier
+    (none / type / popularity).
+
+    Once either knob is given, terms occupies a fixed argv slot ("null" if absent)
+    so the ones after it stay positionally addressable — the same fixed-slot
+    contract :func:`compare_refinement` uses.
     """
     args = ["fault_localize", str(run_dir)]
-    if strategy is not None:
-        args += [json.dumps(list(terms) if terms else None), strategy]
+    if strategy is not None or candidate_sort is not None:
+        args += [json.dumps(list(terms) if terms else None),
+                 strategy or config.THRESHOLD_STRATEGY,
+                 candidate_sort or config.CANDIDATE_SORT]
     elif terms:
         args.append(json.dumps(list(terms)))
     proc = _worker(*args)
@@ -444,7 +452,8 @@ def mined_r(out: str) -> str | None:
 
 
 def mine_only(run_dir: Path, terms: list[str] | None = None,
-              strategy: str | None = None) -> Containment:
+              strategy: str | None = None,
+              candidate_sort: str | None = None) -> Containment:
     """Mine R with no phi to judge it against — the SKIPPED path for a dataset row
     whose ``Target Phi`` cell is empty.
 
@@ -459,7 +468,7 @@ def mine_only(run_dir: Path, terms: list[str] | None = None,
     to yield a verdict); the reason is carried in the note.
     """
     try:
-        out = fault_localize(run_dir, terms, strategy)
+        out = fault_localize(run_dir, terms, strategy, candidate_sort)
     except GameRVError as exc:
         return Containment("SKIPPED", None, str(exc),
                            "no ground-truth phi (mining R failed)")
@@ -603,17 +612,21 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
 def compare_refinement(run_dir: Path, phi: str,
                        terms: list[str] | None = None,
                        mode: str | None = None,
-                       strategy: str | None = None) -> Containment:
+                       strategy: str | None = None,
+                       candidate_sort: str | None = None) -> Containment:
     """Run gamerv's compare_refinement and classify the verdict on phi.
 
     ``terms`` focuses R-mining on those raw variables (box-only), matching the
     vocabulary used in fault localization, so the verdict is decided against the
     same R. Empty/None mines R generically. ``mode`` selects gamerv's decision
-    path (auto / data-direct / symbolic) and ``strategy`` how R's thresholds are
-    placed (midpoints / weakest / gap-mean); each defaults to the config value.
+    path (auto / data-direct / symbolic), ``strategy`` how R's thresholds are
+    placed (midpoints / weakest / gap-mean), and ``candidate_sort`` how the mined
+    candidates are ordered within one score tier (none / type / popularity — only
+    the order they are reported and checked in, never which R is mined); each
+    defaults to the config value.
 
-    terms/mode/strategy are passed as fixed argv positions (terms as JSON, "null"
-    when absent) so mode and strategy stay addressable even when no terms are set.
+    terms/mode/strategy/sort are passed as fixed argv positions (terms as JSON,
+    "null" when absent) so each stays addressable even when no terms are set.
 
     An empty ``phi`` (a dataset row with no ground truth) is not an error: it is
     routed to :func:`mine_only`, which mines R and returns ``SKIPPED``.
@@ -621,11 +634,13 @@ def compare_refinement(run_dir: Path, phi: str,
     if not phi.strip():
         # No ground truth to compare: gamerv would only report that it could not
         # evaluate an empty phi, which reads as an ERROR. Mine R instead.
-        return mine_only(run_dir, terms, strategy)
+        return mine_only(run_dir, terms, strategy, candidate_sort)
     mode = mode or config.REFINEMENT_MODE
     strategy = strategy or config.THRESHOLD_STRATEGY
+    candidate_sort = candidate_sort or config.CANDIDATE_SORT
     args = ["compare_refinement", str(run_dir), phi,
-            json.dumps(list(terms) if terms else None), mode, strategy]
+            json.dumps(list(terms) if terms else None), mode, strategy,
+            candidate_sort]
     proc = _worker(*args)
     out = proc.stdout or ""
     if proc.stdout:

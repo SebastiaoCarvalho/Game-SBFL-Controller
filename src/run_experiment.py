@@ -10,6 +10,8 @@
     python run_experiment.py --rows 1-60 --skip-manual  # unattended: skip rows needing a human
     python run_experiment.py --row 20 --refinement-mode symbolic --threshold-strategy weakest
     python run_experiment.py --row 20 --refinement-mode data-direct   # corroborate-only
+    python run_experiment.py --candidate-sort type   # reorder each score tier: flags before thresholds
+    python run_experiment.py --candidate-sort all    # sweep: one pass (and one results folder) per sort
     python run_experiment.py --row 4 --no-instrument  # build the source as committed
     python run_experiment.py --row 4 --clean     # drop row 4's cached build + logs
 
@@ -21,6 +23,7 @@ that folder's report.txt ("BY CASE"), not to stdout.
 
 import argparse
 import csv
+import json
 import statistics
 import shutil
 import sys
@@ -55,6 +58,27 @@ def _parse_rows(spec: str) -> tuple[int, int]:
     if not hi:
         return int(lo), int(lo)
     return int(lo), int(hi)
+
+
+def _parse_sorts(spec: str) -> list[str]:
+    """``--candidate-sort``: one sort, a comma-separated list of them, or ``all``.
+
+    More than one turns the batch into a **sweep**: the same rows are run once per
+    sort, each pass writing its own results folder, which is what someone would
+    otherwise get by starting the batch three times by hand. The order is the one
+    given (``all`` means every sort in config order) and duplicates are dropped —
+    a repeated sort would only produce a second folder of the same numbers.
+    """
+    names = list(dict.fromkeys(s.strip() for s in spec.split(",") if s.strip()))
+    if names == ["all"]:
+        return list(config.CANDIDATE_SORTS)
+    bad = [n for n in names if n not in config.CANDIDATE_SORTS]
+    if bad or not names:
+        raise argparse.ArgumentTypeError(
+            f"invalid candidate sort {', '.join(bad) if bad else spec!r}: choose "
+            f"from {', '.join(config.CANDIDATE_SORTS)}, a comma-separated list of "
+            f"them, or 'all'")
+    return names
 
 
 def _dir_size(path) -> int:
@@ -144,6 +168,21 @@ def main(argv: list[str]) -> int:
                          "phi on the pooled good/violation states (independent of "
                          "R), 'auto' is data-direct with a symbolic fallback for "
                          f"non-raw phi. Default: {config.REFINEMENT_MODE}.")
+    ap.add_argument("--candidate-sort", type=_parse_sorts,
+                    default=[config.CANDIDATE_SORT],
+                    metavar="{" + ",".join((*config.CANDIDATE_SORTS, "all")) + "}",
+                    help="how the mined candidate refinements are ordered *within* "
+                         "one score tier (they all separate the fault equally well, "
+                         "so the order decides the ground truth's rank): 'none' = "
+                         "the miner's order, 'type' = boolean flags, then parity, "
+                         "then categorical equalities, then numeric thresholds, "
+                         "'popularity' = most-used in the game's source first "
+                         "(needs step 7a's per-variable counts). Never changes "
+                         "which refinements are mined. Pass several "
+                         "comma-separated (or 'all') to SWEEP them: the selected "
+                         "rows are run once per sort and each pass writes its own "
+                         "results/run_<timestamp>_<sort>/ folder. Default: "
+                         f"{config.CANDIDATE_SORT}.")
     ap.add_argument("--threshold-strategy", choices=config.THRESHOLD_STRATEGIES,
                     default=config.THRESHOLD_STRATEGY,
                     help="how R's numeric split-points are placed: 'weakest' = just "
@@ -191,43 +230,90 @@ def main(argv: list[str]) -> int:
         _clean(cases)
         return 0
 
+    sorts = args.candidate_sort
+    sweep = len(sorts) > 1
     print(f"Refinement decision: mode={args.refinement_mode}  "
-          f"threshold strategy={args.threshold_strategy}")
+          f"threshold strategy={args.threshold_strategy}  "
+          f"candidate sort={' -> '.join(sorts) if sweep else sorts[0]}")
     print(f"Source instrumentation (step 2a): "
           f"{'on' if args.instrument else 'off'}")
     if args.skip_manual:
         print("Manual predicates: never prompting (--skip-manual) — rows the "
               "hints do not cover are reported NEEDS_MANUAL")
+    if sweep:
+        print(f"Candidate-sort sweep: {len(cases)} row(s) x {len(sorts)} sort(s) "
+              f"= {len(cases) * len(sorts)} case run(s), one results folder each.")
+        # Worth saying before an overnight start: the sweep is not three times the
+        # first pass's wall clock, but it is not one pass either. Step 5's recording
+        # is content-cached per game+branch, so passes 2..n restore it; steps 6 and 8
+        # re-run every pass, and step 8's mining is where a row spends its minutes.
+        print("                      steps 2/5 are cached after the first pass; "
+              "steps 6 and 8 (the mining) re-run in every pass.")
+        if not args.skip_manual:
+            print("                      consider --skip-manual: a manual predicate "
+                  "no hint covers would otherwise block every remaining pass at a "
+                  "prompt.")
 
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     gamerv.backup_properties()
 
-    results = []
+    passes: list[tuple[str, object, list]] = []
+    rc = 0
     try:
-        for case in cases:
-            print("\n" + "=" * 70)
-            print(f"ROW {case.row}: {case.branch}")
-            print("=" * 70)
+        for i, sort in enumerate(sorts, 1):
+            if sweep:
+                print("\n" + "#" * 70)
+                print(f"# PASS {i}/{len(sorts)}: candidate sort = {sort}")
+                print("#" * 70)
             try:
-                res = run_case(case, manual_auto=args.manual_auto,
-                               refinement_mode=args.refinement_mode,
-                               threshold_strategy=args.threshold_strategy,
-                               instrument_source=args.instrument,
-                               skip_manual=args.skip_manual)
+                results = _run_pass(cases, args, sort)
             except DirtyTreeError as exc:
+                # Experiment-wide precondition, not a per-row failure: the remaining
+                # passes would abort on the same dirty tree. Passes already finished
+                # keep the folders they wrote.
                 print(f"\nABORTING: {exc}", file=sys.stderr)
                 return 2
-            results.append(res)
-            phases = "  ".join(f"{p}={v}s" for p, v in res.phase_cells().items())
-            print(f"\n--> ROW {case.row} [{res.status}] "
-                  f"({res.elapsed_s:.1f}s total | {phases}) {res.notes}")
+            # Written per pass rather than at the end, so an interrupted sweep still
+            # leaves every finished pass's folder complete.
+            out = _write_results(results, _settings(args, sort),
+                                 suffix=f"_{sort}" if sweep else "")
+            _summary(results, out)
+            passes.append((sort, out, results))
+            # Exit non-zero if any row errored in any pass, so CI/scripts can notice.
+            if any(r.status == "ERROR" for r in results):
+                rc = 1
     finally:
         gamerv.restore_properties()
 
-    out = _write_results(results)
-    _summary(results, out)
-    # Exit non-zero if any row errored, so CI/scripts can notice.
-    return 0 if all(r.status != "ERROR" for r in results) else 1
+    if sweep:
+        _sweep_summary(passes)
+    return rc
+
+
+def _run_pass(cases, args, candidate_sort: str) -> list:
+    """Run every selected case once, under one candidate sort. Returns the results.
+
+    One call is one results folder — the unit a sweep repeats. Every per-row failure
+    is captured by :func:`pipeline.run_case` as an ERROR result so the batch keeps
+    going; ``DirtyTreeError`` is the one exception and propagates, because no later
+    row (or pass) can run against a dirty game tree either.
+    """
+    results = []
+    for case in cases:
+        print("\n" + "=" * 70)
+        print(f"ROW {case.row}: {case.branch}")
+        print("=" * 70)
+        res = run_case(case, manual_auto=args.manual_auto,
+                       refinement_mode=args.refinement_mode,
+                       threshold_strategy=args.threshold_strategy,
+                       instrument_source=args.instrument,
+                       skip_manual=args.skip_manual,
+                       candidate_sort=candidate_sort)
+        results.append(res)
+        phases = "  ".join(f"{p}={v}s" for p, v in res.phase_cells().items())
+        print(f"\n--> ROW {case.row} [{res.status}] "
+              f"({res.elapsed_s:.1f}s total | {phases}) {res.notes}")
+    return results
 
 
 def _write_csv(path, header, rows) -> None:
@@ -237,8 +323,35 @@ def _write_csv(path, header, rows) -> None:
         w.writerows(rows)
 
 
-def _write_results(results) -> "object":
+def _settings(args, candidate_sort: str) -> dict:
+    """The knobs this pass ran under, for ``settings.json``.
+
+    Only the ones that change what the numbers *mean*: two runs over the same rows
+    with different knobs produce two folders that are otherwise indistinguishable,
+    and the candidate sort in particular exists to be compared across runs — which
+    is why it is the pass's own sort that is recorded here, not the whole sweep's
+    list (``--candidate-sort all`` writes three folders, each naming one sort).
+    """
+    return {
+        "candidate_sort": candidate_sort,
+        "refinement_mode": args.refinement_mode,
+        "threshold_strategy": args.threshold_strategy,
+        "instrument_source": bool(args.instrument),
+        "game": args.game,
+        "rows": ([args.row] if args.row else list(args.rows) if args.rows else None),
+        "dataset": str(args.dataset or config.DATASET),
+        "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _write_results(results, settings: dict | None = None,
+                   suffix: str = "") -> "object":
     """Write this run's CSVs into their own results/run_<timestamp>/ folder.
+
+    ``suffix`` is appended to the folder name; a candidate-sort sweep passes
+    ``_<sort>`` so its three folders say which pass they are without anyone having
+    to open settings.json (and cannot collide on a shared second when a cached pass
+    is fast). A plain run passes nothing and keeps the bare ``run_<timestamp>``.
 
     One folder per run, so a run can grow extra artefacts (more views of the
     same rows, plots) without cluttering results/:
@@ -251,6 +364,10 @@ def _write_results(results) -> "object":
                    falls back to the status word (SKIPPED/ERROR/
                    VARIABLE_NOT_FOUND/...)
                    for rows that produced no R, so no cell is silently blank.
+      settings.json the knobs this batch ran under (candidate sort, refinement
+                   mode, threshold strategy, row/game selection). Two runs over
+                   the same rows under different knobs are otherwise
+                   indistinguishable; report.txt and the plots read it back.
       mining.csv   step 8's search metrics per row: how many candidate
                    refinements were mined, and the ground truth's rank among
                    them (blank when it was not established at all — see
@@ -277,7 +394,7 @@ def _write_results(results) -> "object":
     ``python src/plots.py <run_dir>``).
     """
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = config.RESULTS_DIR / f"run_{stamp}"
+    out = config.RESULTS_DIR / f"run_{stamp}{suffix}"
     out.mkdir(parents=True, exist_ok=True)
 
     _write_csv(
@@ -305,6 +422,11 @@ def _write_results(results) -> "object":
         [[r.game, r.branch, r.fault_type, r.fault_class, r.phi, r.status]
          + r.mining.cells() for r in results],
     )
+    if settings is not None:
+        # Written before the report/plots so both can read it back and caption
+        # themselves with the knobs the numbers came from.
+        (out / "settings.json").write_text(
+            json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     report.write(out)
     plots.render(out)
     return out
@@ -386,6 +508,53 @@ def _summary(results, out) -> None:
           f"({', '.join(sorted(p.name for p in out.iterdir()))})")
     print(f"  per-case verdicts, notes and timings: "
           f"{out / report.REPORT_TXT} (BY CASE)")
+
+
+def _rel(path) -> str:
+    """A results folder as the path someone would type back at the shell."""
+    try:
+        return str(path.relative_to(config.CONTROLLER_DIR))
+    except ValueError:
+        return str(path)
+
+
+def _sweep_summary(passes: list[tuple[str, object, list]]) -> None:
+    """Close a multi-sort sweep: one line per pass, then the commands to diff them.
+
+    Each pass has already printed its own full summary and written its own folder —
+    this only answers the question the sweep was started to ask, which is how the
+    passes compare. The candidate *set* is the same under every sort (the sort
+    permutes one score tier, it does not re-mine), so the verdict counts should
+    agree and the ranks should not: a SUCCESS column that moves between passes is
+    worth looking at, and the rank columns are the measurement.
+
+    The real comparison is ``src/compare.py A B``, which diffs two folders row by
+    row (rank moves included), so the last thing printed is those command lines
+    against the first pass, ready to paste.
+    """
+    print("\n" + "=" * 70)
+    print("SWEEP SUMMARY")
+    print("=" * 70)
+    rows = len(passes[0][2]) if passes else 0
+    print(f"  {len(passes)} candidate sort(s) over {rows} row(s), "
+          f"one results folder each\n")
+    print(f"  {'sort':<12} {'SUCCESS':>9} {'found':>9} {'median rank':>12}   folder")
+    for sort, out, results in passes:
+        ok = sum(1 for r in results if r.status == "SUCCESS")
+        mined = [r for r in results
+                 if r.mining.candidates is not None and r.phi.strip()]
+        found = [r for r in mined if r.mining.found]
+        ranks = [r.mining.gt_rank for r in mined if r.mining.gt_rank]
+        median = f"{statistics.median(ranks):.0f}" if ranks else "-"
+        print(f"  {sort:<12} {f'{ok}/{len(results)}':>9} "
+              f"{f'{len(found)}/{len(mined)}':>9} {median:>12}   {_rel(out)}")
+    if len(passes) > 1:
+        base = passes[0]
+        print(f"\n  compare against the {base[0]} pass (per-row verdict and rank "
+              f"moves):")
+        for sort, out, _ in passes[1:]:
+            print(f"    python src/compare.py {_rel(base[1])} {_rel(out)}"
+                  f"   # {base[0]} -> {sort}")
 
 
 if __name__ == "__main__":

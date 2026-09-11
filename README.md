@@ -41,6 +41,7 @@ that are not part of the pipeline itself live in `scripts/`.
 | `src/dataset.py` | Reads `dataset.csv` into `TestCase(game, specification, branch, phi, fault_type)` **and** owns the fault taxonomy (the twelve `Fault Type` categories and their two parents). |
 | `src/game_repo.py` | git checkout, build, game launch/shutdown — each fn takes a `config.Game`. |
 | `src/instrument.py` | Step 2a: runs gamerv's source instrumenter over the branch before each compile, then reverts it. |
+| `src/term_rules.py` | Step 7a: regenerates the game's compound-term allow-list by digesting its own source, so the compound sweep is scoped per game instead of by a stale Super Tux file. |
 | `src/progress.py` | Renders a long subprocess (the compiles) as one self-updating progress line, with its full output kept in `build_logs/`. |
 | `src/gamerv.py` | Wrappers around gamerv's `worker.py` ops + logs/properties/active-game helpers. |
 | `src/manual_review.py` | Operator prompts for gamerv's manual visual/audio predicate values (step 6). |
@@ -50,8 +51,10 @@ that are not part of the pipeline itself live in `scripts/`.
 | `src/metrics.py` | Step 8's mining metrics per row: candidate-set size, the ground truth's rank in it, the match tier, and the `union_only` flag. |
 | `src/report.py` | Writes `report.txt` from a run's CSVs: classification counts, the same counts per game / bug category / parent category, the **per-game breakdown** (the whole analysis again over each game's own rows), and the per-case division (one line per dataset row); also a standalone CLI. |
 | `src/plots.py` | Draws a run's figures from its CSVs (candidate-count boxplot; candidates vs. ground-truth rank); also a standalone CLI. |
+| `src/compare.py` | Diffs **two** runs' `full.csv`: which rows gained or lost a SUCCESS, the counts per game/category side by side, and how the mining numbers and the ground truth's **rank** moved (top-k, MRR, rank share, per-case moves); also a standalone CLI. |
 | `src/run_experiment.py` | CLI implementation: select rows, loop, write `results/`. |
 | `scripts/prepare_branches.py` | **Secondary** maintenance: reconcile a game's branches with its `base`. |
+| `scripts/profile_shape_lint.py` | Measures each game's object cardinality in its own traces and checks it against the role `game_profile.json` declares — which quantified collections are really singletons, and which singletons no base matches at all. |
 
 ## Games
 
@@ -98,6 +101,29 @@ branch name (e.g. `base`) without colliding.
    is on (see below), validate pauses for operator judgement — handled inline.
 7. Select the last invalid trace. (Fault localization is intentionally skipped —
    `compare_refinement` re-mines `R` itself, so a separate pass would duplicate it.)
+7a. **Term rules** (`term_rules.py`) — regenerate the game's compound-term
+   allow-list, `gamerv/config/games/<game>/fl_term_rules.json`, by digesting the
+   game's own source (`runners.source_digest`). Unconstrained, the compound sweep
+   *is* the candidate explosion: one Super Tux run mined 2136 perfectly-separating
+   refinements, 2127 of them compound and only 9 over a single variable. The rules
+   keep the combinations the source actually forms — if the game computes or
+   compares `a` against `b`, `a - b` is a quantity the game is about; if it never
+   does, it is arithmetic noise.
+
+   It runs **here**, not inside the step-2a window, because the key records carry
+   pre-edit line numbers: the tree the digest scans must be the pristine one, and by
+   step 7 the instrumentation has been reverted and a run exists to read base fields
+   from. Cached on `instrument.fingerprint(game)` — the same content key the build
+   cache uses — so a row that changed nothing pays a file read.
+
+   Both inputs are **required**, and the step refuses to write without them: the key
+   table kept from step 2a (`instrument.keys_path`, copied aside before the revert
+   deletes the manifest) and a recorded run. Each covers half the vocabulary, and the
+   rules are a *strict* allow-list, so a combination missing from them is one the
+   miner is forbidden to build. Digesting Super Tux with the accessor bridge alone
+   permits 26 combinations and blocks three of its own dataset rows, whose ground
+   truths name instrumented locals. An absent rules file means allow-all — worse for
+   the candidate count, safe for correctness — so that is the state it fails into.
 8. Decide whether `phi` is a valid refinement (`worker.py compare_refinement`) —
    symbolic `∃ R ∈ R_all . phi -> R` (each mined refinement checked on its own) or
    data-direct, per `--refinement-mode` (see below).
@@ -199,6 +225,85 @@ CLI flag):
   - `midpoints` — sample midpoints across the pooled values and let the mining
     search pick (gamerv's historical behaviour).
 
+#### Candidate ordering (step 8)
+
+A candidate refinement's score is its good-state support, and the reported
+candidate set is the **top tier**: the leading run of candidates sharing the best
+support *and* the fewest literals, with the redundant threshold spellings inside
+it folded away. Inside that tier every candidate separates the fault equally
+well, so the order they are read in is a free choice — and it is what `gt_rank`
+measures against. `--candidate-sort` (`config.CANDIDATE_SORT`) selects it:
+
+- `none` (default) — the miner's own order: support, then fewest literals, then
+  generation order. The baseline. Note it is not a *neutral* control: generation
+  order groups atoms by object and field and puts every positive literal before
+  every negated one.
+- `type` — by the kind of value the atom compares against: boolean flags
+  (`player.on_ground == true`), then parity tests (`player.coins % 2 == 0`),
+  then categorical equalities (`player.bonus == "fire"`, a container literal, or
+  two quantities compared), then numeric thresholds (`player.vy < 0`). The
+  premise is reading cost: a flag states a fact, a threshold makes the reader
+  judge a number. A conjunction is ranked by its *worst* literal. Expect this to
+  move a lot of rows — roughly three quarters of mined atoms are thresholds.
+- `popularity` — by how often the atom's quantities are mentioned in the game's
+  own source, most-mentioned first, scoring a compound by its **least**-mentioned
+  operand. The counts come from step 7a's digest
+  (`gamerv/config/games/<game>/fl_var_popularity.json`); a derived centre
+  (`cx`/`cy`) is scored through the raw components it is computed from. With no
+  counts for the game gamerv says so on stdout and keeps the mined order.
+
+**Support and size always stay the primary keys**, so a sort only permutes
+candidates that are already tied on both: the tier boundaries, the candidate
+count and `below_top` mean the same under every sort, the mined `R` never moves
+(it is chosen before the sort), and two runs are directly comparable.
+
+Two kinds of candidate are held out of the tier because something already in it
+implies them — not because they are uninteresting, and both are kept in
+`refinement_separators.log` under their own divider:
+
+- a **longer conjunction at the same score**. gamerv builds a pair only when
+  neither literal separates alone, so a size-2 candidate sitting beside a sound
+  single says "these two together exclude the violations" where the single
+  already did it by itself. On FreeMiner row 114 that is 33 744 pairs behind
+  1 067 singles, all at one score.
+- a **tighter or differently-spelled split** of a bound the tier already carries.
+  `Forall(e.h < 22)`, `Forall(e.h < 58)` and `~(Exists(e.h > 116))` are three
+  spellings of one cap on `max(e.h)`, and the loosest implies the other two. The
+  two polarities fold separately and a negated literal may absorb a positive one
+  but never the reverse: a positive literal reads False where its quantity is
+  missing or non-numeric, its negation True.
+
+Dropping implied candidates cannot change a verdict — the test is
+`Exists R: phi -> R`, and the retained candidate is the weaker one, so it accepts
+at least as many `phi`s — but it does move `candidates` and `gt_rank`, which is
+the point. It can also move `gt_match` from `exact` to `implication` where `phi`
+was spelled at a tighter split than the retained candidate: that spelling is not
+a refinement the tool would show. Measured over the archived caches of the
+2026-09-11 run: median candidates 151 → 84, mean 802 → 130, worst case
+34 811 → 296, and no case over 1 000 left.
+
+Re-reading an **archived** run mixes the two rules: its `phi_refinement.json`
+ranks `phi` over the tier of the run that wrote it, so a rank past the new,
+smaller tier is reported as `below_top` (a miss) even where the refinement itself
+is still in the tier. Re-run the row to re-rank it — the mining cache is reused,
+so only the tier and the `phi` check are redone. To compare orderings, sweep the batch
+over several sorts in one command:
+
+```bash
+./run_experiment.sh --skip-manual --candidate-sort all          # all three sorts
+./run_experiment.sh --skip-manual --candidate-sort none,type    # or name them
+```
+
+The selected rows are run once per sort, in the order given, and each pass writes
+its own `results/run_<timestamp>_<sort>/` folder — the same three folders as three
+separate runs, which is what makes it an overnight job. The build cache and the
+step-5 log cache both hit on the later passes, so they skip building and recording
+and pay only re-validation and re-mining (step 8, where the time goes). Each folder
+records the knobs its pass ran under in `settings.json`, and `report.txt` and the
+figures caption themselves with them; the sweep closes with a `SWEEP SUMMARY` table
+(SUCCESS, ground truth found, median rank per sort) and the `src/compare.py`
+command lines that diff the passes row by row.
+
 #### Result statuses (step 9)
 
 Every row ends on exactly one of these:
@@ -262,6 +367,8 @@ sub-second. The first run is therefore interactive (pick the game/monitor).
 ./run_experiment.sh --row 4 --manual-auto   # replay cached manual answers
 ./run_experiment.sh --skip-manual          # unattended: skip rows needing a human
 ./run_experiment.sh --row 20 --refinement-mode data-direct --threshold-strategy weakest
+./run_experiment.sh --candidate-sort type   # reorder each score tier: flags before thresholds
+./run_experiment.sh --skip-manual --candidate-sort all  # sweep all three sorts, one results folder each
 ./run_experiment.sh --row 4 --no-instrument  # skip step 2a (build source as committed)
 ./run_experiment.sh --row 4 --clean         # drop row 4's cached build + logs, then stop
 ```
@@ -280,7 +387,9 @@ CONTROLLER_BUILD_OUTPUT=raw ./run_experiment.sh --row 4   # inherit the compiler
 ```
 
 Results are written to one folder per run, `results/run_<timestamp>/`, and
-summarized on stdout. The closing stdout summary is **aggregate only** — the
+summarized on stdout. A candidate-sort sweep (`--candidate-sort all`) is *n* runs,
+so it writes *n* such folders, each suffixed with its pass's sort
+(`results/run_<timestamp>_type/`). The closing stdout summary is **aggregate only** — the
 classification counts, the mining rates and the per-game / per-category divisions;
 every per-case number (verdict, note, mining metrics, phase timings) goes to
 `report.txt` and `full.csv`, so a 120-row batch's terminal output stays readable
@@ -290,7 +399,8 @@ every per-case number (verdict, note, mining metrics, phase timings) goes to
 |---|---|
 | `full.csv` | every column the pipeline produced (the dataset `row` number, fault type + parent category, phi, formula, notes, mining metrics, per-phase timings) — the archival record. |
 | `summary.csv` | the five columns a results table needs: game, branch, property, ground truth, refinement found. |
-| `mining.csv` | step 8's search metrics per row: how many candidate refinements were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. |
+| `mining.csv` | step 8's search metrics per row: how many candidate refinements were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. The **rank** is a position in the order `--candidate-sort` chose; the count is the tier's size and is the same under every sort. |
+| `settings.json` | the knobs the batch ran under — candidate sort, refinement mode, threshold strategy, instrumentation, row/game selection, dataset. Two runs over the same rows under different knobs are otherwise indistinguishable; `report.txt` and the figures read it back and caption themselves with it. |
 | `report.txt` | the **aggregate** view: rows per classification, then the same counts per game, per **bug category** and per **parent category**, plus the mining rates for each — then `PER-GAME BREAKDOWN`, which repeats all of those cuts **over one game's rows at a time** (that game's classifications, category tables and mining numbers, with no other game in the denominators) — then the **per-case** division (`BY CASE`): one line per dataset row with its verdict, candidate count, ground-truth rank, match tier and note, followed by `BY CASE — TIMINGS` (per-case wall clock and phase seconds, with the run's totals). |
 | `candidates.png` | boxplot of the candidate count, one box per game, every row a point beside its box. |
 | `candidates_vs_rank.png` | the same candidate counts **beside** the ground truth's rank, over the rows where it was found — "we mined 128 candidates, and the ground truth was 3rd" in one figure. Both series share one axis (a set size and an index into that set), log-scaled when the spans are far apart. |
@@ -304,6 +414,95 @@ python src/report.py results/run_20260901_223129 --print    # ...and show it
 python src/plots.py  results/run_20260901_223129            # both figures
 python src/plots.py  results/run_20260901_223129 --figure ranks --out /tmp/r.png
 ```
+
+### Comparing two runs
+
+A fix is judged by re-running the batch and asking what moved, which is a diff of
+two results folders (`src/compare.py`, the **before** run first):
+
+```bash
+python src/compare.py results/run_20260910_023507 results/run_20260911_105646
+python src/compare.py run_20260910_023507 run_20260911_105646   # bare names resolve under results/
+python src/compare.py A B --game "Super Tux"   # only that game's cases
+python src/compare.py A B --top 1,5,10,25      # the rank cut-offs to count phi at
+python src/compare.py A B --out cmp.txt --csv cmp.csv --all
+```
+
+It reads the runs' `full.csv` and splits every changed row the way the question is
+asked — the run's own criterion, `SUCCESS` (see *Result statuses*):
+
+```
+  gained (now SUCCESS):
+    row  29  Super Tux Kart  stunned_animation_sometimes_missing  VARIABLE_NOT_FOUND -> SUCCESS
+  lost (no longer SUCCESS):
+    row  58  Witch Blast     coin_ui_not_updating                 SUCCESS -> REFINEMENT_NOT_FOUND
+  other changes (neither side SUCCESS):
+    row  26  Super Tux Kart  kart_flying_when_tipped              VARIABLE_NOT_FOUND -> FAIL   (closer)
+```
+
+then the aggregate deltas (classifications, and the gained/lost split per game,
+per parent category and per bug category) and a `MINING` section — the found rate
+and the candidate-set size on each side, with the per-case moves, biggest first.
+
+**`GROUND-TRUTH RANK`** is the other half of "did it improve": a fix can leave
+every verdict where it stood and still have moved `phi` from rank 40 to rank 2 —
+or cut a candidate set from 6873 to 56 — which no status column shows. Over the
+cases that mined with a ground truth in **both** runs (the only rows whose two
+rank distributions are comparable):
+
+```
+  where phi ranked          A      B   delta
+  in the top 1              4      4       0
+  in the top 3              8      8       0
+  in the top 5             12     12       0
+  in the top 10            22     22       0
+  ranked at all            54     48      -6
+  found without a rank      1      1       0
+  not found at all         36     42      +6
+  ------------------------------------------
+  median rank              12     11      -1
+  mean reciprocal rank  0.098  0.097  -0.001
+  median rank share      4.6%   9.0%  +4.4pt
+```
+
+| line | what it says |
+|---|---|
+| `in the top k` | how often `phi` was among the first *k* mined refinements — the number a results table quotes, since *k* is how far a user reads. The cut-offs are `--top` (default `1,3,5,10`). |
+| `ranked at all` | and its two complements: **found without a rank** (only `phi`'s own sound core region establishes it, so there is no position) and **not found**. |
+| `median rank` | the middle position, over each side's own ranked rows. |
+| `mean reciprocal rank` | `1/rank` averaged over *every* compared case, 0 where `phi` was not ranked — the single number that moves both when a fix finds `phi` on a new row and when it ranks `phi` higher. |
+| `median rank share` | the rank as a fraction of that run's candidate set, because the sets move too: rank 11 of 155 is deeper into the list than rank 12 of 236, and only this number says so. |
+
+Then the same cuts per game and per parent category, and the per-case **rank
+moves** — ordered by how far `phi` travelled *relative* to where it was (40 -> 2
+is the move worth reading, 262 -> 270 is noise), with the ranks gained and lost
+at the top:
+
+```
+  row  game            branch                                       rank     delta  of candidates                       match  status
+   41  Super Tux Kart  stunned_animation_never_finish           - -> 269    ranked     276 -> 333            - -> implication  VARIABLE_NOT_FOUND -> SUCCESS
+   13  Super Tux       no_jump_small                          132 -> 153       +21     132 -> 153  implication -> implication  same
+```
+
+The rank is a position in the order `--candidate-sort` chose, so a run under
+another sort ranks the same candidate set differently — which is exactly what
+`SETTINGS` at the top of the comparison is there to catch.
+
+- **A case is its game + branch**, never the dataset row number — that number is a
+  position in `dataset.csv` and shifts when a row is inserted above it, which
+  would silently compare two different mutants. The number is display only (B's,
+  falling back to A's), and a case whose number moved is flagged once at the top.
+- **Only the cases both runs hold are compared**, so a 120-row batch can be diffed
+  against a 24-row one; the rest are listed under `NOT COMPARED` instead of
+  counting as a change on either side.
+- **The knobs are diffed first** (`SETTINGS`, from each run's `settings.json`): a
+  run under another candidate sort or threshold strategy is not the same
+  experiment, and is a second explanation for every row below it.
+- `closer` / `further` on the *other* changes orders the two statuses by how much
+  they settled (`ERROR` < `NEEDS_MANUAL` < `SKIPPED` < `INCONCLUSIVE` <
+  `VARIABLE_NOT_FOUND` < `FAIL` < `REFINEMENT_NOT_FOUND` < `SUCCESS`) — a reading
+  aid for skimming, **not** a second success criterion. The verdict line uses
+  SUCCESS and nothing else.
 
 Rows that never reached mining have a blank `candidates` cell and are excluded
 from the boxplots rather than counted as zero; the rank figure further excludes

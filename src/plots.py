@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
+import report
 
 MINING_CSV = "mining.csv"
 CANDIDATES_PNG = "candidates.png"
@@ -374,6 +375,18 @@ def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str,
 _BOX_LEGEND = "box = median and IQR · whiskers 1.5×IQR · one point per row"
 
 
+def _sort_note(run_dir: Path | str) -> str:
+    """A caption clause naming the candidate ordering, when it was not the default.
+
+    Ranks are positions within a score tier whose internal order the sort decides,
+    so two figures drawn under two sorts are the same measurement of different
+    orderings — and must not be mistakable for each other.
+    """
+    settings = report.read_settings(run_dir) or {}
+    sort = settings.get("candidate_sort")
+    return f"\ncandidates within a tier ordered by: {sort}" if sort and sort != "none" else ""
+
+
 def _scope_note(top_scored: bool) -> str:
     """The caption line naming what the counts are over. A run written before the
     metric was narrowed to the top-scored tier is captioned as the whole ranked list,
@@ -398,24 +411,26 @@ def _ranks_subtitle(ranked: list[MinedRow], mined: int) -> str:
 # Entry points
 # --------------------------------------------------------------------------
 def _render_candidates(rows: list[MinedRow], dropped: int, out: Path,
-                       top_scored: bool = True) -> Path | None:
+                       top_scored: bool = True, sort_note: str = "") -> Path | None:
     if not rows:
         print("    no mined rows in this run — candidates boxplot skipped")
         return None
     return draw_candidates(rows, out,
-                           _candidates_subtitle(rows, dropped) + _scope_note(top_scored),
+                           _candidates_subtitle(rows, dropped)
+                           + _scope_note(top_scored) + sort_note,
                            top_scored)
 
 
 def _render_ranks(rows: list[MinedRow], _dropped: int, out: Path,
-                  top_scored: bool = True) -> Path | None:
+                  top_scored: bool = True, sort_note: str = "") -> Path | None:
     ranked = [r for r in rows if r.gt_rank]
     if not ranked:
         print("    no row's ground truth was ranked — candidates-vs-rank boxplot "
               "skipped")
         return None
     return draw_ranks(ranked, out,
-                      _ranks_subtitle(ranked, len(rows)) + _scope_note(top_scored),
+                      _ranks_subtitle(ranked, len(rows))
+                      + _scope_note(top_scored) + sort_note,
                       top_scored)
 
 
@@ -430,11 +445,12 @@ FIGURES = {
 def _render_here(run_dir: Path, figures: list[str],
                  out: Path | None) -> list[Path]:
     rows, dropped, top_scored = read_mining(run_dir)
+    note = _sort_note(run_dir)
     written = []
     for name in figures:
         renderer, filename = FIGURES[name]
         target = Path(out) if out else Path(run_dir) / filename
-        path = renderer(rows, dropped, target, top_scored)
+        path = renderer(rows, dropped, target, top_scored, note)
         if path is not None:
             written.append(path)
     return written

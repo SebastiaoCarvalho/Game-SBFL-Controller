@@ -4,6 +4,8 @@
 
   1. read row            (caller provides the TestCase)
   2. checkout, instrument (2a), build (game_repo.py, instrument.py)
+  7a. term rules — the compound-term allow-list, digested from the game's own
+      source (term_rules.py)
   3. set the ONLY safety property     (gamerv.py)
   4. clear previous logs              (gamerv.py)
   5. record traces via replay         (record_traces — launches the game per tape)
@@ -46,6 +48,7 @@ import game_repo as repo
 import gamerv
 import hints
 import instrument
+import term_rules
 import logcache
 import manual_review
 import metrics
@@ -277,7 +280,8 @@ def run_case(case: TestCase, manual_auto: bool = False,
              refinement_mode: str | None = None,
              threshold_strategy: str | None = None,
              instrument_source: bool | None = None,
-             skip_manual: bool = False) -> CaseResult:
+             skip_manual: bool = False,
+             candidate_sort: str | None = None) -> CaseResult:
     """Execute the pipeline for one dataset row.
 
     The row's ``game`` (Game Name) is resolved to a :class:`config.Game`; an
@@ -294,9 +298,12 @@ def run_case(case: TestCase, manual_auto: bool = False,
     its traces have no verdict, so there is nothing to decide phi against.
 
     ``refinement_mode`` (auto / data-direct / symbolic) selects how step 8 decides
-    phi, and ``threshold_strategy`` (midpoints / weakest / gap-mean) how R's
-    thresholds are placed. ``None`` defers to ``config.REFINEMENT_MODE`` /
-    ``config.THRESHOLD_STRATEGY``.
+    phi, ``threshold_strategy`` (midpoints / weakest / gap-mean) how R's
+    thresholds are placed, and ``candidate_sort`` (none / type / popularity) how
+    the mined candidates are ordered *within* one score tier — which moves the
+    ground truth's rank without changing the candidate set or the mined R. ``None``
+    defers to ``config.REFINEMENT_MODE`` / ``config.THRESHOLD_STRATEGY`` /
+    ``config.CANDIDATE_SORT``.
 
 Alongside the verdict, step 8's search metrics are attached to the result
     (:class:`metrics.Mining`): the candidate count, the ground truth's rank among the
@@ -391,10 +398,13 @@ Alongside the verdict, step 8's search metrics are attached to the result
 
         print("    mining generically (all logged variables)")
 
-        # Decision path + threshold placement for step 8 (default to config).
+        # Decision path + threshold placement + candidate order for step 8
+        # (default to config).
         mode = refinement_mode or config.REFINEMENT_MODE
         strategy = threshold_strategy or config.THRESHOLD_STRATEGY
-        print(f"    refinement mode: {mode}   threshold strategy: {strategy}")
+        sort = candidate_sort or config.CANDIDATE_SORT
+        print(f"    refinement mode: {mode}   threshold strategy: {strategy}"
+              f"   candidate sort: {sort}")
 
         # Step 7 — pick the trace to check phi against (the last invalid run).
         # Fault localization is intentionally skipped: compare_refinement re-mines
@@ -406,11 +416,21 @@ Alongside the verdict, step 8's search metrics are attached to the result
         if run_dir is None:
             return result("INCONCLUSIVE", notes="no invalid trace to localize")
 
+        # Step 7a — refresh the compound-term allow-list from this game's own
+        # source, now that the step-2a window has closed (the tree is pristine
+        # again, which the key table's line numbers assume) and a run exists to read
+        # the game's base fields from. Cached on the instrumentation fingerprint, so
+        # it costs a file read on a row that changed nothing. See term_rules.
+        print("[7a] term rules (compound-term allow-list from source)")
+        with _phase(timings, "refine"):
+            term_rules.ensure(game, run_dir)
+
         # Step 8 — is phi a valid refinement? (mode/strategy chosen above)
         print(f"[8] check phi as refinement   (phi = {case.phi})")
         with _phase(timings, "refine"):
             cont = gamerv.compare_refinement(run_dir, case.phi, None,
-                                             mode=mode, strategy=strategy)
+                                             mode=mode, strategy=strategy,
+                                             candidate_sort=sort)
 
         # The search metrics for the row: how many top-scored candidate refinements
         # the miner produced and where the ground truth sits among them, read off the

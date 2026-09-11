@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import statistics
 import sys
 import textwrap
@@ -59,6 +60,9 @@ import dataset
 
 FULL_CSV = "full.csv"
 REPORT_TXT = "report.txt"
+#: The knobs a run was produced under (run_experiment._settings). Absent for runs
+#: written before it existed.
+SETTINGS_JSON = "settings.json"
 
 #: Every status a row can end on, in the order a table reads best: decided rows
 #: first, then the ones the method could not decide, then the run's own failures.
@@ -486,14 +490,31 @@ def _game_sections(rows: list[Row]) -> list[str]:
     return out
 
 
-def render(rows: list[Row], title: str = "") -> str:
+def _settings_line(settings: dict | None) -> list[str]:
+    """The run's knobs as one header line, or nothing when they were not recorded.
+
+    Two runs over the same rows under different knobs produce reports that are
+    otherwise identical, and the candidate sort exists to be compared across runs —
+    so the report has to say which one produced these numbers. A run written before
+    ``settings.json`` existed simply has no such line (rather than a made-up one).
+    """
+    if not settings:
+        return []
+    parts = [f"{k}={settings[k]}" for k in
+             ("candidate_sort", "refinement_mode", "threshold_strategy")
+             if settings.get(k)]
+    return [f"settings: {'   '.join(parts)}"] if parts else []
+
+
+def render(rows: list[Row], title: str = "", settings: dict | None = None) -> str:
     """The whole report as text."""
     games = sorted({r.game for r in rows if r.game})
     head = f"GameRV experiment report{f' — {title}' if title else ''}"
     lines = ["=" * 78, head, "=" * 78,
              f"rows: {len(rows)}   games: {len(games)}"
              f"{'  (' + ', '.join(games) + ')' if games else ''}",
-             f"generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+             f"generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             *_settings_line(settings)]
 
     lines += _section("CLASSIFICATIONS", _classification_table(rows))
     lines += ["", "  status meanings:"]
@@ -573,6 +594,16 @@ def terminal_lines(rows: list[Row]) -> list[str]:
 # --------------------------------------------------------------------------
 # Entry points
 # --------------------------------------------------------------------------
+def read_settings(run_dir: Path | str) -> dict | None:
+    """The knobs a run recorded (``settings.json``), or ``None`` for a run written
+    before it existed. Read here rather than passed in, so regenerating a past run's
+    report (``python src/report.py <run_dir>``) still carries them."""
+    try:
+        return json.loads((Path(run_dir) / SETTINGS_JSON).read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def write(run_dir: Path | str, out: Path | str | None = None) -> Path | None:
     """Write ``report.txt`` for ``run_dir``; return its path, or None on failure.
 
@@ -583,7 +614,8 @@ def write(run_dir: Path | str, out: Path | str | None = None) -> Path | None:
     target = Path(out) if out else run_dir / REPORT_TXT
     try:
         rows = read_rows(run_dir)
-        target.write_text(render(rows, run_dir.name), encoding="utf-8")
+        target.write_text(render(rows, run_dir.name, read_settings(run_dir)),
+                          encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - an extra artefact, never a run failure
         print(f"    report skipped ({type(exc).__name__}: {exc})")
         return None
