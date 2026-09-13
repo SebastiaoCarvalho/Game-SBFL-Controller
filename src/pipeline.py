@@ -189,7 +189,18 @@ def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
     if not ok:
         return None
     new = sorted({d.name for d in gamerv.run_dirs()} - before)
-    return config.GAMERV_LOGS_DIR / new[-1] if new else None
+    if not new:
+        # Distinguish "gamerv wrote nothing" from "gamerv wrote a run dir whose
+        # event log is empty" — the second means the capture stack worked and the
+        # GAME stayed silent, which is a game/replay fault and needs naming here.
+        # Left un-recorded either way; run_dirs() already refuses to count it.
+        blank = sorted({d.name for d in gamerv.empty_run_dirs()} - before)
+        if blank:
+            print(f"    [warn] {blank[-1]} logged 0 events — the game ran and was "
+                  f"captured but emitted no state; check the replay actually "
+                  f"started and that the game's snapshot is not failing")
+        return None
+    return config.GAMERV_LOGS_DIR / new[-1]
 
 
 # --------------------------------------------------------------------------
@@ -386,6 +397,16 @@ Alongside the verdict, step 8's search metrics are attached to the result
             with _phase(timings, "record"):
                 n = _record_or_restore(game, case, instr)
         if n == 0:
+            # A row whose tapes all replayed into an EMPTY event log is a broken
+            # experiment run, not an undecidable one: phi never got a chance. Both
+            # ended up INCONCLUSIVE once, which read as "nothing to decide phi
+            # against" and quietly cost a whole game its SUCCESS rows.
+            blank = gamerv.empty_run_dirs()
+            if blank:
+                return result("ERROR", notes=(
+                    f"{len(blank)} trace(s) recorded but every event log is empty "
+                    f"— the game ran and was captured but logged no state "
+                    f"({blank[-1].name})"))
             return result("INCONCLUSIVE", notes="no traces recorded (no tapes / log failed)")
 
         # Step 6 — validate all logs (replaying cached manual answers if --manual-auto).

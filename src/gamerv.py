@@ -237,13 +237,38 @@ def clear_logs(row: int | None = None) -> None:
 
 # --- Step 6: validate -----------------------------------------------------
 
-def run_dirs() -> list[Path]:
-    """Run directories under logs/ that actually hold a recorded trace."""
+def run_dirs(include_empty: bool = False) -> list[Path]:
+    """Run directories under logs/ that actually hold a recorded trace.
+
+    A run whose ``events.jsonl`` exists but is EMPTY is not a trace: the capture
+    stack ran and wrote its files, but the game emitted no state. It happens for
+    real — a game that renders nothing (a browser build that never paints), or one
+    whose snapshot throws on every event — and the video/audio come out normal
+    either way, so nothing downstream notices. Such a run is excluded by default,
+    which keeps it out of the log cache and out of validation instead of letting it
+    masquerade as a trace with no violations.
+
+    ``include_empty`` returns them anyway, for callers that need to tell "the game
+    logged nothing" apart from "there was no run at all".
+    """
     logs = config.GAMERV_LOGS_DIR
     if not logs.exists():
         return []
-    return sorted(d for d in logs.iterdir()
-                  if d.is_dir() and (d / "events.jsonl").exists())
+    def has_trace(d: Path) -> bool:
+        f = d / "events.jsonl"
+        if not f.exists():
+            return False
+        try:
+            return include_empty or f.stat().st_size > 0
+        except OSError:
+            return False
+    return sorted(d for d in logs.iterdir() if d.is_dir() and has_trace(d))
+
+
+def empty_run_dirs() -> list[Path]:
+    """Run dirs that were written but logged no events at all — see :func:`run_dirs`."""
+    kept = {d.name for d in run_dirs()}
+    return [d for d in run_dirs(include_empty=True) if d.name not in kept]
 
 
 def validate(run_dir: Path, auto: bool = False,

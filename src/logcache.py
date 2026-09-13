@@ -106,9 +106,38 @@ def cached_key(game: Game, branch: str) -> str | None:
         return None
 
 
+def _has_trace(run_dir: Path) -> bool:
+    """True if this cached run actually logged something (see gamerv.run_dirs)."""
+    f = run_dir / "events.jsonl"
+    try:
+        return f.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def has(game: Game, branch: str, key: str) -> bool:
-    """True if the branch's cached logs match ``key`` (a usable hit)."""
-    return cached_key(game, branch) == key
+    """True if the branch's cached logs match ``key`` AND hold a usable trace.
+
+    The key alone is not enough. A recording session where the game emitted no
+    state still produces run dirs — video, audio and frame timestamps all present,
+    ``events.jsonl`` empty — and those got cached under a perfectly valid key. On
+    every later run the slot then hit, restored nothing usable, and the row came
+    back undecidable rather than broken; 53 slots across two games were poisoned
+    that way before anyone noticed. Treating an all-empty slot as a miss lets the
+    cache heal itself on the next run instead of needing a manual purge.
+    """
+    if cached_key(game, branch) != key:
+        return False
+    slot = _slot(game, branch)
+    try:
+        names = json.loads(_meta(game, branch).read_text())["run_dirs"]
+    except (json.JSONDecodeError, OSError, KeyError):
+        return False
+    if not any(_has_trace(slot / n) for n in names):
+        print(f"    [cache] slot for {branch!r} holds only empty event logs "
+              f"— treating as a miss and re-recording")
+        return False
+    return True
 
 
 def invalidate(game: Game, branch: str) -> None:
@@ -142,5 +171,8 @@ def restore(game: Game, branch: str) -> int:
         dest = config.GAMERV_LOGS_DIR / name
         shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(slot / name, dest)
-        n += 1
+        # Counted the way gamerv.run_dirs() counts: a restored run with an empty
+        # event log is not a trace. It is still copied into logs/ so the caller can
+        # report *why* the row has nothing (pipeline.run_case reads it back).
+        n += _has_trace(dest)
     return n
