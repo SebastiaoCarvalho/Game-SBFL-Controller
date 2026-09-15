@@ -19,9 +19,22 @@ of them the ones whose names happen to coincide with Super Tux's, and the games 
 primary is not named ``player`` could mine none at all.
 
 So this module regenerates a game's rules whenever the inputs change, and the
-regeneration is keyed by :func:`instrument.fingerprint` — the same content key the
-build cache uses, covering the source tree, the instrumenter, and the spec. A row that
-changes none of them re-uses the file.
+regeneration is keyed by :func:`game_repo.build_key` — the same content key the build
+cache uses: the **HEAD tree hash** of the checked-out source plus
+:func:`instrument.fingerprint` (the instrumenter, its spec, the compile database, our
+flags). A row that changes none of them re-uses the file.
+
+The tree hash is the half that must not be dropped, and dropping it is not
+hypothetical: this step keyed on the fingerprint alone until 2026-09-13, and
+``fingerprint`` deliberately does *not* hash the game source (the build cache pairs it
+with the tree hash rather than folding it in). Every branch of one game therefore
+produced the same key, so the digest ran once per game per experiment and every later
+row was served rules derived from whichever mutant branch happened to come first — the
+exact staleness this module exists to prevent, one level down. Measured on the
+2026-09-12 run: Super Tux's rules are stamped 01:12 and its 24 rows ran until ~04:00,
+so ~20 branches were scored against row 3's source. Row 20's target names
+``handle_input__max_bullets``, a local that exists only on its own branch
+(``src/object/player.cpp:1811``), and could not be in a file digested from another.
 
 Three bridges feed the digest (see :mod:`runners.source_keys`), and this step supplies
 all three:
@@ -51,6 +64,7 @@ import subprocess
 from pathlib import Path
 
 import config
+import game_repo
 import instrument
 from config import Game
 
@@ -82,9 +96,55 @@ def _accessor_map(game: Game) -> Path | None:
 
 
 def _stamp(game: Game, run_dir: Path | None) -> dict:
-    return {"game": game.name, "fingerprint": instrument.fingerprint(game),
-            "keys": instrument.keys_path(game).is_file(),
+    """The inputs the generated file describes.
+
+    ``source`` is :func:`game_repo.build_key` — the HEAD tree hash *and* the
+    instrumenter fingerprint — so a different branch of the same game re-digests. A
+    repo this machine cannot read (or a game that is not a checkout) degrades to the
+    fingerprint alone rather than failing the step; that is the old behaviour, and it
+    is still better than no rules at all.
+    """
+    try:
+        source = game_repo.build_key(game)
+    except Exception:  # noqa: BLE001 - not a checkout / git unavailable
+        source = instrument.fingerprint(game)
+    return {"game": game.name, "source": source,
+            "keys": _keys_tree(game) or instrument.keys_path(game).is_file(),
             "snapshot": bool(run_dir)}
+
+
+def _keys_tree(game: Game) -> str | None:
+    """The tree the kept key table was built from (``instrument.keys_tree_path``)."""
+    try:
+        return instrument.keys_tree_path(game).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _warn_if_keys_are_from_another_tree(game: Game) -> None:
+    """Say so when the key table was not built from the checked-out source.
+
+    Step 2a does not run on a build-cache hit (``game_repo.build``), so on a warm
+    cache the kept table belongs to whichever branch last missed. ``source_keys``
+    looks up by identifier+scope+class, so such a table still resolves everything the
+    two branches share and misses only what is **new** on this one — which is exactly
+    a mutation's own local, and exactly what a dataset row's target phi tends to name
+    (row 20: ``handle_input__max_bullets``). The rules are still worth generating
+    (they cover the shared vocabulary); the gap just must not be silent.
+    """
+    have = _keys_tree(game)
+    if have is None:
+        return
+    try:
+        want = game_repo.head_tree_hash(game)
+    except Exception:  # noqa: BLE001 - not a checkout / git unavailable
+        return
+    if have != want:
+        print(f"  [term-rules] [warn] key table was built from tree {have[:12]}, "
+              f"not the checked-out {want[:12]} — step 2a was skipped on a "
+              f"build-cache hit, so combinations over locals that exist only on "
+              f"this branch stay blocked. Clear this branch's build_cache slot to "
+              f"force step 2a.")
 
 
 def up_to_date(game: Game, run_dir: Path | None) -> bool:
@@ -147,6 +207,7 @@ def ensure(game: Game, run_dir: Path | None = None, *, force: bool = False) -> b
     if not force and up_to_date(game, run_dir):
         print(f"  [term-rules] up to date ({rules_path(game).name})")
         return True
+    _warn_if_keys_are_from_another_tree(game)
 
     args = ["-m", "runners.source_digest", str(game.instrument_src),
             "--game", game.name, "--rule-granularity", "object",

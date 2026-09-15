@@ -419,8 +419,91 @@ def apply(game: Game) -> None:
               f"'{_NOTHING_TO_DO}':\n{_tail(out, 5)}")
 
 
+def keys_tree_path(game: Game) -> Path:
+    """Which source tree :func:`keys_path`'s table was built from.
+
+    A sibling file rather than a field inside the table, because the table is
+    gamerv's manifest format and this side does not own it.
+
+    It is needed because step 2a does **not** run on a build-cache hit (see
+    ``game_repo.build``), so the kept table belongs to whichever branch last missed
+    the cache — not necessarily the one checked out now. The lookup is by
+    identifier+scope+class (``runners.source_keys``), so a table from a sibling branch
+    still resolves everything the two branches share and silently misses only what is
+    new in this one. That is precisely a mutation's own local: row 20's target names
+    ``handle_input__max_bullets``, which exists on one branch. :mod:`term_rules` reads
+    this to say so out loud instead of digesting against a mismatched table.
+    """
+    return keys_path(game).with_suffix(".tree")
+
+
+def _head_tree(game: Game) -> str | None:
+    """The checked-out tree hash, or None. Spelled out here rather than imported from
+    ``game_repo`` — that module imports this one, and the cycle is not worth a line."""
+    try:
+        out = subprocess.run(["git", "-C", str(game.repo_dir), "rev-parse", "HEAD^{tree}"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def stash_keys(game: Game, slot: Path) -> None:
+    """Copy this game's kept key table (and its tree stamp) into a build-cache slot.
+
+    The table is produced by step 2a, which does **not** run on a build-cache hit —
+    so without this the single per-game table at :func:`keys_path` belongs to
+    whichever branch last *missed* the cache, and a later branch digests its
+    arithmetic against a stranger's vocabulary. ``runners.source_keys`` resolves by
+    identifier+scope+class, so a sibling's table silently resolves everything the two
+    branches share and misses exactly what is **new** on this one — a mutation's own
+    local. Measured on dataset row 33: the kept table held ``old_energy`` (present on
+    ``base``) but not ``old_num_powerups`` (added by the mutation), so the pair the
+    ground truth is written over was never permitted as a compound term.
+
+    Pairing the table with the binary in the same content-keyed slot is what makes a
+    cache hit restore a *matching* pair. Best effort throughout: a missing table costs
+    the term-rules step its precision, never the run its correctness.
+    """
+    for src in (keys_path(game), keys_tree_path(game)):
+        if not src.is_file():
+            continue
+        try:
+            slot.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, slot / src.name)
+        except OSError as exc:
+            print(f"  [instrument] [warn] could not stash the key table: {exc}")
+            return
+
+
+def restore_keys(game: Game, slot: Path) -> bool:
+    """Put a build-cache slot's stashed key table back, for :func:`stash_keys`' reason.
+
+    Returns whether a table landed. A slot stored before this existed has none, and
+    then the kept table is left alone rather than deleted: a stale table is worse than
+    a matching one and better than none (``term_rules.ensure`` refuses to build an
+    allow-list with no table at all, which blocks *every* compound term).
+    """
+    src = slot / keys_path(game).name
+    if not src.is_file():
+        return False
+    try:
+        keys_path(game).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, keys_path(game))
+        tree = slot / keys_tree_path(game).name
+        if tree.is_file():
+            shutil.copyfile(tree, keys_tree_path(game))
+        else:
+            keys_tree_path(game).unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"  [instrument] [warn] could not restore the key table: {exc}")
+        return False
+    return True
+
+
 def _keep_key_table(game: Game) -> None:
-    """Copy the fresh manifest to :func:`keys_path` before the revert deletes it.
+    """Copy the fresh manifest to :func:`keys_path` before the revert deletes it,
+    stamping which tree produced it (:func:`keys_tree_path`).
 
     Best effort by design: a missing key table costs the term-rules step its
     precision, never the run its correctness.
@@ -434,6 +517,15 @@ def _keep_key_table(game: Game) -> None:
         shutil.copyfile(src, dst)
     except OSError as exc:
         print(f"  [instrument] [warn] could not keep the key table: {exc}")
+        return
+    tree = _head_tree(game)
+    try:
+        if tree:
+            keys_tree_path(game).write_text(tree + "\n")
+        else:
+            keys_tree_path(game).unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"  [instrument] [warn] could not stamp the key table: {exc}")
 
 
 def revert(game: Game, baseline: frozenset[str] = frozenset()) -> None:

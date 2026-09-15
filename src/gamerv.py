@@ -456,6 +456,15 @@ _REFINED_MARKER = "Refined invariant:"
 #: (VARIABLE_NOT_FOUND) rather than being lumped in with ERROR.
 _UNEXPORTED_MARKER = "which no logged state reports"
 
+#: gamerv rejects a phi that is sound but holds on fewer good states than the best
+#: mined refinement does ("phi is sound but UNDER-SUPPORTED: ..."). phi is meant to be
+#: the condition the fault turns on, so it should hold wherever the property held; one
+#: below that ceiling is a weaker separator than the data affords. It is the VACUOUS
+#: rule (support 0) generalised, and it outranks containment — a phi strong enough to
+#: be contained in a degenerate R (a type-minimum bound contains everything) would
+#: otherwise be certified by it.
+_UNDER_SUPPORTED_MARKER = "UNDER-SUPPORTED"
+
 
 def mined_r(out: str) -> str | None:
     """The mined R from fault_localize's ``Refined invariant:`` line, if it printed one.
@@ -584,7 +593,11 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
     no_r_all      = ("not comparable by containment" in out
                      or "no mined refinement constrains" in out)
     data_sound    = "IS a sound refinement" in out  # corroborate: sound + informative
-    data_unsound  = "is NOT sound" in out or "VACUOUS" in out
+    # Sound but weaker than the data affords (see _UNDER_SUPPORTED_MARKER). gamerv
+    # prints it *instead of* the "IS a sound refinement" line, so data_sound is already
+    # False here; it is named separately because it outranks the containment verdict.
+    data_under    = _UNDER_SUPPORTED_MARKER in out
+    data_unsound  = "is NOT sound" in out or "VACUOUS" in out or data_under
 
     # Decided before either mode: phi was never scored, because the game exports
     # none of the quantities it reads. Reported as its own outcome (a gap in the
@@ -594,6 +607,12 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
                            _unexported_note(out) or verdict)
 
     if mode == "symbolic":
+        # Ahead of the containment verdict: an under-supported phi is rejected on the
+        # data whatever a mined R says about it. Containment alone would call it a find
+        # whenever *some* candidate is weak enough to contain it, which is how a phi
+        # holding on 1 of 2 good states came to be certified by `ticks_left > -32768`.
+        if data_under:
+            return Containment("FAIL", r_text, out, verdict)
         # SUCCESS comes from the per-candidate containment only; everything else
         # cross-references the data-direct verdict to separate REFINEMENT_NOT_FOUND (R
         # missed a real refinement) from FAIL (phi genuinely not sound).

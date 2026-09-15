@@ -142,7 +142,14 @@ def build(game: Game, instrument_source: bool = True) -> None:
     key = build_key(game, instrument_source)
     if buildcache.has(game, branch, key):
         if buildcache.restore(game, branch):
-            print("  [build-cache] hit — restoring binary, skipping build")
+            # The key table travels with the binary. Step 2a is skipped on a hit, so
+            # without this the kept table would still be the one the last *miss*
+            # produced — a sibling branch's vocabulary, missing exactly this
+            # mutation's own locals. See instrument.stash_keys.
+            kept = instrument.restore_keys(game, buildcache.slot(game, branch))
+            print("  [build-cache] hit — restoring binary, skipping build"
+                  + ("" if kept or not instrumenting
+                     else " (slot predates the key table; term rules may be stale)"))
             return
         print("  [build-cache] restored slot incomplete — rebuilding")
     else:
@@ -158,6 +165,8 @@ def build(game: Game, instrument_source: bool = True) -> None:
         # bug this branch exists to avoid.
         _configure_and_build(game, branch)
     buildcache.store(game, branch, key)
+    # After store(), which replaces the slot wholesale.
+    instrument.stash_keys(game, buildcache.slot(game, branch))
 
 
 def _configure_and_build(game: Game, branch: str) -> None:
