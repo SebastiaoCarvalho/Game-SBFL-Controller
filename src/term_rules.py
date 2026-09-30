@@ -59,6 +59,7 @@ re-scanned once rather than left without counts forever.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -110,7 +111,22 @@ def _stamp(game: Game, run_dir: Path | None) -> dict:
         source = instrument.fingerprint(game)
     return {"game": game.name, "source": source,
             "keys": _keys_tree(game) or instrument.keys_path(game).is_file(),
-            "snapshot": bool(run_dir)}
+            "snapshot": bool(run_dir), "digest": _digest_code()}
+
+
+def _digest_code() -> str:
+    """A hash of the digest's own code. ``source`` covers the game tree and the
+    instrumenter, but not the scanner that turns them into rules, so a fix there (how
+    a key is attributed to a base, say) left every existing rules file "up to date"
+    and silently kept the old answer."""
+    h = hashlib.sha256()
+    for name in ("source_digest.py", "source_keys.py"):
+        path = config.GAMERV_SRC_DIR / "runners" / name
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(name.encode())
+    return h.hexdigest()[:16]
 
 
 def _keys_tree(game: Game) -> str | None:

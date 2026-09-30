@@ -35,9 +35,8 @@ distributions are comparable) it reports
     in the top k      how often phi was among the first k mined refinements, at
                       the cut-offs ``--top`` names (1, 3, 5, 10 by default) — the
                       row a results table quotes, since k is how far a user reads
-    ranked at all     and its two complements: found but unranked (phi's own
-                      sound core region establishes it, so there is no position),
-                      and not found
+    ranked at all     and its two complements: found but unranked (only an
+                      archived run's retired ``region`` tier), and not found
     median rank       the middle position, over each side's own ranked rows
     mean reciprocal rank   1/rank averaged over *every* compared case, 0 where phi
                       was not ranked — the one number that moves both when a fix
@@ -683,8 +682,12 @@ def _settings_lines(cmp: Comparison) -> list[str]:
     if a is None or b is None:
         missing = "A" if a is None else "B"
         return [f"  run {missing} recorded no settings.json — knobs not comparable."]
-    keys = [k for k in ("candidate_sort", "refinement_mode", "threshold_strategy",
-                        "instrument_source", "game", "rows", "dataset")
+    # A run recorded before the objective knob existed was a refinement run.
+    a = {"objective": "refinement", **a}
+    b = {"objective": "refinement", **b}
+    keys = [k for k in ("objective", "candidate_sort", "refinement_mode",
+                        "threshold_strategy", "instrument_source", "game", "rows",
+                        "dataset")
             if a.get(k) != b.get(k)]
     if not keys:
         return ["  identical knobs on both runs "
@@ -800,8 +803,8 @@ def render(cmp: Comparison, limit: int | None = MOVES_SHOWN,
         lines += _rank_moves(cmp.pairs, limit)
         lines += ["",
                   "  ranked = phi is at a known position among the top-scored mined",
-                  "  candidates; a phi established only by its own sound core region",
-                  "  is found but unranked, and counts 0 in the reciprocal rank. The",
+                  "  candidates; an archived run's retired region match is found but",
+                  "  unranked, and counts 0 in the reciprocal rank. The",
                   "  rank is a position in the order --candidate-sort chose, so a run",
                   "  under another sort ranks the same candidate set differently",
                   "  (SETTINGS above says whether that is the case here)."]

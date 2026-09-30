@@ -57,6 +57,7 @@ from datetime import datetime
 from pathlib import Path
 
 import dataset
+import metrics
 
 FULL_CSV = "full.csv"
 REPORT_TXT = "report.txt"
@@ -118,6 +119,18 @@ class Row:
     #: ``((phase, seconds-as-text), ...)`` in pipeline order, '-' for a phase that
     #: did not run. Kept as a tuple so :class:`Row` stays hashable/frozen.
     phases: tuple[tuple[str, str], ...] = ()
+    #: The size of the state the miner searched (metrics.py): every ``base.field``
+    #: the mined states carry, and the ones that vary across them. None for a row
+    #: that never mined, or a run written before the columns existed.
+    variables: int | None = None
+    varying: int | None = None
+    #: ``((sort, rank), ...)`` over :data:`metrics.SORTS`, None where the row was not
+    #: ranked under that sort or its ground truth was not found (metrics.py). A
+    #: tuple, like ``phases``, so the row stays hashable.
+    ranks: tuple[tuple[str, int | None], ...] = ()
+
+    def rank_under(self, sort: str) -> int | None:
+        return dict(self.ranks).get(sort)
 
     @property
     def fault_class(self) -> str:
@@ -180,7 +193,11 @@ def row_from_dict(d: dict) -> Row:
                union_only=cell("union_only").lower() in ("yes", "true", "1"),
                below_top=cell("below_top").lower() in ("yes", "true", "1"),
                case=_int(d.get("row")), notes=cell("notes"),
-               elapsed_s=_float(d.get(_TOTAL_COLUMN)), phases=_phase_cells(d))
+               elapsed_s=_float(d.get(_TOTAL_COLUMN)), phases=_phase_cells(d),
+               variables=_int(d.get("variables")),
+               varying=_int(d.get("varying_variables")),
+               ranks=tuple((s, _int(d.get(c)))
+                           for s, c in zip(metrics.SORTS, metrics.RANK_COLUMNS)))
 
 
 def row_from_result(res) -> Row:
@@ -194,7 +211,9 @@ def row_from_result(res) -> Row:
                below_top=res.mining.below_top,
                case=getattr(res, "row", None) or None, notes=res.notes,
                elapsed_s=res.elapsed_s,
-               phases=tuple(res.phase_cells().items()))
+               phases=tuple(res.phase_cells().items()),
+               variables=res.mining.variables, varying=res.mining.varying,
+               ranks=tuple((s, res.mining.ranks.get(s)) for s in metrics.SORTS))
 
 
 def rows_from_results(results) -> list[Row]:
@@ -247,7 +266,7 @@ def counts(rows: list[Row]) -> dict[str, int]:
     return out
 
 
-def _statuses_present(rows: list[Row]) -> list[str]:
+def statuses_present(rows: list[Row]) -> list[str]:
     """The statuses to give a column, known ones first in their canonical order."""
     seen = counts(rows)
     known = [s for s in STATUSES if s in seen]
@@ -267,7 +286,7 @@ def _classification_table(rows: list[Row]) -> list[str]:
     total = len(rows)
     width = max((len(s) for s in seen), default=6)
     out = [f"  {'status':<{width}}  {'rows':>5}  {'share':>7}"]
-    for status in _statuses_present(rows):
+    for status in statuses_present(rows):
         n = seen[status]
         bar = "#" * round(30.0 * n / total) if total else ""
         out.append(f"  {status:<{width}}  {n:>5}  {_pct(n, total):>7}  {bar}")
@@ -280,7 +299,7 @@ def _status_table(groups: list[tuple[str, list[Row]]], head: str,
                   rows: list[Row]) -> list[str]:
     """One line per group: row count, a column per status present in the run, and the
     success rate — the number the group comparison is actually about."""
-    statuses = _statuses_present(rows)
+    statuses = statuses_present(rows)
     label_w = max([len(head)] + [len(label) for label, _ in groups])
     cols = [ABBREV.get(s, s[:4]) for s in statuses]
     out = [f"  {head:<{label_w}}  {'rows':>5}  "
@@ -322,7 +341,7 @@ def _mining_summary(rows: list[Row]) -> list[str]:
         return ["  no row both mined and carried a ground-truth phi."]
     found = [r for r in mined if r.found]
     ranked = [r for r in mined if r.gt_rank]
-    region = [r for r in found if r.gt_match == "region"]
+    region = [r for r in found if r.gt_match == "region"]   # archived runs only
     exact = [r for r in found if r.gt_match == "exact"]
     union = [r for r in mined if r.union_only]
     cands = [r.candidates for r in mined]
@@ -352,6 +371,91 @@ def _mining_summary(rows: list[Row]) -> list[str]:
         out.append(f"  ground-truth rank:   median {statistics.median(ranks):g}   "
                    f"min {min(ranks)}   max {max(ranks)}   "
                    f"(over the {len(ranks)} ranked row(s))")
+    # The state's size does not depend on a ground truth, so it is taken over every
+    # row that pooled states (the space figure's rows), not only the mined ones.
+    sized = [r for r in rows if r.variables is not None and r.varying is not None]
+    if sized:
+        logged = [r.variables for r in sized]
+        varying = [r.varying for r in sized]
+        out.append(f"  variables per row:   median {statistics.median(logged):g} "
+                   f"logged, {statistics.median(varying):g} varying   "
+                   f"max {max(logged)} / {max(varying)}   "
+                   f"(over the {len(sized)} row(s) that pooled states)")
+    return out
+
+
+def ranked_sorts(rows: list[Row]) -> list[str]:
+    """The candidate sorts this run recorded a rank under, in column order."""
+    return [s for s in metrics.SORTS if any(r.rank_under(s) is not None for r in rows)]
+
+
+def sort_ranked(rows: list[Row], sorts: list[str]) -> list[Row]:
+    """The rows ranked under every one of ``sorts`` — the only rows on which two
+    orderings can be compared, since each is a position in the same tier."""
+    return [r for r in rows if r.candidates is not None
+            and all(r.rank_under(s) is not None for s in sorts)]
+
+
+def sort_left_out(rows: list[Row], sorts: list[str]) -> tuple[int, int]:
+    """Mined rows (with a ground truth) that :func:`sort_ranked` leaves out, as
+    ``(not found, ranked under only some sorts)``. The first is the ordinary miss; the
+    second should be zero — the order cannot decide *whether* a single candidate
+    establishes phi — and a non-zero count is worth a look."""
+    mined = [r for r in rows if r.candidates is not None and r.phi.strip()]
+    some = [r for r in mined if any(r.rank_under(s) is not None for s in sorts)]
+    partial = sum(1 for r in some if any(r.rank_under(s) is None for s in sorts))
+    return len(mined) - len(some), partial
+
+
+def sort_left_out_note(rows: list[Row], sorts: list[str]) -> str:
+    """:func:`sort_left_out` as a caption clause (empty when nothing was left out)."""
+    missed, partial = sort_left_out(rows, sorts)
+    parts = ([f"{missed} mined row(s) left out (ground truth not found)"] if missed
+             else [])
+    parts += ([f"{partial} ranked under only some of the sorts"] if partial else [])
+    return ", ".join(parts)
+
+
+def sort_rank_lines(rows: list[Row]) -> list[str]:
+    """Per game (after the pooled ``all``): the median candidate count and the median
+    ground-truth rank under each sort the run ranked under, then how often each sort
+    put the ground truth highest. Empty unless at least two sorts were ranked.
+
+    Every sort orders the same top-scored tier, so a lower median is the whole
+    comparison; the "ranked best" line says whether that median is a few big wins or
+    a consistent edge.
+    """
+    sorts = ranked_sorts(rows)
+    if len(sorts) < 2:
+        return []
+    both = sort_ranked(rows, sorts)
+    games = by_game(both)
+    groups = ([("all", both)] if len(games) > 1 else []) + games
+    label_w = max([len("game")] + [len(g) for g, _ in groups])
+    col_w = max(8, *(len(s) + 1 for s in sorts))
+    out = [f"  {'game':<{label_w}}  {'rows':>5}  {'med.cand':>8}  "
+           + "  ".join(f"{s:>{col_w}}" for s in sorts)]
+    for label, group in groups:
+        meds = [f"{statistics.median(r.rank_under(s) for r in group):g}"
+                for s in sorts]
+        cand = f"{statistics.median(r.candidates for r in group):g}"
+        out.append(f"  {label:<{label_w}}  {len(group):>5}  {cand:>8}  "
+                   + "  ".join(f"{m:>{col_w}}" for m in meds))
+    best = {s: 0 for s in sorts}
+    tied = 0
+    for r in both:
+        top = min(r.rank_under(s) for s in sorts)
+        winners = [s for s in sorts if r.rank_under(s) == top]
+        if len(winners) == 1:
+            best[winners[0]] += 1
+        else:
+            tied += 1
+    out.append("")
+    out.append("  ranked best: " + "   ".join(f"{s} {n}" for s, n in best.items())
+               + f"   tied {tied}   (of {len(both)} row(s) ranked under every sort)")
+    note = sort_left_out_note(rows, sorts)
+    if note:
+        out.append(f"  {note}")
     return out
 
 
@@ -401,7 +505,7 @@ def _case_table(rows: list[Row]) -> list[str]:
     return out
 
 
-def _phase_names(rows: list[Row]) -> list[str]:
+def phase_names(rows: list[Row]) -> list[str]:
     """Every phase named by any case, in first-seen (pipeline) order."""
     names: list[str] = []
     for r in rows:
@@ -415,7 +519,7 @@ def _timing_table(rows: list[Row]) -> list[str]:
     """Per case: total wall clock and the seconds each pipeline phase took, closed by
     the run's totals. Empty when the run recorded no phase timings at all (an older
     CSV), so the section is then simply not written."""
-    phases = _phase_names(rows)
+    phases = phase_names(rows)
     if not phases:
         return []
     ordered = _case_order(rows)
@@ -500,9 +604,16 @@ def _settings_line(settings: dict | None) -> list[str]:
     """
     if not settings:
         return []
-    parts = [f"{k}={settings[k]}" for k in
-             ("candidate_sort", "refinement_mode", "threshold_strategy")
-             if settings.get(k)]
+    def fmt(v) -> str:
+        return ",".join(map(str, v)) if isinstance(v, list) else str(v)
+
+    # rank_sorts only says something when it names more than the row's own sort.
+    shown = {k: settings.get(k) for k in
+             ("objective", "candidate_sort", "rank_sorts", "refinement_mode",
+              "threshold_strategy")}
+    if len(shown.get("rank_sorts") or ()) < 2:
+        shown["rank_sorts"] = None
+    parts = [f"{k}={fmt(v)}" for k, v in shown.items() if v]
     return [f"settings: {'   '.join(parts)}"] if parts else []
 
 
@@ -519,7 +630,7 @@ def render(rows: list[Row], title: str = "", settings: dict | None = None) -> st
     lines += _section("CLASSIFICATIONS", _classification_table(rows))
     lines += ["", "  status meanings:"]
     lines += [f"    {ABBREV.get(s, s):<4} {s:<21} {MEANING[s]}"
-              for s in _statuses_present(rows) if s in MEANING]
+              for s in statuses_present(rows) if s in MEANING]
 
     if len(games) > 1:
         lines += _section("BY GAME", _status_table(by_game(rows), "game", rows))
@@ -537,13 +648,20 @@ def render(rows: list[Row], title: str = "", settings: dict | None = None) -> st
     lines += _mining_table(by_category(rows), "bug category")
     lines += ["",
               "  mined  = rows that reached mining and carry a ground-truth phi",
-              "  found  = a single mined refinement establishes phi (or phi's own",
-              "           core region does, for a conjunctive phi with no rank)",
+              "  found  = a single mined refinement establishes phi",
               "  union  = only the union of several candidates covers phi, so the",
               "           ground truth counts as not found (see metrics.py)",
               "  cand   = the top-scored tier of the ranked candidate set (the",
               "           refinements a user reads from the top); a phi established",
               "           only below that tier counts as not found too"]
+
+    by_sort = sort_rank_lines(rows)
+    if by_sort:
+        lines += _section(
+            "RANK BY CANDIDATE SORT",
+            ["  the same top-scored candidates, read in each sort's order; medians",
+             "  over the rows whose ground truth was ranked under every sort.", ""]
+            + by_sort)
 
     # Then the same analysis per game, so each game's own numbers can be read
     # (and quoted) without the rest of the run diluting them.

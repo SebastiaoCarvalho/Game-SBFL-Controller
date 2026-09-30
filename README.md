@@ -201,7 +201,13 @@ CLI flag):
     single `R` establishes `phi` but the data-direct test does, the row is
     classified **REFINEMENT_NOT_FOUND** (the search missed a real refinement) —
     and the note says so explicitly when the *union* of several candidates would
-    have covered it.
+    have covered it. Only a **mined** `R` counts. A conjunctive-quantifier `phi`
+    (`~Exists(c1 & c2)`) used to have a last-resort `region` match, where `phi`
+    was checked against its own sound core (itself, minus data-constant
+    conjuncts). That region is derived from `phi`, so it contains any sound `phi`.
+    It was a self-match that looked like a find, and it was retired on 2026-09-28.
+    Such a `phi` is now REFINEMENT_NOT_FOUND unless a mined candidate contains it
+    (row 73 was the only row it decided).
   - `data-direct` — evaluate `phi` straight on the pooled good (`P & Q`) and
     violation (`P & ~Q`) states, independent of `R`. Verdict reads *"phi IS a
     sound refinement, corroborated by the data"*. Errors on a `phi` that reads a
@@ -224,6 +230,87 @@ CLI flag):
   - `gap-mean` — the midpoint of the violation→nearest-good gap. A stricter `R`.
   - `midpoints` — sample midpoints across the pooled values and let the mining
     search pick (gamerv's historical behaviour).
+
+#### Objective: bug condition or refinement (step 8)
+
+`--objective` (`config.OBJECTIVE`) selects what step 8 mines, and so what the
+row's `phi` is read as:
+
+- `bug-condition` (default) — spectrum-based fault localization: a condition `B`
+  under which the **bug occurs**. Every P-state is a test (failing = violation,
+  passing = good) and every candidate — single literals, and pairs that beat the
+  best single — is ranked by its **Ochiai** score `ef / sqrt(F·(ef + ep))`, with no
+  hard constraint on either side. `phi` is the bad condition, read from
+  `dataset_bug_condition.csv` unless `--dataset` is given; results folders end in
+  `_bug` and `settings.json` records `objective`. This is the framing the
+  experiment is reported under.
+- `refinement` — a condition `R` under which the property is **sound**:
+  `G(P & R -> Q)`. `R` never holds on a violation (a hard constraint) and is ranked
+  by the good states it keeps. `phi` is the good condition (`dataset.csv`'s `Target
+  Phi`). It was the only objective before 2026-09-26, so a results folder without
+  `_bug` (or a `settings.json` without `objective`) is a refinement run.
+
+How a bug-condition `phi` is decided (its own Ochiai score against the top tier —
+the best score, then fewest literals):
+
+| phi's score | status |
+|---|---|
+| below the top (*OUTRANKED*), or holds on no violation (*VACUOUS*) | FAIL |
+| above the top (*OUTRANKS* every mined candidate) | REFINEMENT_NOT_FOUND |
+| equal, and a single top-ranked `B` over phi's variables has `phi -> B` | SUCCESS |
+| equal, no such `B` | REFINEMENT_NOT_FOUND |
+
+Each numeric candidate is placed at its Ochiai-best split and spelled at the
+loosest edge of that data gap (`x > -1` when no value lies between -1 and the next
+one), so a `phi` splitting in the same gap implies it. `--threshold-strategy` does
+not apply. A split is one-sided, so a numeric field or container path also gets
+`x == v` for up to 8 of its most frequent values, and the miner offers `~(x == v)`:
+that is the only candidate a negated equality ground truth (`~(skid_state == 0)`,
+`m_floor_normal.y != 0`) can be contained in. A value qualifies when it renders
+exactly at 3 decimals and either recurs (seen in two or more states) or belongs to
+a quantity with only two observed values — there the equality cuts the data exactly
+where the threshold does, so it adds a spelling but no new partition to overfit.
+A one-off value among three or more would let `~(x == v)` carve a single awkward
+state out of an imperfect split. Arithmetic compounds get no equality atoms —
+their values recur by coincidence.
+
+Three more vocabulary rules exist for negated ground truths, all bug-condition
+only: the compound budget breaks its (on small pools, massive) ties by the smaller
+term first and keeps a term's `Exists`/`Forall` variants together — a negated
+existential `~(Exists(t > c))` is contained only in `Forall(t < b)`; an opaque base
+(`subject`, which containment treats as free booleans) gets each split spelled from
+both edges, so a phi like `~(subject.meleeDamages > 0)` can match exactly; and a
+two-valued field's negation is dropped as redundant only for booleans, since
+`~(fsm_state == "run")` is not `fsm_state == "spawn_ship"`. And before containment,
+a bug-condition phi is expanded into its disjunctive normal form and the
+alternatives no recorded state satisfies are dropped (the refinement "core", which
+used to look only at a top-level `|`) — a negated good condition hides its
+alternatives under the negation.
+
+**Conjunctive candidates** are the bug-condition twin of refinement's disjunctive
+ones. Negating a good condition `A | B` gives a bug condition `~A & ~B`, which as a
+two-literal pair would rank behind every single condition with the same score. When
+the bug condition has top-level `&` parts, gamerv also mines `A & B` conjunctions
+over distinct fields, each entered as *one* candidate. The arity comes from phi's
+own `&` count, a field is represented by its loosest tied-best literal, and a
+conjunction is kept only when it beats every part (and, for three or more parts,
+every smaller conjunction inside it). On tiny pools (one violation) this adds many
+coincidental perfect conjunctions to the tier: rows 78 and 107 grow from about 200
+to 7k–16k candidates.
+
+Keeping *both* sides soft is deliberate: with "holds on every violation"
+as a hard rule, every coefficient (Ochiai, Tarantula, Jaccard) reduces to a
+function of the good states alone and the ranking is exactly the refinement one,
+negated.
+
+`dataset_bug_condition.csv` is generated from the dataset, next to it, with each
+`Target Phi` negated, with the negation pushed inside so it reads like the mutation
+condition (`m_wading` -> `player.wading == true`, not `~(player.wading == false)`):
+De Morgan, `Exists` <-> `Forall`, flipped comparison operators; a double negation is
+dropped. Only `~Exists(a & b)` keeps its `~` (row 95: a quantifier body cannot be a
+disjunction). Re-run
+`python3 scripts/mirror_bug_dataset.py` after editing `dataset.csv`; `--check`
+says whether the mirror is stale.
 
 #### Candidate ordering (step 8)
 
@@ -286,23 +373,27 @@ Re-reading an **archived** run mixes the two rules: its `phi_refinement.json`
 ranks `phi` over the tier of the run that wrote it, so a rank past the new,
 smaller tier is reported as `below_top` (a miss) even where the refinement itself
 is still in the tier. Re-run the row to re-rank it — the mining cache is reused,
-so only the tier and the `phi` check are redone. To compare orderings, sweep the batch
-over several sorts in one command:
+so only the tier and the `phi` check are redone. To compare orderings, rank every row
+under several sorts in one run:
 
 ```bash
-./run_experiment.sh --skip-manual --candidate-sort all          # all three sorts
-./run_experiment.sh --skip-manual --candidate-sort none,type    # or name them
+./run_experiment.sh --skip-manual --candidate-sort all          # none, then type, popularity
+./run_experiment.sh --skip-manual --candidate-sort type,none    # or name them; the first is the rows' own
 ```
 
-The selected rows are run once per sort, in the order given, and each pass writes
-its own `results/run_<timestamp>_<sort>/` folder — the same three folders as three
-separate runs, which is what makes it an overnight job. The build cache and the
-step-5 log cache both hit on the later passes, so they skip building and recording
-and pay only re-validation and re-mining (step 8, where the time goes). Each folder
-records the knobs its pass ran under in `settings.json`, and `report.txt` and the
-figures caption themselves with them; the sweep closes with a `SWEEP SUMMARY` table
-(SUCCESS, ground truth found, median rank per sort) and the `src/compare.py`
-command lines that diff the passes row by row.
+Each row is **mined once**, under the first sort — its verdict, notes and `gt_rank`
+are that sort's — and then **step 8b** re-ranks the cached candidates under each
+further sort: one more `compare_refinement` call per sort that reuses the mining
+cache (the sort is not part of its signature), so gamerv only re-orders the tier and
+re-decides `phi`, exactly as a run under that sort would. It costs about a second
+per sort per row, timed in its own `rerank` phase so the method's `refine` time is
+not inflated by it. The run writes **one** `results/run_<timestamp>_sorts/` folder:
+`gt_rank_none` / `gt_rank_type` / `gt_rank_popularity` columns, a `RANK BY
+CANDIDATE SORT` table in `report.txt` (and on stdout: median rank per sort per game,
+and how often each sort ranks the ground truth best), and `ranks_by_sort.png`. The
+candidate count and the verdict cannot move between sorts; step 8b prints a
+warning if either does. Two separate runs can still be diffed row by row with
+`src/compare.py A B`.
 
 #### Result statuses (step 9)
 
@@ -368,7 +459,8 @@ sub-second. The first run is therefore interactive (pick the game/monitor).
 ./run_experiment.sh --skip-manual          # unattended: skip rows needing a human
 ./run_experiment.sh --row 20 --refinement-mode data-direct --threshold-strategy weakest
 ./run_experiment.sh --candidate-sort type   # reorder each score tier: flags before thresholds
-./run_experiment.sh --skip-manual --candidate-sort all  # sweep all three sorts, one results folder each
+./run_experiment.sh --objective refinement   # mine/score sound refinements instead (dataset.csv)
+./run_experiment.sh --skip-manual --candidate-sort all  # mine once, rank under all three sorts
 ./run_experiment.sh --row 4 --no-instrument  # skip step 2a (build source as committed)
 ./run_experiment.sh --row 4 --clean         # drop row 4's cached build + logs, then stop
 ```
@@ -387,9 +479,9 @@ CONTROLLER_BUILD_OUTPUT=raw ./run_experiment.sh --row 4   # inherit the compiler
 ```
 
 Results are written to one folder per run, `results/run_<timestamp>/`, and
-summarized on stdout. A candidate-sort sweep (`--candidate-sort all`) is *n* runs,
-so it writes *n* such folders, each suffixed with its pass's sort
-(`results/run_<timestamp>_type/`). The closing stdout summary is **aggregate only** — the
+summarized on stdout (a run ranked under several candidate sorts ends in `_sorts`,
+a bug-condition run — the default — in `_bug`, so only a refinement run keeps the
+bare name). The closing stdout summary is **aggregate only** — the
 classification counts, the mining rates and the per-game / per-category divisions;
 every per-case number (verdict, note, mining metrics, phase timings) goes to
 `report.txt` and `full.csv`, so a 120-row batch's terminal output stays readable
@@ -399,11 +491,17 @@ every per-case number (verdict, note, mining metrics, phase timings) goes to
 |---|---|
 | `full.csv` | every column the pipeline produced (the dataset `row` number, fault type + parent category, phi, formula, notes, mining metrics, per-phase timings) — the archival record. |
 | `summary.csv` | the five columns a results table needs: game, branch, property, ground truth, refinement found. |
-| `mining.csv` | step 8's search metrics per row: how many candidate refinements were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. The **rank** is a position in the order `--candidate-sort` chose; the count is the tier's size and is the same under every sort. |
+| `mining.csv` | step 8's search metrics per row: how many candidate refinements were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. The **rank** is a position in the order `--candidate-sort` chose; the count is the tier's size and is the same under every sort. Also the size of the state the miner searched: `variables` (every `base.field` in the pooled good/violation states) and `varying_variables` (the ones not constant across them — the vocabulary atoms are built over), counted by gamerv (`raw_atoms.state_variables`) and blank for a row that never pooled states. Then `gt_rank_<sort>` per candidate sort: the run's own sort always, every sort under `--candidate-sort all`. |
 | `settings.json` | the knobs the batch ran under — candidate sort, refinement mode, threshold strategy, instrumentation, row/game selection, dataset. Two runs over the same rows under different knobs are otherwise indistinguishable; `report.txt` and the figures read it back and caption themselves with it. |
 | `report.txt` | the **aggregate** view: rows per classification, then the same counts per game, per **bug category** and per **parent category**, plus the mining rates for each — then `PER-GAME BREAKDOWN`, which repeats all of those cuts **over one game's rows at a time** (that game's classifications, category tables and mining numbers, with no other game in the denominators) — then the **per-case** division (`BY CASE`): one line per dataset row with its verdict, candidate count, ground-truth rank, match tier and note, followed by `BY CASE — TIMINGS` (per-case wall clock and phase seconds, with the run's totals). |
-| `candidates.png` | boxplot of the candidate count, one box per game, every row a point beside its box. |
+| `success_by_fault_type.png` | one bar per **bug category**, grouped under its parent, split into success / fail / undecided (R_NF, V_NF, INCO) / not evaluated (SKIP, MANU, ERR), with the success rate at its end. |
+| `success_by_parent.png` | the same split for the two **parent categories** (non-temporal vs temporal). |
+| `time.png` | **time** of the method's own phases: one panel for validate + refine (over the cases that ran both), one for each alone, a box per game, each panel on its own axis. Build and record are left out — they depend on the game and its data, not on the method; their seconds stay in `full.csv` and `report.txt`. |
+| `space.png` | **space**: per game, the `variables` and `varying_variables` counts side by side. |
+| `time_vs_space.png` | the refine phase's seconds against the varying-variable count, one panel per game with every other game's rows in gray behind it. |
+| `candidates.png` | boxplot of the candidate count, one box per game, every row a point beside its box — over every row that mined, including the ones whose ground truth was not found. |
 | `candidates_vs_rank.png` | the same candidate counts **beside** the ground truth's rank, over the rows where it was found — "we mined 128 candidates, and the ground truth was 3rd" in one figure. Both series share one axis (a set size and an index into that set), log-scaled when the spans are far apart. |
+| `ranks_by_sort.png` | in place of the above for a run ranked under several sorts (`--candidate-sort all`): per game, one box of candidate counts (the same set under every sort) and one box of ground-truth ranks per sort, over the same rows, each box named with its median. |
 
 Every artefact after the CSVs is derived *from* them, so each can be regenerated
 (or redrawn elsewhere) for any past run:
@@ -411,7 +509,7 @@ Every artefact after the CSVs is derived *from* them, so each can be regenerated
 ```bash
 python src/report.py results/run_20260901_223129            # rewrite report.txt
 python src/report.py results/run_20260901_223129 --print    # ...and show it
-python src/plots.py  results/run_20260901_223129            # both figures
+python src/plots.py  results/run_20260901_223129            # every figure
 python src/plots.py  results/run_20260901_223129 --figure ranks --out /tmp/r.png
 ```
 
@@ -468,7 +566,7 @@ rank distributions are comparable):
 | line | what it says |
 |---|---|
 | `in the top k` | how often `phi` was among the first *k* mined refinements — the number a results table quotes, since *k* is how far a user reads. The cut-offs are `--top` (default `1,3,5,10`). |
-| `ranked at all` | and its two complements: **found without a rank** (only `phi`'s own sound core region establishes it, so there is no position) and **not found**. |
+| `ranked at all` | and its two complements: **found without a rank** and **not found**. Only an archived run can have a found-without-a-rank row: that is the retired `region` tier, where `phi` was contained only in a region derived from `phi` itself. It is no longer counted as a find (see `--refinement-mode symbolic` above). |
 | `median rank` | the middle position, over each side's own ranked rows. |
 | `mean reciprocal rank` | `1/rank` averaged over *every* compared case, 0 where `phi` was not ranked — the single number that moves both when a fix finds `phi` on a new row and when it ranks `phi` higher. |
 | `median rank share` | the rank as a fraction of that run's candidate set, because the sets move too: rank 11 of 155 is deeper into the list than rank 12 of 236, and only this number says so. |

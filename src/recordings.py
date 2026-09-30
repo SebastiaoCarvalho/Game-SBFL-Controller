@@ -42,9 +42,22 @@ def frame_count(rec_path: Path) -> int:
     tape sections, each opened by its own ``frames <N>``; every kart is captured
     on the same World update so all counts are equal, so the FIRST one is the
     replay length. Returns 0 if no count is found.
+
+    The scan window is generous because a 0 here is silent and expensive: it makes
+    ``replay_duration`` 0, so ``_record_one`` stops the log ``replay_delay +
+    replay_margin`` after launch — 7 s for SuperTuxKart — and the row logs a game
+    that is still loading. That is what broke ``race_ends_on_first_kart``, whose
+    tapes are ``STK_AGENT_DEMO 11``: the header grew ``ai_karts``, ``prestart``,
+    ``boosts`` and ``debug`` lines, which pushed ``frames`` to line 17 and one past
+    the old 16-line limit. Every other live tape has it by line 14, so the limit had
+    no margin left for a format that keeps gaining header fields.
+
+    The v1 bare-integer form is accepted only on the line it is documented to sit
+    on (right after the magic), so widening the window cannot start matching a tape
+    *data* line that happens to be a lone number.
     """
     with open(rec_path, encoding="utf-8", errors="replace") as f:
-        for _ in range(16):  # header is tiny; don't scan the whole tape
+        for lineno in range(1, 65):  # header is tiny; don't scan the whole tape
             line = f.readline()
             if not line:
                 break
@@ -52,7 +65,7 @@ def frame_count(rec_path: Path) -> int:
             if len(parts) == 2 and parts[0] == "frames" and parts[1].isdigit():
                 return int(parts[1])
             # v1: a bare integer on its own line right after the magic.
-            if len(parts) == 1 and parts[0].isdigit():
+            if lineno == 2 and len(parts) == 1 and parts[0].isdigit():
                 return int(parts[0])
     return 0
 

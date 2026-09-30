@@ -11,7 +11,8 @@
     python run_experiment.py --row 20 --refinement-mode symbolic --threshold-strategy weakest
     python run_experiment.py --row 20 --refinement-mode data-direct   # corroborate-only
     python run_experiment.py --candidate-sort type   # reorder each score tier: flags before thresholds
-    python run_experiment.py --candidate-sort all    # sweep: one pass (and one results folder) per sort
+    python run_experiment.py --candidate-sort all    # mine once, rank under every sort (one folder)
+    python run_experiment.py --objective refinement  # mine/score sound refinements instead (reads dataset.csv)
     python run_experiment.py --row 4 --no-instrument  # build the source as committed
     python run_experiment.py --row 4 --clean     # drop row 4's cached build + logs
 
@@ -63,11 +64,13 @@ def _parse_rows(spec: str) -> tuple[int, int]:
 def _parse_sorts(spec: str) -> list[str]:
     """``--candidate-sort``: one sort, a comma-separated list of them, or ``all``.
 
-    More than one turns the batch into a **sweep**: the same rows are run once per
-    sort, each pass writing its own results folder, which is what someone would
-    otherwise get by starting the batch three times by hand. The order is the one
-    given (``all`` means every sort in config order) and duplicates are dropped —
-    a repeated sort would only produce a second folder of the same numbers.
+    More than one ranks every row under each of them in **one pass**: the first sort
+    is the row's own (its verdict, notes and ``gt_rank``), and step 8b re-reads the
+    candidates it mined in each further sort's order (``pipeline._rerank``). The sort
+    only permutes one score tier, so the candidate set is identical under all of them
+    and re-mining per sort — as three separate batches would — buys nothing but three
+    times the wall clock. The order is the one given (``all`` means every sort in
+    config order, ``none`` first) and duplicates are dropped.
     """
     names = list(dict.fromkeys(s.strip() for s in spec.split(",") if s.strip()))
     if names == ["all"]:
@@ -151,7 +154,10 @@ def main(argv: list[str]) -> int:
                    help="run an inclusive row range, e.g. 4-9")
     ap.add_argument("--game", default=None,
                     help="only run rows whose Game Name matches (case-insensitive)")
-    ap.add_argument("--dataset", default=None, help="override dataset.csv path")
+    ap.add_argument("--dataset", default=None,
+                    help="override the dataset path (default: "
+                         f"{config.BUG_DATASET_NAME}, or dataset.csv under "
+                         "--objective refinement)")
     ap.add_argument("--manual-auto", action="store_true",
                     help="reuse stored hint answers for the manual image/audio "
                          "predicates; prompt only for ones not yet recorded")
@@ -179,10 +185,25 @@ def main(argv: list[str]) -> int:
                          "'popularity' = most-used in the game's source first "
                          "(needs step 7a's per-variable counts). Never changes "
                          "which refinements are mined. Pass several "
-                         "comma-separated (or 'all') to SWEEP them: the selected "
-                         "rows are run once per sort and each pass writes its own "
-                         "results/run_<timestamp>_<sort>/ folder. Default: "
-                         f"{config.CANDIDATE_SORT}.")
+                         "comma-separated (or 'all') to rank each row under every "
+                         "one of them in a single pass: mined once under the first, "
+                         "re-ranked under the rest (step 8b), written to one "
+                         "results/run_<timestamp>_sorts/ folder with a "
+                         "gt_rank_<sort> column each and the ranks_by_sort.png "
+                         f"figure. Default: {config.CANDIDATE_SORT}.")
+    ap.add_argument("--objective", choices=config.OBJECTIVES,
+                    default=config.OBJECTIVE,
+                    help="what step 8 mines and reads phi as: 'bug-condition' = "
+                         "fault localization, a condition under which the bug "
+                         "occurs, ranked by Ochiai suspiciousness over the "
+                         "violation (failing) and good (passing) states with no "
+                         "hard constraint; it reads its ground truth from "
+                         f"{config.BUG_DATASET_NAME} unless --dataset is given, "
+                         "ignores --threshold-strategy, and its results folders end "
+                         "in _bug. 'refinement' = a condition under which the "
+                         "property is sound (never holds on a violation, ranked by "
+                         "the good states it keeps), scored against dataset.csv. "
+                         f"Default: {config.OBJECTIVE}.")
     ap.add_argument("--threshold-strategy", choices=config.THRESHOLD_STRATEGIES,
                     default=config.THRESHOLD_STRATEGY,
                     help="how R's numeric split-points are placed: 'weakest' = just "
@@ -213,6 +234,19 @@ def main(argv: list[str]) -> int:
     if args.skip_manual:
         args.manual_auto = True
 
+    # A bug-condition run scores phi as the condition under which the bug occurs, so
+    # a dataset of good conditions would be scored against the wrong ground truth on
+    # every row — quietly, since each would read as an honest FAIL. Its own dataset
+    # is therefore the default, not an opt-in.
+    if args.dataset is None and args.objective == "bug-condition":
+        if not config.BUG_DATASET.is_file():
+            print(f"No bug-condition dataset at {config.BUG_DATASET}: generate it "
+                  f"with scripts/mirror_bug_dataset.py, or pass --dataset.",
+                  file=sys.stderr)
+            return 1
+        args.dataset = str(config.BUG_DATASET)
+    print(f"Dataset: {args.dataset or config.DATASET}")
+
     cases = _select(read_cases(args.dataset), args.row, args.rows, args.game)
     if not cases:
         print("No matching dataset rows.")
@@ -231,69 +265,48 @@ def main(argv: list[str]) -> int:
         return 0
 
     sorts = args.candidate_sort
-    sweep = len(sorts) > 1
-    print(f"Refinement decision: mode={args.refinement_mode}  "
+    multi = len(sorts) > 1
+    print(f"Refinement decision: objective={args.objective}  "
+          f"mode={args.refinement_mode}  "
           f"threshold strategy={args.threshold_strategy}  "
-          f"candidate sort={' -> '.join(sorts) if sweep else sorts[0]}")
+          f"candidate sort={sorts[0]}"
+          + (f" (also ranked under: {', '.join(sorts[1:])})" if multi else ""))
     print(f"Source instrumentation (step 2a): "
           f"{'on' if args.instrument else 'off'}")
     if args.skip_manual:
         print("Manual predicates: never prompting (--skip-manual) — rows the "
               "hints do not cover are reported NEEDS_MANUAL")
-    if sweep:
-        print(f"Candidate-sort sweep: {len(cases)} row(s) x {len(sorts)} sort(s) "
-              f"= {len(cases) * len(sorts)} case run(s), one results folder each.")
-        # Worth saying before an overnight start: the sweep is not three times the
-        # first pass's wall clock, but it is not one pass either. Step 5's recording
-        # is content-cached per game+branch, so passes 2..n restore it; steps 6 and 8
-        # re-run every pass, and step 8's mining is where a row spends its minutes.
-        print("                      steps 2/5 are cached after the first pass; "
-              "steps 6 and 8 (the mining) re-run in every pass.")
-        if not args.skip_manual:
-            print("                      consider --skip-manual: a manual predicate "
-                  "no hint covers would otherwise block every remaining pass at a "
-                  "prompt.")
+    if multi:
+        print(f"Candidate sorts: each row is mined once under {sorts[0]} and "
+              f"re-ranked under {', '.join(sorts[1:])} (step 8b, no re-mining) — "
+              f"one results folder.")
 
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     gamerv.backup_properties()
-
-    passes: list[tuple[str, object, list]] = []
-    rc = 0
     try:
-        for i, sort in enumerate(sorts, 1):
-            if sweep:
-                print("\n" + "#" * 70)
-                print(f"# PASS {i}/{len(sorts)}: candidate sort = {sort}")
-                print("#" * 70)
-            try:
-                results = _run_pass(cases, args, sort)
-            except DirtyTreeError as exc:
-                # Experiment-wide precondition, not a per-row failure: the remaining
-                # passes would abort on the same dirty tree. Passes already finished
-                # keep the folders they wrote.
-                print(f"\nABORTING: {exc}", file=sys.stderr)
-                return 2
-            # Written per pass rather than at the end, so an interrupted sweep still
-            # leaves every finished pass's folder complete.
-            out = _write_results(results, _settings(args, sort),
-                                 suffix=f"_{sort}" if sweep else "")
-            _summary(results, out)
-            passes.append((sort, out, results))
-            # Exit non-zero if any row errored in any pass, so CI/scripts can notice.
-            if any(r.status == "ERROR" for r in results):
-                rc = 1
+        try:
+            results = _run_pass(cases, args, sorts[0], rank_sorts=tuple(sorts))
+        except DirtyTreeError as exc:
+            # Experiment-wide precondition, not a per-row failure: every later row
+            # would abort on the same dirty tree.
+            print(f"\nABORTING: {exc}", file=sys.stderr)
+            return 2
+        out = _write_results(results, _settings(args, sorts),
+                             suffix=("_bug" if args.objective == "bug-condition"
+                                     else "") + ("_sorts" if multi else ""))
+        _summary(results, out)
     finally:
         gamerv.restore_properties()
-
-    if sweep:
-        _sweep_summary(passes)
-    return rc
+    # Exit non-zero if any row errored, so CI/scripts can notice.
+    return 1 if any(r.status == "ERROR" for r in results) else 0
 
 
-def _run_pass(cases, args, candidate_sort: str) -> list:
-    """Run every selected case once, under one candidate sort. Returns the results.
+def _run_pass(cases, args, candidate_sort: str,
+              rank_sorts: tuple[str, ...] = ()) -> list:
+    """Run every selected case once, under one candidate sort (ranked under
+    ``rank_sorts`` too, see :func:`_parse_sorts`). Returns the results.
 
-    One call is one results folder — the unit a sweep repeats. Every per-row failure
+    One call is one results folder. Every per-row failure
     is captured by :func:`pipeline.run_case` as an ERROR result so the batch keeps
     going; ``DirtyTreeError`` is the one exception and propagates, because no later
     row (or pass) can run against a dirty game tree either.
@@ -308,7 +321,9 @@ def _run_pass(cases, args, candidate_sort: str) -> list:
                        threshold_strategy=args.threshold_strategy,
                        instrument_source=args.instrument,
                        skip_manual=args.skip_manual,
-                       candidate_sort=candidate_sort)
+                       candidate_sort=candidate_sort,
+                       objective=args.objective,
+                       rank_sorts=rank_sorts)
         results.append(res)
         phases = "  ".join(f"{p}={v}s" for p, v in res.phase_cells().items())
         print(f"\n--> ROW {case.row} [{res.status}] "
@@ -323,17 +338,18 @@ def _write_csv(path, header, rows) -> None:
         w.writerows(rows)
 
 
-def _settings(args, candidate_sort: str) -> dict:
-    """The knobs this pass ran under, for ``settings.json``.
+def _settings(args, sorts: list[str]) -> dict:
+    """The knobs this run ran under, for ``settings.json``.
 
     Only the ones that change what the numbers *mean*: two runs over the same rows
-    with different knobs produce two folders that are otherwise indistinguishable,
-    and the candidate sort in particular exists to be compared across runs — which
-    is why it is the pass's own sort that is recorded here, not the whole sweep's
-    list (``--candidate-sort all`` writes three folders, each naming one sort).
+    with different knobs produce two folders that are otherwise indistinguishable.
+    ``candidate_sort`` is the rows' own sort (their verdicts and ``gt_rank``);
+    ``rank_sorts`` every sort a rank was recorded under, that one first.
     """
     return {
-        "candidate_sort": candidate_sort,
+        "objective": args.objective,
+        "candidate_sort": sorts[0],
+        "rank_sorts": list(sorts),
         "refinement_mode": args.refinement_mode,
         "threshold_strategy": args.threshold_strategy,
         "instrument_source": bool(args.instrument),
@@ -348,10 +364,11 @@ def _write_results(results, settings: dict | None = None,
                    suffix: str = "") -> "object":
     """Write this run's CSVs into their own results/run_<timestamp>/ folder.
 
-    ``suffix`` is appended to the folder name; a candidate-sort sweep passes
-    ``_<sort>`` so its three folders say which pass they are without anyone having
-    to open settings.json (and cannot collide on a shared second when a cached pass
-    is fast). A plain run passes nothing and keeps the bare ``run_<timestamp>``.
+    ``suffix`` is appended to the folder name: a run ranked under several candidate
+    sorts ends in ``_sorts``, and a bug-condition run (the default) prefixes
+    ``_bug`` so its folders are never mistaken for a refinement run's. A
+    single-sort refinement run passes nothing and keeps the bare
+    ``run_<timestamp>``, the name every refinement run has always had.
 
     One folder per run, so a run can grow extra artefacts (more views of the
     same rows, plots) without cluttering results/:
@@ -372,7 +389,8 @@ def _write_results(results, settings: dict | None = None,
                    refinements were mined, and the ground truth's rank among
                    them (blank when it was not established at all — see
                    metrics.py for the match tiers), plus whether only the *union*
-                   of several candidates covered it.
+                   of several candidates covered it, and the variables in the
+                   states the miner searched (logged / varying).
       report.txt   the aggregate view: rows per classification, and the same
                    counts cut by game, by bug category and by parent category,
                    with the mining rates per cut — then the same analysis again
@@ -382,12 +400,22 @@ def _write_results(results, settings: dict | None = None,
                    numbers, note and phase timings (report.py). The stdout
                    summary prints the aggregate tables only, so this file is the
                    place the per-game and per-case detail is read.
+      success_by_fault_type.png / success_by_parent.png  the classifications
+                   per bug category and per parent category, as stacked bars
+                   (plots.py, from full.csv).
+      time.png     the method's time per case (validate, refine, and the two
+                   together), a box per game.
+      space.png    the variables in the mined states, logged vs. varying.
+      time_vs_space.png  refine seconds against the varying-variable count.
       candidates.png  a boxplot of that candidate count, one box per game, drawn
                    from mining.csv (plots.py). Skipped, with a printed note, if
                    no row in the run mined.
       candidates_vs_rank.png  the same candidate counts beside the ground truth's
                    rank, over the rows where it was found — a big candidate set
                    read together with how deep in it the answer sat.
+      ranks_by_sort.png  instead of the above when the run ranked under several
+                   candidate sorts: the candidate count beside the rank under
+                   each sort, over the same rows.
 
     Every artefact after the CSVs is derived *from* them, so each can be
     regenerated for a past run (``python src/report.py <run_dir>``,
@@ -474,8 +502,7 @@ def _summary(results, out) -> None:
         print(f"                row(s) {rows or '?'} — re-run each interactively "
               f"(--manual-auto, no --skip-manual) to classify and cache the answers")
     if mined:
-        # "Found" is decided by the match tier, not by the rank: a conjunctive phi can
-        # be established by its own core region, which has no rank (see metrics.py).
+        # "Found" is decided by the match tier, not by the rank (see metrics.py).
         found = [r for r in mined if r.mining.found]
         ranks = [r.mining.gt_rank for r in mined if r.mining.gt_rank]
         tiers: dict[str, int] = {}
@@ -484,8 +511,8 @@ def _summary(results, out) -> None:
         union_only = sum(1 for r in mined if r.mining.union_only)
         median = f", median rank {statistics.median(ranks):.0f}" if ranks else ""
         detail = " ".join(f"{k}={v}" for k, v in sorted(tiers.items())) or "none"
-        # The tier breakdown is part of the line because "established" covers both a
-        # single mined refinement (exact / implication) and phi's own core region.
+        # The tier breakdown is part of the line: "established" is a single mined
+        # refinement spelled as phi (exact) or implying it (implication).
         print(f"  mining:     ground truth established in {len(found)}/{len(mined)} "
               f"row(s) ({detail}{median})")
         if union_only:
@@ -496,8 +523,14 @@ def _summary(results, out) -> None:
             print(f"              {below_top} further row(s) are covered by a single "
                   f"candidate scoring below the top tier — not counted as found")
     # The same aggregation report.txt is written from, so the two cannot disagree.
+    rows = report.rows_from_results(results)
+    by_sort = report.sort_rank_lines(rows)
+    if by_sort:
+        print("\n  rank by candidate sort (same candidates, each sort's order):")
+        for line in by_sort:
+            print(line)
     print()
-    for line in report.terminal_lines(report.rows_from_results(results)):
+    for line in report.terminal_lines(rows):
         print(line)
     total = sum(r.elapsed_s for r in results)
     phase_totals = {p: sum(r.timings.get(p, 0.0) for r in results) for p in PHASES}
@@ -508,53 +541,6 @@ def _summary(results, out) -> None:
           f"({', '.join(sorted(p.name for p in out.iterdir()))})")
     print(f"  per-case verdicts, notes and timings: "
           f"{out / report.REPORT_TXT} (BY CASE)")
-
-
-def _rel(path) -> str:
-    """A results folder as the path someone would type back at the shell."""
-    try:
-        return str(path.relative_to(config.CONTROLLER_DIR))
-    except ValueError:
-        return str(path)
-
-
-def _sweep_summary(passes: list[tuple[str, object, list]]) -> None:
-    """Close a multi-sort sweep: one line per pass, then the commands to diff them.
-
-    Each pass has already printed its own full summary and written its own folder —
-    this only answers the question the sweep was started to ask, which is how the
-    passes compare. The candidate *set* is the same under every sort (the sort
-    permutes one score tier, it does not re-mine), so the verdict counts should
-    agree and the ranks should not: a SUCCESS column that moves between passes is
-    worth looking at, and the rank columns are the measurement.
-
-    The real comparison is ``src/compare.py A B``, which diffs two folders row by
-    row (rank moves included), so the last thing printed is those command lines
-    against the first pass, ready to paste.
-    """
-    print("\n" + "=" * 70)
-    print("SWEEP SUMMARY")
-    print("=" * 70)
-    rows = len(passes[0][2]) if passes else 0
-    print(f"  {len(passes)} candidate sort(s) over {rows} row(s), "
-          f"one results folder each\n")
-    print(f"  {'sort':<12} {'SUCCESS':>9} {'found':>9} {'median rank':>12}   folder")
-    for sort, out, results in passes:
-        ok = sum(1 for r in results if r.status == "SUCCESS")
-        mined = [r for r in results
-                 if r.mining.candidates is not None and r.phi.strip()]
-        found = [r for r in mined if r.mining.found]
-        ranks = [r.mining.gt_rank for r in mined if r.mining.gt_rank]
-        median = f"{statistics.median(ranks):.0f}" if ranks else "-"
-        print(f"  {sort:<12} {f'{ok}/{len(results)}':>9} "
-              f"{f'{len(found)}/{len(mined)}':>9} {median:>12}   {_rel(out)}")
-    if len(passes) > 1:
-        base = passes[0]
-        print(f"\n  compare against the {base[0]} pass (per-row verdict and rank "
-              f"moves):")
-        for sort, out, _ in passes[1:]:
-            print(f"    python src/compare.py {_rel(base[1])} {_rel(out)}"
-                  f"   # {base[0]} -> {sort}")
 
 
 if __name__ == "__main__":

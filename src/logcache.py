@@ -106,11 +106,22 @@ def cached_key(game: Game, branch: str) -> str | None:
         return None
 
 
+#: What a cached run dir has to carry to be worth restoring. ``events.jsonl`` is the
+#: trace itself; ``frame_timestamps.csv`` is what maps each event to a video frame,
+#: and validation refuses a run without it ("frame_timestamps.csv is empty in ..."),
+#: so a slot missing it fails step 6 identically on every run. Both are written by
+#: the recording session's teardown, and a session killed before that teardown leaves
+#: the timestamps empty and the mp4 unfinalized while the event log — pulled earlier,
+#: at SIGINT — looks perfectly healthy. Checking only the event log let exactly that
+#: slot (Super Tux Kart / nitro_collection_failing_when_nitro) hit the cache forever
+#: and ERROR the row on every run.
+_REQUIRED_FILES = ("events.jsonl", "frame_timestamps.csv")
+
+
 def _has_trace(run_dir: Path) -> bool:
-    """True if this cached run actually logged something (see gamerv.run_dirs)."""
-    f = run_dir / "events.jsonl"
+    """True if this cached run holds a restorable recording (see gamerv.run_dirs)."""
     try:
-        return f.stat().st_size > 0
+        return all((run_dir / f).stat().st_size > 0 for f in _REQUIRED_FILES)
     except OSError:
         return False
 
@@ -125,6 +136,10 @@ def has(game: Game, branch: str, key: str) -> bool:
     back undecidable rather than broken; 53 slots across two games were poisoned
     that way before anyone noticed. Treating an all-empty slot as a miss lets the
     cache heal itself on the next run instead of needing a manual purge.
+
+    A slot whose recording died before teardown is poisoned the same way and needs
+    the same healing, which is why the test is over ``_REQUIRED_FILES`` rather than
+    the event log alone.
     """
     if cached_key(game, branch) != key:
         return False
@@ -134,8 +149,9 @@ def has(game: Game, branch: str, key: str) -> bool:
     except (json.JSONDecodeError, OSError, KeyError):
         return False
     if not any(_has_trace(slot / n) for n in names):
-        print(f"    [cache] slot for {branch!r} holds only empty event logs "
-              f"— treating as a miss and re-recording")
+        print(f"    [cache] slot for {branch!r} holds no restorable recording "
+              f"(every run dir is missing a non-empty "
+              f"{' / '.join(_REQUIRED_FILES)}) — treating as a miss and re-recording")
         return False
     return True
 

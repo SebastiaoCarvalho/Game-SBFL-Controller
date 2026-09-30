@@ -52,6 +52,26 @@ Four numbers per case:
               while the mining metrics count it as a miss. The flag is what keeps
               that difference visible instead of silent.
 
+and two numbers for the size of the state the miner searched (the run's **space**),
+counted by gamerv over the pooled good/violation states it persisted
+(``raw_atoms.state_variables``):
+
+  variables          every ``base.field`` the profile's bases and collections carry
+                     in those states — what the game logs.
+  varying_variables  the ones whose value changes across them — the depth-1
+                     vocabulary the miner builds its atoms over. Constant fields
+                     carry no signal and never become a candidate.
+
+Both are blank for a mining cache written before gamerv recorded them.
+
+Finally, one rank per candidate sort, ``gt_rank_<sort>`` (``none`` / ``type`` /
+``popularity``): the ground truth's position in the *same* top tier read in that
+sort's order. The run's own sort always fills its column (equal to ``gt_rank``); a run
+started with several sorts (``--candidate-sort all``) re-ranks the cached mining under
+each of the others (``pipeline._rerank``), so the columns compare the orderings over
+one identical candidate set. A column is blank where the row was not ranked under
+that sort, or its ground truth was not found.
+
 **Where the rank comes from.** gamerv decides phi against the mined refinements one
 at a time — ``Exists R in R_all: phi -> R``
 (``runners.fault_localization.check_phi_refinement``) — and persists that verdict to
@@ -95,10 +115,11 @@ in a results table:
   implication  that single candidate implies phi (``phi -> R`` holds) without being
                spelled the same — a mined threshold is placed from the data, so it
                rarely equals a hand-written constant.
-  region       no mined candidate establishes phi, but phi's own sound core region
-               does: a conjunctive-quantifier phi whose joint per-item pattern no
-               single mined atom names. There is no rank — the region is derived
-               from phi, not mined (see gamerv's check_phi_refinement).
+  region       RETIRED (2026-09-28), still read from archived runs: no mined
+               candidate established phi, only phi's own sound core region did. That
+               region is derived from phi, so it contains any sound phi — a
+               self-match, not a find. gamerv no longer reports it, and a leftover
+               ``region`` record in a trace's phi cache is read as not found.
   threshold    textual fallback only: same quantity, same direction, different split
                point (``player.coins < 5`` vs a mined ``player.coins < 369``).
 """
@@ -107,7 +128,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MINING_CACHE = "fault_localization.json"
@@ -127,7 +148,14 @@ _FLOAT_SUFFIX = re.compile(r"(?<=[0-9.])[fF](?![0-9A-Za-z_.])")
 
 #: The CSV header for :meth:`Mining.cells`, so the columns and the cells that fill
 #: them are declared in one place.
-COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only", "below_top")
+#: The candidate sorts a rank can be recorded under, in the order their columns are
+#: written. Kept in step with ``config.CANDIDATE_SORTS`` / gamerv's
+#: ``runners.candidate_sort.SORTS``; this module stays import-free of both.
+SORTS = ("none", "type", "popularity")
+RANK_COLUMNS = tuple(f"gt_rank_{s}" for s in SORTS)
+
+COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only", "below_top",
+           "variables", "varying_variables", *RANK_COLUMNS)
 
 
 @dataclass
@@ -139,12 +167,17 @@ class Mining:
     union_only: bool = False        # only the union of candidates establishes phi
     below_top: bool = False         # a single candidate establishes phi, but a
                                     # lower-scoring one than the top tier
+    variables: int | None = None    # base.field variables in the mined states
+    varying: int | None = None      # ... of which change across them
+    #: ``{sort: rank}`` for every sort the row was ranked under (the run's own sort
+    #: included); a sort mapped to None was ranked and the ground truth not found.
+    ranks: dict = field(default_factory=dict)
 
     @property
     def found(self) -> bool:
-        """Was the ground truth found — by a single top-scored candidate, or by phi's
-        own region? (The tier says which; ``union_only`` and ``below_top`` are
-        deliberately not it: both are ways of *missing*.)"""
+        """Was the ground truth found by a single top-scored candidate? (The tier says
+        how; ``union_only`` and ``below_top`` are deliberately not it: both are ways of
+        *missing*. An archived run may also carry the retired ``region`` tier.)"""
         return bool(self.gt_match)
 
     def cells(self) -> list[str]:
@@ -153,7 +186,11 @@ class Mining:
                 "" if self.gt_rank is None else str(self.gt_rank),
                 self.gt_match,
                 "yes" if self.union_only else "",
-                "yes" if self.below_top else ""]
+                "yes" if self.below_top else "",
+                "" if self.variables is None else str(self.variables),
+                "" if self.varying is None else str(self.varying),
+                *("" if self.ranks.get(s) is None else str(self.ranks[s])
+                  for s in SORTS)]
 
 
 # --------------------------------------------------------------------------
@@ -453,11 +490,16 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     entry = _entry(run_dir / MINING_CACHE, formula)
     if entry is None:
         return Mining()
+    # The state size is known as soon as the miner pooled states, whether or not it
+    # then ranked anything.
+    size = entry.get("variables") or {}
+    space = Mining(variables=_count(size.get("logged")),
+                   varying=_count(size.get("varying")))
     shown = entry.get("shown")
     if shown is None:
-        return Mining()
+        return space
     top = _top_tier(shown)            # the reported candidate set — see _top_tier
-    m = Mining(candidates=len(top))
+    m = Mining(candidates=len(top), variables=space.variables, varying=space.varying)
     if not phi.strip():
         return m                      # no ground truth on this row to look for
 
@@ -478,8 +520,10 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
             m.gt_rank = rank
             m.gt_match = ("exact" if _same_formula(verdict.get("r_text"), phi)
                           else "implication")
-        elif match:
-            m.gt_match = match        # "region": established, but by no candidate
+        # Any other match is the retired "region" tier (phi contained in a region
+        # derived from phi itself). gamerv does not rewrite the phi cache when no
+        # candidate is eligible, so a record left over from before the retirement can
+        # still sit beside a trace. It is not a find, so it is ignored.
         return m
 
     # No persisted verdict (data-direct / auto with a raw phi): fall back to textual
@@ -498,6 +542,11 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     if threshold_rank is not None:
         m.gt_rank, m.gt_match = threshold_rank, "threshold"
     return m
+
+
+def _count(value) -> int | None:
+    """A persisted non-negative count, or None when absent or malformed."""
+    return value if isinstance(value, int) and value >= 0 else None
 
 
 def _same_formula(r_text: str | None, phi: str) -> bool:

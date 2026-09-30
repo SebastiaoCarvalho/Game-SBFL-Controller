@@ -334,7 +334,12 @@ def validate(run_dir: Path, auto: bool = False,
                     f"predicates to answer:\n{proc.stdout}"
                 )
             continue
-        raise GameRVError(f"validate {run_dir} failed:\n{proc.stderr}")
+        # stdout FIRST: the worker prints its own reason there ("Invalid argument
+        # for 'validate': frame_timestamps.csv is empty in ..."), while stderr under
+        # this env is all TensorFlow/absl startup noise. Raising with stderr alone
+        # put that noise in the row's ERROR note and left the actual cause nowhere.
+        detail = "\n".join(s.strip() for s in (proc.stdout, proc.stderr) if s and s.strip())
+        raise GameRVError(f"validate {run_dir} failed:\n{detail}")
 
 
 def validate_all(auto: bool = False, skip_manual: bool = False) -> list[Path]:
@@ -373,7 +378,8 @@ def last_invalid_run() -> Path | None:
 
 def fault_localize(run_dir: Path, terms: list[str] | None = None,
                    strategy: str | None = None,
-                   candidate_sort: str | None = None) -> str:
+                   candidate_sort: str | None = None,
+                   objective: str | None = None) -> str:
     """Localize the fault in ``run_dir``, mining a refinement R.
 
     When ``terms`` is given, mining is focused on exactly those raw game-state
@@ -382,17 +388,19 @@ def fault_localize(run_dir: Path, terms: list[str] | None = None,
     single JSON list so values with spaces/parens survive argv intact. ``strategy``
     selects how R's thresholds are placed (midpoints / weakest / gap-mean) and
     ``candidate_sort`` how the mined candidates are ordered within one score tier
-    (none / type / popularity).
+    (none / type / popularity), and ``objective`` whether it mines refinements or
+    bug conditions (see ``config.OBJECTIVE``).
 
-    Once either knob is given, terms occupies a fixed argv slot ("null" if absent)
+    Once any knob is given, terms occupies a fixed argv slot ("null" if absent)
     so the ones after it stay positionally addressable — the same fixed-slot
     contract :func:`compare_refinement` uses.
     """
     args = ["fault_localize", str(run_dir)]
-    if strategy is not None or candidate_sort is not None:
+    if strategy is not None or candidate_sort is not None or objective is not None:
         args += [json.dumps(list(terms) if terms else None),
                  strategy or config.THRESHOLD_STRATEGY,
-                 candidate_sort or config.CANDIDATE_SORT]
+                 candidate_sort or config.CANDIDATE_SORT,
+                 objective or config.OBJECTIVE]
     elif terms:
         args.append(json.dumps(list(terms)))
     proc = _worker(*args)
@@ -448,6 +456,11 @@ def _unwrap(s: str) -> str:
 
 
 _REFINED_MARKER = "Refined invariant:"
+#: fault_localize's line under the bug-condition objective, where there is no refined
+#: invariant — only the top of the Ochiai ranking: ``Most suspicious condition:  B``.
+_MOST_SUSPICIOUS_MARKER = "Most suspicious condition:"
+#: A bug-condition compare_refinement run opens with this header.
+_BUG_RANKING_HEADER = "=== Bug Condition Ranking ==="
 
 #: gamerv's corroborate refuses to score a phi that reads a quantity no pooled
 #: state carries ("Could not evaluate phi: phi reads <k>, which no logged state
@@ -465,9 +478,20 @@ _UNEXPORTED_MARKER = "which no logged state reports"
 #: otherwise be certified by it.
 _UNDER_SUPPORTED_MARKER = "UNDER-SUPPORTED"
 
+#: The bug-condition objective's verdicts on phi's own Ochiai score against the top of
+#: the ranking. OUTRANKED (below it) is the under-support rule's twin — decided on the
+#: data, ahead of containment. OUTRANKS (above it) means the search never built a
+#: condition as good as phi: not found, whatever containment would say. TOP_RANKED
+#: (equal) is the bug-condition "corroborated by the data".
+_OUTRANKED_MARKER = "phi is OUTRANKED"
+_OUTRANKS_MARKER = "phi OUTRANKS every mined bug condition"
+_TOP_RANKED_MARKER = "phi IS a top-ranked bug condition"
+
 
 def mined_r(out: str) -> str | None:
-    """The mined R from fault_localize's ``Refined invariant:`` line, if it printed one.
+    """The mined R from fault_localize's ``Refined invariant:`` line, if it printed one
+    (or, under the bug-condition objective, the top-ranked B from its ``Most
+    suspicious condition:`` line).
 
     The line reads ``Refined invariant:  G((P) & (R) -> (Q))``. Splitting at paren
     depth 0 inside the ``G(...)`` isolates the antecedent ``(P) & (R)``, whose last
@@ -475,6 +499,8 @@ def mined_r(out: str) -> str | None:
     """
     for line in reversed(out.splitlines()):
         s = line.strip()
+        if s.startswith(_MOST_SUSPICIOUS_MARKER):
+            return s[len(_MOST_SUSPICIOUS_MARKER):].strip() or None
         if not s.startswith(_REFINED_MARKER):
             continue
         body = s[len(_REFINED_MARKER):].strip()
@@ -487,7 +513,8 @@ def mined_r(out: str) -> str | None:
 
 def mine_only(run_dir: Path, terms: list[str] | None = None,
               strategy: str | None = None,
-              candidate_sort: str | None = None) -> Containment:
+              candidate_sort: str | None = None,
+              objective: str | None = None) -> Containment:
     """Mine R with no phi to judge it against — the SKIPPED path for a dataset row
     whose ``Target Phi`` cell is empty.
 
@@ -502,7 +529,7 @@ def mine_only(run_dir: Path, terms: list[str] | None = None,
     to yield a verdict); the reason is carried in the note.
     """
     try:
-        out = fault_localize(run_dir, terms, strategy, candidate_sort)
+        out = fault_localize(run_dir, terms, strategy, candidate_sort, objective)
     except GameRVError as exc:
         return Containment("SKIPPED", None, str(exc),
                            "no ground-truth phi (mining R failed)")
@@ -565,6 +592,14 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
     phi — the game simply does not export the variable its ground truth is written
     over — so the row is neither a verdict nor an experiment failure (``ERROR``).
 
+    A **bug-condition** run (``config.OBJECTIVE``) ranks candidates by Ochiai, and
+    its data-side verdict compares phi's own score with the top of that ranking
+    instead of testing soundness: *OUTRANKED* (below it) plays the under-supported
+    part and is FAIL ahead of containment; *top-ranked* (equal) plays "corroborated
+    by the data"; *OUTRANKS* (above it) is REFINEMENT_NOT_FOUND outright — the search
+    never built a condition as good as phi. Containment and the statuses are
+    otherwise read exactly as for a refinement.
+
     Pure string logic, separated out so it can be unit-tested without the worker.
     """
     r_text = None
@@ -573,7 +608,7 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
     in_symbolic = False
     for line in out.splitlines():
         s = line.strip()
-        if s.startswith("R") and "=" in s and r_text is None:
+        if s.startswith(("R", "B ")) and "=" in s and r_text is None:
             r_text = s.split("=", 1)[1].strip()
         if s.startswith("(symbolic view"):
             in_symbolic = True
@@ -589,15 +624,26 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
     not_contained = "is NOT contained" in out       # no single R does (witness shown)
     # phi is covered only by the *union* of several candidates — gamerv reports it on a
     # miss, and it is the reason a row the old union test called found is now a miss.
-    union_only    = "established only by several mined refinements together" in out
+    union_only    = ("established only by several mined refinements together" in out
+                     or "established only by several mined bug conditions together"
+                     in out)
     no_r_all      = ("not comparable by containment" in out
                      or "no mined refinement constrains" in out)
-    data_sound    = "IS a sound refinement" in out  # corroborate: sound + informative
-    # Sound but weaker than the data affords (see _UNDER_SUPPORTED_MARKER). gamerv
-    # prints it *instead of* the "IS a sound refinement" line, so data_sound is already
-    # False here; it is named separately because it outranks the containment verdict.
-    data_under    = _UNDER_SUPPORTED_MARKER in out
+    bug           = _BUG_RANKING_HEADER in out  # a bug-condition (Ochiai) run
+    # phi's score is above every mined candidate's: nothing the search built is phi.
+    outranks      = _OUTRANKS_MARKER in out
+    # corroborate: sound + informative (a bug condition: as high as the best mined)
+    data_sound    = ("IS a sound refinement" in out or _TOP_RANKED_MARKER in out
+                     or outranks)
+    # Sound but weaker than the data affords (see _UNDER_SUPPORTED_MARKER), or — for a
+    # bug condition — scored below the top of the ranking. gamerv prints it *instead
+    # of* the corroborated line, so data_sound is already False here; it is named
+    # separately because it outranks the containment verdict.
+    data_under    = _UNDER_SUPPORTED_MARKER in out or _OUTRANKED_MARKER in out
     data_unsound  = "is NOT sound" in out or "VACUOUS" in out or data_under
+    nothing_mined = ("No sound refinement R was mined" in out
+                     or "No bug condition B was mined" in out)
+    noun = "bug condition" if bug else "refinement"
 
     # Decided before either mode: phi was never scored, because the game exports
     # none of the quantities it reads. Reported as its own outcome (a gap in the
@@ -613,6 +659,10 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
         # holding on 1 of 2 good states came to be certified by `ticks_left > -32768`.
         if data_under:
             return Containment("FAIL", r_text, out, verdict)
+        if outranks:
+            return Containment("REFINEMENT_NOT_FOUND", r_text, out, (
+                "phi scores above every mined bug condition — the search did not "
+                "build it"))
         # SUCCESS comes from the per-candidate containment only; everything else
         # cross-references the data-direct verdict to separate REFINEMENT_NOT_FOUND (R
         # missed a real refinement) from FAIL (phi genuinely not sound).
@@ -626,13 +676,13 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
                     if "VACUOUS" in out else (sym_verdict or verdict))
         elif (not_contained or no_r_all) and data_sound:
             status = "REFINEMENT_NOT_FOUND"
-            note = ("phi corroborated by the data, but no single mined refinement "
+            note = (f"phi corroborated by the data, but no single mined {noun} "
                     "establishes it — the search did not find it"
                     + (" (only the union of several candidates covers it)"
                        if union_only else ""))
         elif not_contained or data_unsound:
             status, note = "FAIL", (sym_verdict or verdict)
-        elif ("No sound refinement R was mined" in out or "Cannot compare phi" in out
+        elif (nothing_mined or "Cannot compare phi" in out
               or "No violated formula" in out or no_r_all):
             status, note = "INCONCLUSIVE", verdict
         else:
@@ -645,7 +695,7 @@ def parse_containment(out: str, mode: str = "auto") -> Containment:
         status = "SUCCESS"                  # phi is a sound (valid) refinement
     elif data_unsound or not_contained:
         status = "FAIL"                     # phi does not exclude every violation
-    elif ("No sound refinement R was mined" in out or "Cannot compare phi" in out
+    elif (nothing_mined or "Cannot compare phi" in out
           or "No violated formula" in out):
         status = "INCONCLUSIVE"             # nothing to decide phi against
     else:  # "Could not evaluate phi" / "Could not decide containment" / unexpected
@@ -657,7 +707,9 @@ def compare_refinement(run_dir: Path, phi: str,
                        terms: list[str] | None = None,
                        mode: str | None = None,
                        strategy: str | None = None,
-                       candidate_sort: str | None = None) -> Containment:
+                       candidate_sort: str | None = None,
+                       objective: str | None = None,
+                       echo: bool = True) -> Containment:
     """Run gamerv's compare_refinement and classify the verdict on phi.
 
     ``terms`` focuses R-mining on those raw variables (box-only), matching the
@@ -666,28 +718,33 @@ def compare_refinement(run_dir: Path, phi: str,
     path (auto / data-direct / symbolic), ``strategy`` how R's thresholds are
     placed (midpoints / weakest / gap-mean), and ``candidate_sort`` how the mined
     candidates are ordered within one score tier (none / type / popularity — only
-    the order they are reported and checked in, never which R is mined); each
-    defaults to the config value.
+    the order they are reported and checked in, never which R is mined), and
+    ``objective`` whether phi is a refinement or a bug condition (refinement /
+    bug-condition); each defaults to the config value.
 
-    terms/mode/strategy/sort are passed as fixed argv positions (terms as JSON,
-    "null" when absent) so each stays addressable even when no terms are set.
+    terms/mode/strategy/sort/objective are passed as fixed argv positions (terms as
+    JSON, "null" when absent) so each stays addressable even when no terms are set.
 
     An empty ``phi`` (a dataset row with no ground truth) is not an error: it is
     routed to :func:`mine_only`, which mines R and returns ``SKIPPED``.
+
+    ``echo=False`` keeps gamerv's output (the whole candidate list) off stdout — for
+    a re-ranking call, whose only product is the verdict it persists.
     """
     if not phi.strip():
         # No ground truth to compare: gamerv would only report that it could not
         # evaluate an empty phi, which reads as an ERROR. Mine R instead.
-        return mine_only(run_dir, terms, strategy, candidate_sort)
+        return mine_only(run_dir, terms, strategy, candidate_sort, objective)
     mode = mode or config.REFINEMENT_MODE
     strategy = strategy or config.THRESHOLD_STRATEGY
     candidate_sort = candidate_sort or config.CANDIDATE_SORT
+    objective = objective or config.OBJECTIVE
     args = ["compare_refinement", str(run_dir), phi,
             json.dumps(list(terms) if terms else None), mode, strategy,
-            candidate_sort]
+            candidate_sort, objective]
     proc = _worker(*args)
     out = proc.stdout or ""
-    if proc.stdout:
+    if proc.stdout and echo:
         print(out, end="")
     if proc.returncode != 0:
         return Containment("ERROR", None, out + "\n" + (proc.stderr or ""))

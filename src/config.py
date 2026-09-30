@@ -44,6 +44,21 @@ _DATASET_CANDIDATES = (
 )
 DATASET = next((p for p in _DATASET_CANDIDATES if p and p.is_file()),
                _DATASET_CANDIDATES[-1])
+# The same dataset with each Target Phi restated as the condition under which the
+# bug OCCURS rather than the one under which the property holds -- the ground truth
+# the "bug-condition" OBJECTIVE is scored against (see below). Generated from
+# DATASET by scripts/mirror_bug_dataset.py, next to it; resolved the same way, with
+# $FL_BUG_DATASET in place of $FL_DATASET.
+BUG_DATASET_NAME = "dataset_bug_condition.csv"
+_BUG_DATASET_CANDIDATES = (
+    Path(os.environ["FL_BUG_DATASET"]) if os.environ.get("FL_BUG_DATASET") else None,
+    Path(os.environ["FL_DATA_DIR"]) / BUG_DATASET_NAME
+    if os.environ.get("FL_DATA_DIR") else None,
+    Path("/home/sebastiao/nii/fl") / BUG_DATASET_NAME,
+    CONTROLLER_DIR / "data" / BUG_DATASET_NAME,
+)
+BUG_DATASET = next((p for p in _BUG_DATASET_CANDIDATES if p and p.is_file()),
+                   _BUG_DATASET_CANDIDATES[-1])
 RESULTS_DIR = CONTROLLER_DIR / "results"
 # Cached operator answers for the manual image/audio predicate prompts, one file
 # per recording: hints/<game>/<branch>/<recX>.hint. Written whenever the operator
@@ -136,6 +151,31 @@ CLANG_RESOURCE_DIR = Path.home() / ".local" / "share" / "gamerv-clang" / "18"
 # Overridable per run with --refinement-mode.
 REFINEMENT_MODE = "symbolic"
 REFINEMENT_MODES = ("auto", "data-direct", "symbolic")
+
+# --- Objective: what is mined, and what phi is read as --------------------
+#   "bug-condition" — the default, and the framing the experiment is reported
+#                     under: spectrum-based fault localization, a condition B
+#                     under which the BUG OCCURS. Every P-state is a test (failing =
+#                     violation, passing = good) and every candidate is ranked by
+#                     its Ochiai suspiciousness ef / sqrt(F * (ef + ep)), with no
+#                     hard constraint on either side. phi is the bad condition, so
+#                     rows are read from BUG_DATASET by default. phi is FAIL when it
+#                     scores below the top of the ranking, REFINEMENT_NOT_FOUND when
+#                     it scores above it (or ties it with no top-ranked candidate
+#                     containing it), SUCCESS when it ties it and a single
+#                     top-ranked B has phi -> B. The threshold strategy does not
+#                     apply: each split is placed where its Ochiai score is highest,
+#                     and fields and paths also get `x == v` atoms for recurring
+#                     values, so a negated equality phi (`x != 0`) has a
+#                     candidate to match.
+#   "refinement"    — a condition R under which the property is SOUND: R is false
+#                     on every violation (P & ~Q) — a hard constraint — and ranked
+#                     by the good states (P & Q) it keeps; G(P & R -> Q). phi is the
+#                     good condition, read from DATASET. Every run before
+#                     2026-09-26 was one of these.
+# Overridable per run with --objective.
+OBJECTIVE = "bug-condition"
+OBJECTIVES = ("refinement", "bug-condition")
 
 # --- Refinement threshold strategy ---------------------------------------
 # How R's numeric atom split-points are placed between the violation and good

@@ -59,8 +59,18 @@ from game_repo import DirtyTreeError
 
 # Ordered phase labels for per-case timing. The single elapsed_s total is split
 # across these; not every phase runs for every row (e.g. an early INCONCLUSIVE
-# return leaves later phases unrecorded). See run_case.
-PHASES = ("build", "record", "validate", "refine")
+# return leaves later phases unrecorded). See run_case. "rerank" is step 8b, which
+# only a multi-sort run has: experiment bookkeeping, kept out of "refine" so the
+# method's own time is not inflated by it.
+PHASES = ("build", "record", "validate", "refine", "rerank")
+
+#: What a re-ranking call (step 8b) rewrites in the run dir. Restored afterwards, so
+#: the row's artefacts — archived with its logs — are the primary sort's.
+_RANK_ARTEFACTS = ("phi_refinement.json", "refinement_separators.log")
+
+#: gamerv's note that a sort could not do its job (popularity with no source counts)
+#: and left the mined order in place — see fault_localization._announce_sort.
+_SORT_DEGRADED = "candidates keep their mined order"
 
 
 @contextmanager
@@ -287,12 +297,67 @@ def _record_or_restore(game: Game, case: TestCase,
     return n
 
 
+def _rerank(run_dir: Path, case: TestCase, sorts: list[str],
+            primary: metrics.Mining, primary_status: str, *, mode: str,
+            strategy: str, objective: str) -> dict[str, int | None]:
+    """Step 8b — the ground truth's rank under each of ``sorts``, over the candidates
+    step 8 already mined.
+
+    Each sort is one more ``compare_refinement`` call on the same run dir. Its mining
+    cache matches (the sort is not part of the signature), so nothing is re-mined:
+    gamerv re-orders the cached tier and decides phi against it, exactly as a run
+    started under that sort would — the rank recorded here is the one that run would
+    report. What differs between the calls is only the order, so the candidate count
+    and the verdict must not move; either moving is printed as a warning (a cache miss
+    that re-mined, or the phi scan's budget cutting a different prefix).
+
+    Returns ``{sort: rank}``, None where the ground truth was not found — or where
+    the sort could not order anything (popularity without the game's source counts),
+    since the mined order it falls back to would be recorded under the wrong name.
+    """
+    saved = {n: (run_dir / n).read_bytes() for n in _RANK_ARTEFACTS
+             if (run_dir / n).is_file()}
+    ranks: dict[str, int | None] = {}
+    try:
+        for s in sorts:
+            cont = gamerv.compare_refinement(run_dir, case.phi, None, mode=mode,
+                                             strategy=strategy, candidate_sort=s,
+                                             objective=objective, echo=False)
+            m = metrics.read(run_dir, case.formula, case.phi)
+            if _SORT_DEGRADED in cont.stdout:
+                print(f"    {s}: [warn] the sort had nothing to order by and kept the "
+                      f"mined order — no rank recorded")
+                ranks[s] = None
+                continue
+            ranks[s] = m.gt_rank
+            where = ("not among them" if m.gt_rank is None
+                     else f"ground truth at rank {m.gt_rank}")
+            print(f"    {s}: {where}")
+            if m.candidates != primary.candidates:
+                print(f"    {s}: [warn] {m.candidates} candidate(s), not "
+                      f"{primary.candidates} — the call re-mined instead of re-ranking")
+            if cont.status != primary_status or m.found != primary.found:
+                print(f"    {s}: [warn] verdict {cont.status} "
+                      f"({'found' if m.found else 'not found'}), where the row's own "
+                      f"sort gave {primary_status} — the order moved more than the rank")
+    finally:
+        # Put the primary sort's artefacts back (and drop any the calls created).
+        for n in _RANK_ARTEFACTS:
+            if n in saved:
+                (run_dir / n).write_bytes(saved[n])
+            else:
+                (run_dir / n).unlink(missing_ok=True)
+    return ranks
+
+
 def run_case(case: TestCase, manual_auto: bool = False,
              refinement_mode: str | None = None,
              threshold_strategy: str | None = None,
              instrument_source: bool | None = None,
              skip_manual: bool = False,
-             candidate_sort: str | None = None) -> CaseResult:
+             candidate_sort: str | None = None,
+             objective: str | None = None,
+             rank_sorts: tuple[str, ...] = ()) -> CaseResult:
     """Execute the pipeline for one dataset row.
 
     The row's ``game`` (Game Name) is resolved to a :class:`config.Game`; an
@@ -312,13 +377,21 @@ def run_case(case: TestCase, manual_auto: bool = False,
     phi, ``threshold_strategy`` (midpoints / weakest / gap-mean) how R's
     thresholds are placed, and ``candidate_sort`` (none / type / popularity) how
     the mined candidates are ordered *within* one score tier — which moves the
-    ground truth's rank without changing the candidate set or the mined R. ``None``
-    defers to ``config.REFINEMENT_MODE`` / ``config.THRESHOLD_STRATEGY`` /
-    ``config.CANDIDATE_SORT``.
+    ground truth's rank without changing the candidate set or the mined R.
+    ``objective`` (refinement / bug-condition) says whether step 8 mines conditions
+    under which the property holds or under which the bug occurs — and so which of
+    the two the row's phi is. ``None`` defers to ``config.REFINEMENT_MODE`` /
+    ``config.THRESHOLD_STRATEGY`` / ``config.CANDIDATE_SORT`` / ``config.OBJECTIVE``.
 
 Alongside the verdict, step 8's search metrics are attached to the result
     (:class:`metrics.Mining`): the candidate count, the ground truth's rank among the
     ranked candidates and the match tier.
+
+    ``rank_sorts`` names further candidate sorts to rank the ground truth under
+    (step 8b, :func:`_rerank`): the candidates step 8 mined are read again in each
+    sort's order, without re-mining, so ``mining.ranks`` compares the orderings over
+    one identical candidate set. ``candidate_sort`` stays the row's own sort — its
+    verdict, notes and ``gt_rank``.
 
     ``instrument_source`` runs step 2a — gamerv's source instrumenter — before
     each compile, so the built binary reports its function-local variables.
@@ -424,8 +497,9 @@ Alongside the verdict, step 8's search metrics are attached to the result
         mode = refinement_mode or config.REFINEMENT_MODE
         strategy = threshold_strategy or config.THRESHOLD_STRATEGY
         sort = candidate_sort or config.CANDIDATE_SORT
+        goal = objective or config.OBJECTIVE
         print(f"    refinement mode: {mode}   threshold strategy: {strategy}"
-              f"   candidate sort: {sort}")
+              f"   candidate sort: {sort}   objective: {goal}")
 
         # Step 7 — pick the trace to check phi against (the last invalid run).
         # Fault localization is intentionally skipped: compare_refinement re-mines
@@ -447,11 +521,12 @@ Alongside the verdict, step 8's search metrics are attached to the result
             term_rules.ensure(game, run_dir)
 
         # Step 8 — is phi a valid refinement? (mode/strategy chosen above)
-        print(f"[8] check phi as refinement   (phi = {case.phi})")
+        noun = "bug condition" if goal == "bug-condition" else "refinement"
+        print(f"[8] check phi as {noun}   (phi = {case.phi})")
         with _phase(timings, "refine"):
             cont = gamerv.compare_refinement(run_dir, case.phi, None,
                                              mode=mode, strategy=strategy,
-                                             candidate_sort=sort)
+                                             candidate_sort=sort, objective=goal)
 
         # The search metrics for the row: how many top-scored candidate refinements
         # the miner produced and where the ground truth sits among them, read off the
@@ -466,6 +541,17 @@ Alongside the verdict, step 8's search metrics are attached to the result
             below = " [below the top score]" if mining.below_top else ""
             print(f"    mined {mining.candidates} top-scored candidate refinement(s) "
                   f"— {rank}{tier}{union}{below}")
+            if case.phi.strip():
+                mining.ranks = {sort: mining.gt_rank}
+
+        # Step 8b — the same candidates, read in each further sort's order.
+        extra = [s for s in rank_sorts if s != sort]
+        if extra and mining.ranks and cont.status != "ERROR":
+            print(f"[8b] re-rank the same candidates under: {', '.join(extra)}")
+            with _phase(timings, "rerank"):
+                mining.ranks.update(_rerank(run_dir, case, extra, mining, cont.status,
+                                            mode=mode, strategy=strategy,
+                                            objective=goal))
 
         # Step 9 — emit result, carrying gamerv's one-line verdict as the note.
         return result(cont.status, r_text=cont.r_text,
