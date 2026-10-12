@@ -1,8 +1,8 @@
 """Content-addressed cache of step-5 raw logs, one slot per game+branch.
 
 A row's recorded traces (events/video/audio/predicate trace, *before* validation)
-depend only on the built game and the ``.rec`` tapes — never on the property,
-refinement mode, or threshold strategy, which are all applied later in steps 6/8.
+depend only on the built game and the ``.rec`` tapes — never on the property or
+the candidate sort, which are applied later in steps 6/8.
 So when the same game replays the same tapes again, the recording can be skipped:
 the cached logs are restored into ``logs/`` and re-validated.
 

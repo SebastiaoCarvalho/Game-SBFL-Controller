@@ -9,8 +9,9 @@ diffs 120 rows by hand, so this does it:
 
 The first folder is the **before** run (A), the second the **after** run (B), and
 every reading is "A -> B". The headline is the run's own criterion — a row is
-SUCCESS when a single mined ``R`` establishes ``phi`` (see the README's *Result
-statuses*) — so rows are split into the three groups a fix is judged by:
+SUCCESS when ``phi`` ties the top Ochiai score and a single top-ranked bug condition
+``B`` contains it (see the README's *Result statuses*) — so rows are split into the
+three groups a fix is judged by:
 
     gained   anything -> SUCCESS        the fix reached these rows
     lost     SUCCESS -> anything        the fix cost these rows
@@ -19,7 +20,7 @@ statuses*) — so rows are split into the three groups a fix is judged by:
 with one line per changed row, in the shape the question is asked in::
 
     row 43  Super Tux    collision_wall_...   INCONCLUSIVE -> SUCCESS
-    row 56  Witch Blast  player_hurt_...      SUCCESS -> REFINEMENT_NOT_FOUND
+    row 56  Witch Blast  player_hurt_...      SUCCESS -> CONDITION_NOT_FOUND
 
 Then the same change, aggregated: the classification counts side by side with
 their deltas, the gained/lost split per game and per bug category, and the
@@ -32,7 +33,7 @@ a fix can leave every verdict where it stood and still have moved phi from rank
 mined with a ground truth in **both** runs (the only rows whose two rank
 distributions are comparable) it reports
 
-    in the top k      how often phi was among the first k mined refinements, at
+    in the top k      how often phi was among the first k mined candidates, at
                       the cut-offs ``--top`` names (1, 3, 5, 10 by default) — the
                       row a results table quotes, since k is how far a user reads
     ranked at all     and its two complements: found but unranked (only an
@@ -61,8 +62,12 @@ the runs is flagged.
 uses nothing else. The ``closer`` / ``further`` annotation on the *other* changes
 is a reading aid over :data:`PROGRESS`, a heuristic ordering of how much a status
 settled (ERROR decided nothing, FAIL decided phi and rejected it,
-REFINEMENT_NOT_FOUND says phi was right and the search missed it) — useful for
+CONDITION_NOT_FOUND says phi was right and the search missed it) — useful for
 skimming, not a second criterion.
+
+An archived run's statuses are read under today's names (``report.LEGACY_STATUS``:
+REFINEMENT_NOT_FOUND is CONDITION_NOT_FOUND), so a comparison across the rename shows
+no change that is only a change of word.
 
     python src/compare.py A B --out cmp.txt     # also write it to a file
     python src/compare.py A B --csv cmp.csv     # the per-case table, machine-readable
@@ -93,13 +98,14 @@ from report import Row
 #:   ERROR           the experiment itself broke: nothing was learned
 #:   NEEDS_MANUAL    the row has not been run yet
 #:   SKIPPED         no ground truth to decide
-#:   INCONCLUSIVE    nothing to decide phi against (no trace / no violation / no R)
+#:   INCONCLUSIVE    nothing to decide phi against (no trace / no violation / no
+#:                   candidate)
 #:   VARIABLE_NOT_FOUND  phi names a quantity the game never exports
 #:   FAIL            phi was decided — and rejected
-#:   REFINEMENT_NOT_FOUND  phi is right, a single mined R just did not establish it
+#:   CONDITION_NOT_FOUND  phi is right, no single top-ranked B contains it
 #:   SUCCESS         the goal
 PROGRESS = ("ERROR", "NEEDS_MANUAL", "SKIPPED", "INCONCLUSIVE",
-            "VARIABLE_NOT_FOUND", "FAIL", "REFINEMENT_NOT_FOUND", "SUCCESS")
+            "VARIABLE_NOT_FOUND", "FAIL", "CONDITION_NOT_FOUND", "SUCCESS")
 
 GOAL = "SUCCESS"
 
@@ -108,7 +114,7 @@ GOAL = "SUCCESS"
 MOVES_SHOWN = 20
 
 #: The cut-offs the ground-truth rank is counted at ("phi was in the top k mined
-#: refinements"), overridable with ``--top``. These are the numbers a results
+#: candidates"), overridable with ``--top``. These are the numbers a results
 #: table quotes: how often a user reaching for the fix finds it without reading
 #: far.
 TOP_K = (1, 3, 5, 10)
@@ -120,7 +126,7 @@ TOP_K = (1, 3, 5, 10)
 def _key(row: Row) -> tuple[str, str]:
     """The case's identity: its game and the mutant branch it ran.
 
-    Not the dataset row number — that is a position in ``dataset.csv`` and moves
+    Not the dataset row number — that is a position in the dataset and moves
     when a row is inserted above it, which would silently compare two different
     mutants. The branch is the mutant.
     """
@@ -408,7 +414,7 @@ def _mining_summary(pairs: list[Pair]) -> list[str]:
         f"  ground truth found:                   {a_found:>5} -> {b_found}  "
         f"({_pct(a_found, len(a_mined))} -> {_pct(b_found, len(b_mined))}, "
         f"{_delta(b_found - a_found)})",
-        f"  rejected by the single-refinement rule:"
+        f"  rejected by the single-candidate rule: "
         f"{sum(1 for p in a_mined if p.a.union_only):>6} -> "
         f"{sum(1 for p in b_mined if p.b.union_only)}  (union only)",
         f"  median candidates (own mined rows):   "
@@ -461,7 +467,7 @@ def _status_cell(p: Pair) -> str:
 
 
 def _moves_table(pairs: list[Pair], limit: int | None) -> list[str]:
-    """The candidate-set moves, biggest first: how many top-scored refinements each
+    """The candidate-set moves, biggest first: how many top-ranked candidates each
     case mined in each run.
 
     A fix can leave every verdict where it was and still have cut a candidate set
@@ -531,7 +537,7 @@ def _rank_summary(pairs: list[Pair], top_k: tuple[int, ...]) -> list[str]:
     distributions are comparable at all.
 
     Read top-down: the ``top k`` lines are the ones a results table quotes (how
-    often a user reaching for the fix finds it in the first k refinements), the
+    often a user reaching for the fix finds it in the first k candidates), the
     rule below them summarises the same rows as medians and a reciprocal rank.
     """
     both = [p for p in pairs if p.a.mined and p.b.mined]
@@ -670,8 +676,8 @@ def _rank_moves(pairs: list[Pair], limit: int | None) -> list[str]:
 
 def _settings_lines(cmp: Comparison) -> list[str]:
     """The knobs that differed between the runs — the first thing to check when a
-    comparison shows a big move, since a run under another candidate sort or
-    threshold strategy is not the same experiment.
+    comparison shows a big move, since a run under another candidate sort — or an
+    archived run under another objective — is not the same experiment.
 
     A run written before ``settings.json`` existed records none; the line says so
     rather than pretending the knobs matched.
@@ -691,8 +697,7 @@ def _settings_lines(cmp: Comparison) -> list[str]:
             if a.get(k) != b.get(k)]
     if not keys:
         return ["  identical knobs on both runs "
-                f"({a.get('candidate_sort')} / {a.get('refinement_mode')} / "
-                f"{a.get('threshold_strategy')})."]
+                f"({a.get('objective')} / {a.get('candidate_sort')})."]
     width = max(len(k) for k in keys)
     return ([f"  {k:<{width}}  {a.get(k)!r} -> {b.get(k)!r}" for k in keys]
             + ["  a knob that differs is a second explanation for every change below."])
@@ -773,7 +778,7 @@ def render(cmp: Comparison, limit: int | None = MOVES_SHOWN,
     lines += ["",
               "  closer/further rank the two statuses on how much they settled",
               "  (ERROR < NEEDS_MANUAL < SKIPPED < INCONCLUSIVE < VARIABLE_NOT_FOUND",
-              "  < FAIL < REFINEMENT_NOT_FOUND < SUCCESS) — a reading aid, not a",
+              "  < FAIL < CONDITION_NOT_FOUND < SUCCESS) — a reading aid, not a",
               "  second success criterion."]
 
     lines += _section("CLASSIFICATIONS", _classification_table(cmp.pairs))

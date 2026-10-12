@@ -3,27 +3,31 @@
 how big the searched state was, how big the mined candidate set was, and how deep in
 it the ground truth sat.
 
-Step 8 records, per row, how many **top-scored** sound candidate refinements the miner
+Step 8 records, per row, how many **top-ranked** candidate bug conditions the miner
 produced and where the ground-truth phi ranked among them (``metrics.Mining``);
 ``run_experiment`` writes both columns into the run's ``mining.csv``. Both quantities
-are over the top-scored tier of gamerv's ranked list only — the refinements a user
-actually reads before reaching the fix; the lower-scoring sound separators are kept in
-``refinement_separators.log`` and deliberately excluded here, since a count that mixed
-score tiers would answer no question about the method (see metrics.py). The same record
+are over the top-ranked tier of gamerv's Ochiai ranking only — the candidates a user
+actually reads before reaching the fix; the lower-scoring candidates are kept in
+``bug_conditions.log`` and deliberately excluded here, since a count that mixed score
+tiers would answer no question about the method (see metrics.py). The same record
 carries the size of the state the miner searched (``variables`` /
 ``varying_variables``), and ``full.csv`` carries every row's status, bug category and
 per-phase wall clock. This module turns them into the figures a results section wants:
 
   success_by_fault_type.png
                         the **results per bug category**: one horizontal bar per
-                        ``Fault Type``, split into success / fail / undecided / not
-                        evaluated, with the success rate at the bar's end. Grouped
+                        ``Fault Type``, split into success / fail / not mined /
+                        undecided / not evaluated, with the success rate at the
+                        bar's end. Grouped
                         under their parent (non-temporal, temporal) so the two blocks
                         compare at a glance.
   success_by_parent.png the same split for the two parent categories alone — the cut
                         that says whether the method is weaker on temporal faults.
+  success_by_game.png   the same split per game, with the run's pooled success rate in
+                        the subtitle (a pooled bar would be five times as long as the
+                        rest and squeeze them).
   time.png              **time** of the method's own phases: small multiples, one
-                        panel for validate + refine together and one for each, a box
+                        panel for validate + localize together and one for each, a box
                         per game. Build and record are left out — they cost what the
                         game and its recorded data cost, not what the method does.
                         Each panel has its own axis; a shared one would flatten the
@@ -32,7 +36,7 @@ per-phase wall clock. This module turns them into the figures a results section 
                         miner searched beside the ones that actually vary there (the
                         vocabulary it builds atoms over) — what the game logs vs. what
                         the search works with.
-  time_vs_space.png     the refine phase's wall clock against the varying-variable
+  time_vs_space.png     the localize phase's wall clock against the varying-variable
                         count, one panel per game with the other games' rows drawn in
                         gray behind it: does the analysis cost grow with the state?
   candidates.png        a **boxplot of the candidate-set size**, one box per game,
@@ -56,6 +60,17 @@ per-phase wall clock. This module turns them into the figures a results section 
                         positions in the same ranked list (its size, and an index into
                         it), so they share one axis — log-scaled when the two spans are
                         too far apart to read linearly.
+  states_vs_rank.png    the ground truth's **rank against the labelled states** the
+                        ranking was learned from (good + bad per row), one box per
+                        bin, with Spearman's rho over the unbinned counts: does the
+                        truth rank deeper when a row has few examples? Over the rows
+                        whose ground truth was found; the rank is the run's own
+                        sort's.
+  states_vs_rank_by_game.png
+                        the same figure **per game**: small multiples, the pooled
+                        ``all`` panel first, then one per game, on the same bins and
+                        one shared rank axis, each panel with its own rho — does the
+                        relation hold inside every game, or is it one game's rows?
 
 Only rows that actually mined are plotted in the mining figures: a blank
 ``candidates`` cell means the row never reached the point of persisting a mining
@@ -68,7 +83,8 @@ its run predates the columns). How many rows were dropped either way is printed 
 each figure's subtitle, so a box is never read as covering more rows than it does.
 
 Written after the CSVs, from the CSVs — so the same code re-plots an old run (a figure
-whose columns the old run lacks is skipped with a note):
+whose columns the old run lacks is skipped with a note; a run older than the
+good/bad state columns gets them from ``scripts/backfill_states.py``):
 
     python src/plots.py results/run_20260901_223129
     python src/plots.py results/run_20260901_223129 --figure ranks --out /tmp/r.png
@@ -100,6 +116,9 @@ CANDIDATES_PNG = "candidates.png"
 RANKS_PNG = "candidates_vs_rank.png"
 FAULT_TYPES_PNG = "success_by_fault_type.png"
 PARENTS_PNG = "success_by_parent.png"
+GAMES_PNG = "success_by_game.png"
+STATES_PNG = "states_vs_rank.png"
+STATES_GAMES_PNG = "states_vs_rank_by_game.png"
 TIME_PNG = "time.png"
 SPACE_PNG = "space.png"
 TIME_SPACE_PNG = "time_vs_space.png"
@@ -129,13 +148,17 @@ ACCENT2_FILL = "#fbd9cc"
 #: The two neutral outcomes of a success bar (undecided, not evaluated) and the
 #: context points of the time-vs-space panels. Neutral on purpose: success and fail
 #: are the result, these are what the method could not (or was not asked to) decide.
-#: Stacked after orange they validate as an adjacent run (worst normal-vision
-#: Delta E 18.6, worst CVD 9.2 — the validator's gates are 15 and 8); the lighter one
-#: sits at 1.96:1 on the surface, so its identity rides on the legend and the text
-#: report, never on the fill alone.
+#: Stacked after aqua (a success bar's "not mined") they validate as an adjacent run
+#: — blue, orange, aqua, gray, light gray: worst normal-vision Delta E 15.7, worst
+#: CVD 8.0 (aqua vs gray, deutan, a hair under the target of 8 — legal here, the
+#: segments are told apart by their 2px surface gaps and the legend too). The
+#: lighter gray sits at 1.96:1 on the surface and aqua at 2.74:1, so identity rides
+#: on the legend and the text report, never on the fill alone.
 NEUTRAL = "#7f7e78"
 NEUTRAL_LIGHT = "#b8b7ae"
-#: Slots 3 and 4 (aqua, yellow), for the by-sort figure's third and fourth series.
+#: Slots 3 and 4 (aqua, yellow), for the by-sort figure's third and fourth series;
+#: aqua also fills a success bar's "not mined" segment (yellow cannot: beside the
+#: fail segment's orange it is Delta E 13.7, under the normal-vision gate of 15).
 #: Blue, orange, aqua, yellow is the reference palette's own order and validates as
 #: an adjacent run (worst CVD Delta E 9.1, worst normal-vision 22.9). Both sit below
 #: 3:1 on the surface, so every box there is also named in text under it.
@@ -233,12 +256,12 @@ def _grouped(rows: list[MinedRow]) -> dict[str, list[MinedRow]]:
 #: The pipeline phases the method itself runs. Build (compile the mutant) and record
 #: (replay its tapes) cost what the game and its recorded data cost, not what the
 #: method does, so the time figure leaves them out.
-METHOD_PHASES = ("validate", "refine")
+METHOD_PHASES = ("validate", "localize")
 
 
 def _seconds(row: report.Row, phases: str | tuple[str, ...]) -> float | None:
     """A row's wall clock summed over ``phases``, or None unless every one of them
-    ran on it (a ``-`` cell): a case that stopped before refine would otherwise
+    ran on it (a ``-`` cell): a case that stopped before localize would otherwise
     report its validation alone as the method's whole cost."""
     cells = dict(row.phases)
     total = 0.0
@@ -273,14 +296,19 @@ def _new_axes(n_groups: int, width_per_group: float = 1.9, height: float = 4.8):
     return fig, ax
 
 
-def _new_panels(n: int, width: float, height: float, **kw):
-    """A row of ``n`` panels on the palette's surface (small multiples)."""
-    fig, axes = _pyplot().subplots(1, n, figsize=(width, height), dpi=200,
+def _new_panels(n: int, width: float, height: float, nrows: int = 1, **kw):
+    """``n`` panels on the palette's surface (small multiples), filled left to right
+    over ``nrows`` rows; a grid cell past the ``n``-th is hidden."""
+    ncols = -(-n // nrows)
+    fig, axes = _pyplot().subplots(nrows, ncols, figsize=(width, height), dpi=200,
                                    squeeze=False, **kw)
     fig.patch.set_facecolor(SURFACE)
-    for ax in axes[0]:
+    flat = [ax for row in axes for ax in row]
+    for ax in flat[n:]:
+        ax.set_visible(False)
+    for ax in flat[:n]:
         ax.set_facecolor(SURFACE)
-    return fig, list(axes[0])
+    return fig, flat[:n]
 
 
 def _box_style(color: str, fill: str) -> dict:
@@ -393,13 +421,21 @@ def _fmt_seconds(s: float) -> str:
 # --------------------------------------------------------------------------
 # Figure — success per bug category / per parent category
 # --------------------------------------------------------------------------
+#: The status a success bar calls "not mined": phi scores at the top of the ranking
+#: (or above it), but no top-ranked candidate the miner produced contains it. phi
+#: *was* decided, so it is not undecided; the data does not reject it, so it is not a
+#: FAIL either — the predicate was simply not mined. Its own segment, beside fail:
+#: either way the developer reading the ranking does not meet the ground truth.
+NOT_MINED = "CONDITION_NOT_FOUND"
+
 #: The statuses a success bar folds into "undecided": the method ran but could not
-#: decide phi. Everything else that is neither SUCCESS nor FAIL (SKIPPED,
+#: decide phi — it reads a quantity no state reports, or there was nothing to score
+#: it against. Everything else that is neither SUCCESS, FAIL nor not mined (SKIPPED,
 #: NEEDS_MANUAL, ERROR, an unknown verdict word) was never evaluated.
-UNDECIDED = ("REFINEMENT_NOT_FOUND", "VARIABLE_NOT_FOUND", "INCONCLUSIVE")
+UNDECIDED = ("VARIABLE_NOT_FOUND", "INCONCLUSIVE")
 
 #: The segments of a success bar, in stacking order: ``(label, fill)``.
-OUTCOMES = (("success", ACCENT), ("fail", ACCENT2),
+OUTCOMES = (("success", ACCENT), ("fail", ACCENT2), ("not mined", ACCENT3),
             ("undecided", NEUTRAL), ("not evaluated", NEUTRAL_LIGHT))
 
 
@@ -408,14 +444,17 @@ def _outcome(status: str) -> str:
         return "success"
     if status == "FAIL":
         return "fail"
+    if status == NOT_MINED:
+        return "not mined"
     return "undecided" if status in UNDECIDED else "not evaluated"
 
 
 def _outcome_note(rows: list[report.Row]) -> str:
-    """The subtitle clause naming which statuses each neutral segment holds — only
-    the ones this run produced, in the report's own abbreviations."""
+    """The subtitle clause naming which statuses each segment past fail holds — only
+    the ones this run produced, in the report's own abbreviations (so "not mined"
+    reads back to the C_NF of report.txt)."""
     parts = []
-    for bucket in ("undecided", "not evaluated"):
+    for bucket in ("not mined", "undecided", "not evaluated"):
         seen = [report.ABBREV.get(s, s) for s in report.statuses_present(rows)
                 if _outcome(s) == bucket]
         if seen:
@@ -520,6 +559,21 @@ def _render_parents(run: _Run, out: Path) -> Path | None:
                          "Results per parent category", _outcomes_subtitle(rows))
 
 
+def _render_games(run: _Run, out: Path) -> Path | None:
+    rows = run.rows
+    if not rows:
+        print("    no rows in this run — success-by-game chart skipped")
+        return None
+    # No pooled `all` bar: bar length is the row count, so a bar five times longer
+    # would squeeze every game's bar into a fifth of the width. The pooled rate
+    # rides in the subtitle instead.
+    succ = sum(1 for r in rows if _outcome(r.status) == "success")
+    return draw_outcomes([(None, report.by_game(rows))], out, "Results per game",
+                         f"{succ}/{len(rows)} SUCCESS overall "
+                         f"({100.0 * succ / len(rows):.1f}%) · "
+                         + _outcomes_subtitle(rows))
+
+
 # --------------------------------------------------------------------------
 # Figure — time per case, per pipeline phase
 # --------------------------------------------------------------------------
@@ -530,7 +584,7 @@ def _game_groups(rows: list[report.Row]) -> list[tuple[str, list[report.Row]]]:
 
 
 def draw_time(rows: list[report.Row], out_path: Path, subtitle: str) -> Path:
-    """The method's time per case — validate and refine together, then each alone —
+    """The method's time per case — validate and localize together, then each alone —
     one panel each, a horizontal box per game."""
     phases = ([(METHOD_PHASES, " + ".join(METHOD_PHASES))]
               + [(p, p) for p in METHOD_PHASES])
@@ -564,22 +618,23 @@ def draw_time(rows: list[report.Row], out_path: Path, subtitle: str) -> Path:
     axes[0].set_yticklabels([f"{g}  n={len(rs)}" for g, rs in groups],
                             fontsize=10, color=INK_SECONDARY)
     axes[0].set_ylim(len(groups) - 0.5, -0.5)          # first group on top
-    top = _figure_heading(fig, "Method time per case: validate and refine", subtitle)
+    top = _figure_heading(fig, "Method time per case: validate and localize", subtitle)
     return _save(fig, out_path, top)
 
 
 _PHASE_NOTE = ("validate = monitor the traces against the spec · "
-               "refine = mine the candidates and decide phi (steps 7a-8)\n"
+               "localize = rank the bug conditions and decide phi (steps 7a-8)\n"
                "build and record are left out: they depend on the game and its data, "
                "not on the method\n"
-               "a case that stopped before refine is left out of the refine panels")
+               "a case that stopped before localize is left out of the localize "
+               "panels")
 
 
 def _render_time(run: _Run, out: Path) -> Path | None:
     rows = [r for r in run.rows
             if any(_seconds(r, p) is not None for p in METHOD_PHASES)]
     if not rows:
-        print("    no row recorded a validate or refine time — time figure skipped")
+        print("    no row recorded a validate or localize time — time figure skipped")
         return None
     return draw_time(rows, out,
                      f"{len(rows)} case(s) · each panel has its own scale · "
@@ -676,14 +731,14 @@ def _render_space(run: _Run, out: Path) -> Path | None:
 # --------------------------------------------------------------------------
 # Figure — analysis time against the size of the state
 # --------------------------------------------------------------------------
-_REFINE = "refine"
+_LOCALIZE = "localize"
 
 
 def draw_time_vs_space(rows: list[report.Row], out_path: Path, subtitle: str) -> Path:
     """One panel per game on shared axes: that game's rows in the accent, every other
     row in gray behind them, so each game reads against the whole run."""
     games = report.by_game(rows)
-    point = {id(r): (r.varying, _seconds(r, _REFINE)) for r in rows}
+    point = {id(r): (r.varying, _seconds(r, _LOCALIZE)) for r in rows}
     fig, axes = _new_panels(len(games), width=max(6.8, 3.0 * len(games) + 1.0),
                             height=4.3, sharex=True, sharey=True)
     for ax, (game, group) in zip(axes, games):
@@ -705,24 +760,25 @@ def draw_time_vs_space(rows: list[report.Row], out_path: Path, subtitle: str) ->
     for ax in axes:
         ax.set_xlabel("varying variables" + (" (log)" if logx else ""),
                       fontsize=9.5, color=INK_SECONDARY)
-    axes[0].set_ylabel("refine time, seconds" + (" (log)" if logy else ""),
+    axes[0].set_ylabel("localize time, seconds" + (" (log)" if logy else ""),
                        fontsize=10, color=INK_SECONDARY)
-    top = _figure_heading(fig, "Refine time vs. variables searched", subtitle)
+    top = _figure_heading(fig, "Localize time vs. variables searched", subtitle)
     return _save(fig, out_path, top)
 
 
 def _render_time_space(run: _Run, out: Path) -> Path | None:
-    rows = [r for r in _sized(run.rows) if _seconds(r, _REFINE) is not None]
+    rows = [r for r in _sized(run.rows) if _seconds(r, _LOCALIZE) is not None]
     if not rows:
-        print("    no row carries both a variable count and a refine time — "
+        print("    no row carries both a variable count and a localize time — "
               "time-vs-space figure skipped")
         return None
     missed = len(run.rows) - len(rows)
-    tail = f", {missed} excluded (no variable count or no refine phase)" if missed else ""
+    tail = (f", {missed} excluded (no variable count or no localize phase)"
+            if missed else "")
     return draw_time_vs_space(
         rows, out, f"{len(rows)} row(s){tail} · one point per row · "
-                   f"gray = the other games' rows\nrefine = mine the candidates "
-                   f"and decide phi (steps 7a-8)")
+                   f"gray = the other games' rows\nlocalize = rank the bug "
+                   f"conditions and decide phi (steps 7a-8)")
 
 
 # --------------------------------------------------------------------------
@@ -824,6 +880,18 @@ def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str,
     series = [[r.candidates for r in groups[g]] for g in labels]
 
     fig, ax = _new_axes(len(series))
+    log = _log_if_wide(ax, _boxes(ax, labels, series), headroom=2.0)
+    scope = "Top-ranked candidate" if top_scored else "Candidate"
+    _chrome(ax, ("top-ranked candidate bug conditions" if top_scored
+                 else "candidate conditions mined") + (" (log scale)" if log else ""),
+            f"{scope} bug conditions per row", subtitle)
+    return _save(fig, out_path)
+
+
+def _boxes(ax, labels: list[str], series: list[list[float]]) -> list[float]:
+    """One box per group with every row as a point beside it, the median written
+    next to it, and the groups named under the axis with their row count. Returns
+    every value drawn, for the caller's scale decision."""
     ax.boxplot(series, **_box_style(ACCENT, ACCENT_FILL))
     positions = list(range(1, len(series) + 1))
     _scatter(ax, [float(p) for p in positions], series, ACCENT)
@@ -842,12 +910,7 @@ def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str,
     ax.set_xticks(positions)
     ax.set_xticklabels([f"{g}\nn={len(v)}" for g, v in zip(labels, series)],
                        fontsize=10, color=INK_SECONDARY)
-    log = _log_if_wide(ax, [v for vals in series for v in vals], headroom=2.0)
-    scope = "Top-scored candidate" if top_scored else "Candidate"
-    _chrome(ax, ("top-scored candidate refinements" if top_scored
-                 else "candidate refinements mined") + (" (log scale)" if log else ""),
-            f"{scope} refinements per row", subtitle)
-    return _save(fig, out_path)
+    return [v for vals in series for v in vals]
 
 
 # --------------------------------------------------------------------------
@@ -883,6 +946,120 @@ def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str,
                          f"{scope} / ground-truth rank",
                          f"{scope.capitalize()} vs. rank of the ground truth",
                          subtitle)
+
+
+# --------------------------------------------------------------------------
+# Figure — ground-truth rank against the labelled states
+# --------------------------------------------------------------------------
+#: The bins of labelled states per row (good + bad), ``(label, lowest, highest)``.
+#: Fixed, so two runs' figures bin alike, and finest at the bottom, where most rows
+#: are: a row needs one violation to mine at all, and many have exactly one good
+#: state beside it. An empty bin is not drawn.
+STATE_BINS = (("1", 1, 1), ("2", 2, 2), ("3–4", 3, 4), ("5–9", 5, 9),
+              ("10+", 10, None))
+
+
+def _examples(row: report.Row) -> int:
+    """The labelled states a row's ranking was learned from: good + bad."""
+    return row.good_states + row.bad_states
+
+
+def _in_bin(row: report.Row, lo: int, hi: int | None) -> bool:
+    return _examples(row) >= lo and (hi is None or _examples(row) <= hi)
+
+
+def _spearman(xs: list[int], ys: list[int]) -> float | None:
+    """Spearman's rank correlation (ties share their mean rank), or None where it is
+    undefined: fewer than three rows, or one side constant."""
+    if len(xs) < 3:
+        return None
+    try:
+        return statistics.correlation(xs, ys, method="ranked")
+    except statistics.StatisticsError:
+        return None
+
+
+def _fmt_rho(rho: float | None) -> str:
+    return "undefined" if rho is None else f"{rho:.2f}".replace("-", "−")
+
+
+def draw_states_vs_rank(rows: list[report.Row], out_path: Path, subtitle: str) -> Path:
+    """The ground truth's rank per bin of labelled states (good + bad), one box per
+    bin: does a deep rank go with few examples?
+
+    Spearman's rho over the unbinned counts goes in the title's caption — the bins
+    are for the eye, the coefficient is the number to quote.
+    """
+    labels, series = [], []
+    for label, lo, hi in STATE_BINS:
+        ranks = [r.gt_rank for r in rows if _in_bin(r, lo, hi)]
+        if ranks:
+            labels.append(label)
+            series.append(ranks)
+    fig, ax = _new_axes(len(series))
+    log = _log_if_wide(ax, _boxes(ax, labels, series), headroom=2.0)
+    rho = _spearman([_examples(r) for r in rows], [r.gt_rank for r in rows])
+    ax.set_xlabel("labelled states per row (good + bad)", fontsize=10,
+                  color=INK_SECONDARY)
+    _chrome(ax, "rank of the ground truth, 1 = top" + (" (log scale)" if log else ""),
+            "Ground-truth rank vs. labelled states per row",
+            f"Spearman ρ = {_fmt_rho(rho)} over the unbinned counts · {subtitle}")
+    return _save(fig, out_path)
+
+
+def draw_states_vs_rank_by_game(rows: list[report.Row], out_path: Path,
+                                subtitle: str) -> Path:
+    """:func:`draw_states_vs_rank` in small multiples: the pooled ``all`` panel, then
+    one per game, three to a row.
+
+    Every panel has the same bins at the same positions (any bin some row of the run
+    falls in; a game with no row there leaves the slot empty) and one shared rank
+    axis, so a box reads against the same box in the next panel. Each panel names
+    its own row count per bin and its own rho — a game's rows are few, and a rho
+    over a handful of them is the number that says so.
+    """
+    groups = _game_groups(rows)
+    bins = [b for b in STATE_BINS if any(_in_bin(r, b[1], b[2]) for r in rows)]
+    ncols = min(3, len(groups))
+    nrows = -(-len(groups) // ncols)
+    fig, axes = _new_panels(len(groups), width=max(6.8, (0.85 * len(bins) + 0.9)
+                                                    * ncols + 0.8),
+                            height=3.5 * nrows + 2.0, nrows=nrows, sharey=True)
+    positions = list(range(1, len(bins) + 1))
+    for i, (ax, (game, group)) in enumerate(zip(axes, groups)):
+        series = [[r.gt_rank for r in group if _in_bin(r, lo, hi)]
+                  for _label, lo, hi in bins]
+        drawn = [(p, v) for p, v in zip(positions, series) if v]
+        ax.boxplot([v for _p, v in drawn], positions=[p for p, _v in drawn],
+                   manage_ticks=False, **_box_style(ACCENT, ACCENT_FILL))
+        _scatter(ax, [float(p) for p, _v in drawn], [v for _p, v in drawn], ACCENT)
+        for x, vals in drawn:
+            med = statistics.median(vals)
+            ax.annotate(f"{med:g}", xy=(x + 0.26, med), va="center", ha="left",
+                        fontsize=8.5, color=INK_SECONDARY, zorder=4)
+        ax.set_xlim(0.5, len(bins) + 0.5)
+        ax.set_xticks(positions)
+        ax.set_xticklabels([f"{label}\nn={len(v)}" if v else label
+                            for (label, _lo, _hi), v in zip(bins, series)],
+                           fontsize=9, color=INK_SECONDARY)
+        _style_axes(ax)
+        ax.set_title(f"{game}  n={len(group)}", loc="left", fontsize=11, color=INK,
+                     pad=20)
+        rho = _spearman([_examples(r) for r in group], [r.gt_rank for r in group])
+        ax.annotate(f"ρ = {_fmt_rho(rho)}", xy=(0, 1), xycoords="axes fraction",
+                    xytext=(0, 6), textcoords="offset points", fontsize=9,
+                    color=INK_MUTED, ha="left", va="bottom")
+        if i + ncols >= len(groups):         # nothing drawn below this panel
+            ax.set_xlabel("labelled states (good + bad)", fontsize=9.5,
+                          color=INK_SECONDARY)
+    # The rank axis is shared, so one scale decision over every row covers them all.
+    log = _log_if_wide(axes[0], [r.gt_rank for r in rows], headroom=2.0)
+    for ax in axes[::ncols]:
+        ax.set_ylabel("rank of the ground truth" + (" (log)" if log else ""),
+                      fontsize=10, color=INK_SECONDARY)
+    top = _figure_heading(fig, "Ground-truth rank vs. labelled states per row, "
+                               "per game", subtitle)
+    return _save(fig, out_path, top)
 
 
 # --------------------------------------------------------------------------
@@ -958,17 +1135,73 @@ def _render_ranks(run: _Run, out: Path) -> Path | None:
                       top_scored)
 
 
+def _states_rows(run: _Run, figure: str) -> tuple[list[report.Row], str] | None:
+    """The rows both states figures draw — found, and carrying their state counts —
+    with the caption saying which rows were left out and which sort ranked them;
+    None, with a note naming ``figure``, when there is no such row."""
+    counted = [r for r in run.rows if r.candidates is not None
+               and r.good_states is not None and r.bad_states is not None]
+    if not counted:
+        print("    no row carries its good/bad state counts (run predates the "
+              f"columns? see scripts/backfill_states.py) — {figure} skipped")
+        return None
+    found = [r for r in counted if r.gt_rank]
+    if not found:
+        print(f"    no row's ground truth was ranked — {figure} skipped")
+        return None
+    left_out = []
+    if len(counted) > len(found):
+        left_out.append(f"{len(counted) - len(found)} excluded (not found)")
+    uncounted = sum(1 for r in run.rows if r.candidates is not None) - len(counted)
+    if uncounted:
+        left_out.append(f"{uncounted} without state counts")
+    # A multi-sort run ranks the same rows several ways; this figure draws one.
+    sorts = report.ranked_sorts(run.rows)
+    sort_note = run.sort_note
+    if len(sorts) > 1:
+        own = (report.read_settings(run.dir) or {}).get("candidate_sort") or sorts[0]
+        sort_note = (f"\nrank = position under the run's own candidate sort ({own}); "
+                     f"the other sorts are in {SORTS_PNG}")
+    return found, (f"{len(found)} row(s) whose ground truth was found"
+                   + "".join(f", {s}" for s in left_out)
+                   + "\ngood = a trigger state where the spec held · bad = a "
+                     "violation · pooled over the row's traces"
+                   + f"\n{_BOX_LEGEND}"
+                   + sort_note)
+
+
+def _render_states(run: _Run, out: Path) -> Path | None:
+    drawn = _states_rows(run, "states figure")
+    if drawn is None:
+        return None
+    found, caption = drawn
+    return draw_states_vs_rank(found, out, caption)
+
+
+def _render_states_by_game(run: _Run, out: Path) -> Path | None:
+    drawn = _states_rows(run, "states-by-game figure")
+    if drawn is None:
+        return None
+    found, caption = drawn
+    return draw_states_vs_rank_by_game(
+        found, out, "ρ = Spearman over each panel's unbinned counts, undefined below "
+                    "3 rows · " + caption)
+
+
 #: ``figure name -> (renderer, default file name)``. ``render`` draws them all; the
 #: CLI can draw one by name.
 FIGURES = {
     "fault-types": (_render_fault_types, FAULT_TYPES_PNG),
     "parents": (_render_parents, PARENTS_PNG),
+    "games": (_render_games, GAMES_PNG),
     "time": (_render_time, TIME_PNG),
     "space": (_render_space, SPACE_PNG),
     "time-space": (_render_time_space, TIME_SPACE_PNG),
     "candidates": (_render_candidates, CANDIDATES_PNG),
     "ranks": (_render_ranks, RANKS_PNG),
     "sorts": (_render_ranks_by_sort, SORTS_PNG),
+    "states": (_render_states, STATES_PNG),
+    "states-games": (_render_states_by_game, STATES_GAMES_PNG),
 }
 
 

@@ -9,6 +9,7 @@ decisions baked in here (from the plan):
     ``prepare_branches.py``; this module just checks one out and builds it.
 """
 
+import os
 import subprocess
 import time
 
@@ -207,13 +208,16 @@ def _run_build(game: Game, cmd: list[str], branch: str) -> None:
         raise GameError(f"command failed: {' '.join(cmd)}")
 
 
-def launch(game: Game, extra_args: list[str] | None = None) -> subprocess.Popen:
+def launch(game: Game, extra_args: list[str] | None = None,
+           env: dict[str, str] | None = None) -> subprocess.Popen:
     """Launch the game and return the process handle.
 
     The event-log UDP server lives inside the game, so the process must stay
     alive across a logging+replay cycle. The caller is responsible for calling
     ``shutdown`` when done. ``extra_args`` appends to ``game.launch_args`` — the
     controller uses it to pass the per-tape ``--replay <rec> --replay-delay <s>``.
+    ``env`` adds variables to the inherited environment (step 5 passes
+    ``config.REPLAY_DONE_ENV`` this way).
     """
     # NOTE (SuperTux): do NOT force SDL_VIDEODRIVER=x11 here. Under XWayland the
     # game becomes a true fullscreen window that mutter promotes to direct scanout
@@ -221,7 +225,8 @@ def launch(game: Game, extra_args: list[str] | None = None) -> subprocess.Popen:
     # capture delivers a single frame and no events. Native Wayland (the game
     # filling only a corner) keeps mutter compositing, so capture works.
     args = [str(game.binary), *game.launch_args, *(extra_args or [])]
-    proc = subprocess.Popen(args, cwd=str(game.repo_dir))
+    proc = subprocess.Popen(args, cwd=str(game.repo_dir),
+                            env={**os.environ, **env} if env else None)
     print(f"  [{game.name}] launched: {' '.join(args)} (pid {proc.pid})")
     return proc
 

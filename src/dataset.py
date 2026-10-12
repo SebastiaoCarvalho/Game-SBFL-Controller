@@ -5,8 +5,9 @@ a :class:`config.Game` bundle, and gamerv's active predicate catalog), ``Github
 Branch`` (the mutated branch of that game's repo), ``Specification`` (a ``P -> Q``
 safety-property body, no leading ``G``), ``Fault Type`` (which of the benchmark's
 twelve bug categories the mutation belongs to — see :data:`FAULT_TYPES` and
-:func:`fault_class`), and ``Target Phi`` (the ground-truth refinement ``phi`` to
-test ``phi -> R``).
+:func:`fault_class`), and ``Target Phi`` (the ground-truth bug condition ``phi``:
+the condition under which the bug occurs, which step 8 finds when a single top-ranked
+candidate ``B`` has ``phi -> B``).
 
 ``Target Phi`` may be blank: such a row still runs (it is built, recorded and
 mined, so it reports an R and a candidate count) but has no ground truth to
@@ -94,7 +95,7 @@ class TestCase:
     game: str                 # Game Name (resolved to a config.Game in the pipeline)
     specification: str        # P -> Q body (no G)
     branch: str               # github/mutation branch name
-    phi: str                  # ground-truth refinement
+    phi: str                  # ground-truth bug condition
     row: int                  # 1-based row number (after the header)
     fault_type: str = ""      # Fault Type (one of FAULT_TYPES; "" when absent)
     correct_drift: bool = True       # replay with drift correction on (see below)

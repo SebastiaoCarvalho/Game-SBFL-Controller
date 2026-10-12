@@ -8,11 +8,8 @@
     python run_experiment.py --dataset other.csv
     python run_experiment.py --row 4 --manual-auto   # replay cached manual answers
     python run_experiment.py --rows 1-60 --skip-manual  # unattended: skip rows needing a human
-    python run_experiment.py --row 20 --refinement-mode symbolic --threshold-strategy weakest
-    python run_experiment.py --row 20 --refinement-mode data-direct   # corroborate-only
     python run_experiment.py --candidate-sort type   # reorder each score tier: flags before thresholds
     python run_experiment.py --candidate-sort all    # mine once, rank under every sort (one folder)
-    python run_experiment.py --objective refinement  # mine/score sound refinements instead (reads dataset.csv)
     python run_experiment.py --row 4 --no-instrument  # build the source as committed
     python run_experiment.py --row 4 --clean     # drop row 4's cached build + logs
 
@@ -29,6 +26,7 @@ import statistics
 import shutil
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import buildcache
 import config
@@ -155,9 +153,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--game", default=None,
                     help="only run rows whose Game Name matches (case-insensitive)")
     ap.add_argument("--dataset", default=None,
-                    help="override the dataset path (default: "
-                         f"{config.BUG_DATASET_NAME}, or dataset.csv under "
-                         "--objective refinement)")
+                    help=f"override the dataset path (default: {config.DATASET})")
     ap.add_argument("--manual-auto", action="store_true",
                     help="reuse stored hint answers for the manual image/audio "
                          "predicates; prompt only for ones not yet recorded")
@@ -167,50 +163,24 @@ def main(argv: list[str]) -> int:
                          "NEEDS_MANUAL and the batch moves on, so a long run can "
                          "be left unattended (overnight) and finished by re-running "
                          "just those rows interactively. Implies --manual-auto.")
-    ap.add_argument("--refinement-mode", choices=config.REFINEMENT_MODES,
-                    default=config.REFINEMENT_MODE,
-                    help="how step 8 decides phi: 'symbolic' forces phi -> R "
-                         "containment against the mined R, 'data-direct' evaluates "
-                         "phi on the pooled good/violation states (independent of "
-                         "R), 'auto' is data-direct with a symbolic fallback for "
-                         f"non-raw phi. Default: {config.REFINEMENT_MODE}.")
     ap.add_argument("--candidate-sort", type=_parse_sorts,
                     default=[config.CANDIDATE_SORT],
                     metavar="{" + ",".join((*config.CANDIDATE_SORTS, "all")) + "}",
-                    help="how the mined candidate refinements are ordered *within* "
-                         "one score tier (they all separate the fault equally well, "
-                         "so the order decides the ground truth's rank): 'none' = "
+                    help="how the mined candidate bug conditions are ordered "
+                         "*within* one score tier (they all implicate the fault "
+                         "equally strongly, so the order decides the ground truth's "
+                         "rank): 'none' = "
                          "the miner's order, 'type' = boolean flags, then parity, "
                          "then categorical equalities, then numeric thresholds, "
                          "'popularity' = most-used in the game's source first "
                          "(needs step 7a's per-variable counts). Never changes "
-                         "which refinements are mined. Pass several "
+                         "which candidates are mined. Pass several "
                          "comma-separated (or 'all') to rank each row under every "
                          "one of them in a single pass: mined once under the first, "
                          "re-ranked under the rest (step 8b), written to one "
                          "results/run_<timestamp>_sorts/ folder with a "
                          "gt_rank_<sort> column each and the ranks_by_sort.png "
                          f"figure. Default: {config.CANDIDATE_SORT}.")
-    ap.add_argument("--objective", choices=config.OBJECTIVES,
-                    default=config.OBJECTIVE,
-                    help="what step 8 mines and reads phi as: 'bug-condition' = "
-                         "fault localization, a condition under which the bug "
-                         "occurs, ranked by Ochiai suspiciousness over the "
-                         "violation (failing) and good (passing) states with no "
-                         "hard constraint; it reads its ground truth from "
-                         f"{config.BUG_DATASET_NAME} unless --dataset is given, "
-                         "ignores --threshold-strategy, and its results folders end "
-                         "in _bug. 'refinement' = a condition under which the "
-                         "property is sound (never holds on a violation, ranked by "
-                         "the good states it keeps), scored against dataset.csv. "
-                         f"Default: {config.OBJECTIVE}.")
-    ap.add_argument("--threshold-strategy", choices=config.THRESHOLD_STRATEGIES,
-                    default=config.THRESHOLD_STRATEGY,
-                    help="how R's numeric split-points are placed: 'weakest' = just "
-                         "past the greatest/lowest violation value, 'gap-mean' = "
-                         "midpoint of the violation->good gap, 'midpoints' = sampled "
-                         "midpoints (search picks). Affects the symbolic path only. "
-                         f"Default: {config.THRESHOLD_STRATEGY}.")
     ap.add_argument("--clean", action="store_true",
                     help="delete the selected rows' build-cache and log-cache "
                          "slots, then exit without running anything. Forces the "
@@ -234,18 +204,12 @@ def main(argv: list[str]) -> int:
     if args.skip_manual:
         args.manual_auto = True
 
-    # A bug-condition run scores phi as the condition under which the bug occurs, so
-    # a dataset of good conditions would be scored against the wrong ground truth on
-    # every row — quietly, since each would read as an honest FAIL. Its own dataset
-    # is therefore the default, not an opt-in.
-    if args.dataset is None and args.objective == "bug-condition":
-        if not config.BUG_DATASET.is_file():
-            print(f"No bug-condition dataset at {config.BUG_DATASET}: generate it "
-                  f"with scripts/mirror_bug_dataset.py, or pass --dataset.",
-                  file=sys.stderr)
-            return 1
-        args.dataset = str(config.BUG_DATASET)
-    print(f"Dataset: {args.dataset or config.DATASET}")
+    dataset_path = Path(args.dataset) if args.dataset else config.DATASET
+    if not dataset_path.is_file():
+        print(f"No dataset at {dataset_path}: set FL_DATASET or FL_DATA_DIR "
+              f"(see data/README.md), or pass --dataset.", file=sys.stderr)
+        return 1
+    print(f"Dataset: {dataset_path}")
 
     cases = _select(read_cases(args.dataset), args.row, args.rows, args.game)
     if not cases:
@@ -266,10 +230,7 @@ def main(argv: list[str]) -> int:
 
     sorts = args.candidate_sort
     multi = len(sorts) > 1
-    print(f"Refinement decision: objective={args.objective}  "
-          f"mode={args.refinement_mode}  "
-          f"threshold strategy={args.threshold_strategy}  "
-          f"candidate sort={sorts[0]}"
+    print(f"Bug-condition ranking (Ochiai): candidate sort={sorts[0]}"
           + (f" (also ranked under: {', '.join(sorts[1:])})" if multi else ""))
     print(f"Source instrumentation (step 2a): "
           f"{'on' if args.instrument else 'off'}")
@@ -292,8 +253,7 @@ def main(argv: list[str]) -> int:
             print(f"\nABORTING: {exc}", file=sys.stderr)
             return 2
         out = _write_results(results, _settings(args, sorts),
-                             suffix=("_bug" if args.objective == "bug-condition"
-                                     else "") + ("_sorts" if multi else ""))
+                             suffix="_bug" + ("_sorts" if multi else ""))
         _summary(results, out)
     finally:
         gamerv.restore_properties()
@@ -317,12 +277,9 @@ def _run_pass(cases, args, candidate_sort: str,
         print(f"ROW {case.row}: {case.branch}")
         print("=" * 70)
         res = run_case(case, manual_auto=args.manual_auto,
-                       refinement_mode=args.refinement_mode,
-                       threshold_strategy=args.threshold_strategy,
                        instrument_source=args.instrument,
                        skip_manual=args.skip_manual,
                        candidate_sort=candidate_sort,
-                       objective=args.objective,
                        rank_sorts=rank_sorts)
         results.append(res)
         phases = "  ".join(f"{p}={v}s" for p, v in res.phase_cells().items())
@@ -347,11 +304,12 @@ def _settings(args, sorts: list[str]) -> dict:
     ``rank_sorts`` every sort a rank was recorded under, that one first.
     """
     return {
-        "objective": args.objective,
+        # Constant since the refinement objective was retired, but still written: an
+        # archived run without the key was a refinement run, and compare.py reads
+        # the difference off it.
+        "objective": "bug-condition",
         "candidate_sort": sorts[0],
         "rank_sorts": list(sorts),
-        "refinement_mode": args.refinement_mode,
-        "threshold_strategy": args.threshold_strategy,
         "instrument_source": bool(args.instrument),
         "game": args.game,
         "rows": ([args.row] if args.row else list(args.rows) if args.rows else None),
@@ -364,11 +322,10 @@ def _write_results(results, settings: dict | None = None,
                    suffix: str = "") -> "object":
     """Write this run's CSVs into their own results/run_<timestamp>/ folder.
 
-    ``suffix`` is appended to the folder name: a run ranked under several candidate
-    sorts ends in ``_sorts``, and a bug-condition run (the default) prefixes
-    ``_bug`` so its folders are never mistaken for a refinement run's. A
-    single-sort refinement run passes nothing and keeps the bare
-    ``run_<timestamp>``, the name every refinement run has always had.
+    ``suffix`` is appended to the folder name: every run ends in ``_bug``, and a
+    run ranked under several candidate sorts in ``_bug_sorts``. The bare
+    ``run_<timestamp>`` was a refinement run's name (archived under
+    ``results/refinement_archive/``), so the suffix keeps the two apart.
 
     One folder per run, so a run can grow extra artefacts (more views of the
     same rows, plots) without cluttering results/:
@@ -377,20 +334,22 @@ def _write_results(results, settings: dict | None = None,
                    phi, formula, notes, mining metrics, per-phase timings) — the
                    archival record.
       summary.csv  the five columns a results table needs: game, branch,
-                   property, ground truth, and the refinement found. ``result``
-                   falls back to the status word (SKIPPED/ERROR/
-                   VARIABLE_NOT_FOUND/...)
-                   for rows that produced no R, so no cell is silently blank.
-      settings.json the knobs this batch ran under (candidate sort, refinement
-                   mode, threshold strategy, row/game selection). Two runs over
-                   the same rows under different knobs are otherwise
-                   indistinguishable; report.txt and the plots read it back.
-      mining.csv   step 8's search metrics per row: how many candidate
-                   refinements were mined, and the ground truth's rank among
+                   property, ground truth, and the bug condition found (the
+                   top-ranked candidate the verdict is about). ``result`` falls
+                   back to the status word (SKIPPED/ERROR/VARIABLE_NOT_FOUND/...)
+                   for rows that produced no candidate, so no cell is silently
+                   blank.
+      settings.json the knobs this batch ran under (candidate sort(s),
+                   instrumentation, row/game selection). Two runs over the same
+                   rows under different knobs are otherwise indistinguishable;
+                   report.txt and the plots read it back.
+      mining.csv   step 8's search metrics per row: how many top-ranked candidate
+                   bug conditions were mined, and the ground truth's rank among
                    them (blank when it was not established at all — see
                    metrics.py for the match tiers), plus whether only the *union*
-                   of several candidates covered it, and the variables in the
-                   states the miner searched (logged / varying).
+                   of several candidates covered it, the variables in the
+                   states the miner searched (logged / varying), and how many
+                   good and bad (violation) states it learned from.
       report.txt   the aggregate view: rows per classification, and the same
                    counts cut by game, by bug category and by parent category,
                    with the mining rates per cut — then the same analysis again
@@ -400,13 +359,13 @@ def _write_results(results, settings: dict | None = None,
                    numbers, note and phase timings (report.py). The stdout
                    summary prints the aggregate tables only, so this file is the
                    place the per-game and per-case detail is read.
-      success_by_fault_type.png / success_by_parent.png  the classifications
-                   per bug category and per parent category, as stacked bars
-                   (plots.py, from full.csv).
-      time.png     the method's time per case (validate, refine, and the two
+      success_by_fault_type.png / success_by_parent.png / success_by_game.png
+                   the classifications per bug category, per parent category
+                   and per game, as stacked bars (plots.py, from full.csv).
+      time.png     the method's time per case (validate, localize, and the two
                    together), a box per game.
       space.png    the variables in the mined states, logged vs. varying.
-      time_vs_space.png  refine seconds against the varying-variable count.
+      time_vs_space.png  localize seconds against the varying-variable count.
       candidates.png  a boxplot of that candidate count, one box per game, drawn
                    from mining.csv (plots.py). Skipped, with a printed note, if
                    no row in the run mined.
@@ -416,6 +375,11 @@ def _write_results(results, settings: dict | None = None,
       ranks_by_sort.png  instead of the above when the run ranked under several
                    candidate sorts: the candidate count beside the rank under
                    each sort, over the same rows.
+      states_vs_rank.png  the ground truth's rank per bin of labelled states
+                   (good + bad), with Spearman's rho: does a deep rank go with
+                   few examples?
+      states_vs_rank_by_game.png  the same, one panel per game (after the
+                   pooled one), each with its own rho.
 
     Every artefact after the CSVs is derived *from* them, so each can be
     regenerated for a past run (``python src/report.py <run_dir>``,
@@ -428,7 +392,7 @@ def _write_results(results, settings: dict | None = None,
     _write_csv(
         out / "full.csv",
         ["row", "game", "row_branch", "fault_type", "fault_class",
-         "specification", "phi", "formula", "status", "R", "notes",
+         "specification", "phi", "formula", "status", "B", "notes",
          *metrics.COLUMNS,
          "elapsed_s"] + [f"{p}_s" for p in PHASES],
         [[r.row or "", r.game, r.branch, r.fault_type, r.fault_class,
@@ -511,8 +475,8 @@ def _summary(results, out) -> None:
         union_only = sum(1 for r in mined if r.mining.union_only)
         median = f", median rank {statistics.median(ranks):.0f}" if ranks else ""
         detail = " ".join(f"{k}={v}" for k, v in sorted(tiers.items())) or "none"
-        # The tier breakdown is part of the line: "established" is a single mined
-        # refinement spelled as phi (exact) or implying it (implication).
+        # The tier breakdown is part of the line: "established" is a single
+        # top-ranked candidate spelled as phi (exact) or implied by it (implication).
         print(f"  mining:     ground truth established in {len(found)}/{len(mined)} "
               f"row(s) ({detail}{median})")
         if union_only:

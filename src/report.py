@@ -24,8 +24,8 @@ beside the CSVs:
   mining            how often the ground truth was found among the *top-scored*
                     mined candidates, how big that candidate set was, and where the
                     ground truth ranked inside it — overall, per game and per
-                    category. Lower-scoring sound refinements are in gamerv's log but
-                    not in these numbers (see metrics.py).
+                    category. Lower-scoring candidates are in gamerv's log but not
+                    in these numbers (see metrics.py).
   by case           one line per dataset case (one row of the dataset): its verdict,
                     its mining numbers and the note the pipeline left, followed by
                     the per-case timing table. This is the per-case detail the run's
@@ -67,24 +67,34 @@ SETTINGS_JSON = "settings.json"
 
 #: Every status a row can end on, in the order a table reads best: decided rows
 #: first, then the ones the method could not decide, then the run's own failures.
-STATUSES = ("SUCCESS", "FAIL", "REFINEMENT_NOT_FOUND", "VARIABLE_NOT_FOUND",
+STATUSES = ("SUCCESS", "FAIL", "CONDITION_NOT_FOUND", "VARIABLE_NOT_FOUND",
             "INCONCLUSIVE", "SKIPPED", "NEEDS_MANUAL", "ERROR")
 
-#: Short column heads for the per-group tables (a full status word is 20 chars).
-ABBREV = {"SUCCESS": "SUCC", "FAIL": "FAIL", "REFINEMENT_NOT_FOUND": "R_NF",
+#: Statuses renamed since an archived run was written, mapped onto their current
+#: names when its ``full.csv`` is read back, so an old run's report, plots and
+#: comparisons count them under today's word. REFINEMENT_NOT_FOUND was the refinement
+#: objective's (and the early bug-condition runs') name for CONDITION_NOT_FOUND.
+LEGACY_STATUS = {"REFINEMENT_NOT_FOUND": "CONDITION_NOT_FOUND"}
+
+#: Short column heads for the per-group tables (a full status word is 19 chars).
+ABBREV = {"SUCCESS": "SUCC", "FAIL": "FAIL", "CONDITION_NOT_FOUND": "C_NF",
           "VARIABLE_NOT_FOUND": "V_NF", "INCONCLUSIVE": "INCO", "SKIPPED": "SKIP",
           "NEEDS_MANUAL": "MANU", "ERROR": "ERR"}
 
 #: One line per status, so a reader who has not read the README can still read the
 #: table. Kept in sync with the README's "Result statuses" section.
 MEANING = {
-    "SUCCESS": "a single mined refinement establishes phi (phi -> R)",
-    "FAIL": "phi was decided and rejected (unsound, or no candidate implies it)",
-    "REFINEMENT_NOT_FOUND": "the data corroborates phi but no single mined R "
-                            "establishes it — the search missed it",
+    "SUCCESS": "phi ties the top Ochiai score and a single top-ranked bug "
+               "condition contains it (phi -> B)",
+    "FAIL": "phi was decided and rejected (outranked, vacuous, or no candidate "
+            "contains it)",
+    "CONDITION_NOT_FOUND": "phi scores as high as the best candidate (or higher) "
+                           "but no single top-ranked B contains it — the search "
+                           "missed it",
     "VARIABLE_NOT_FOUND": "phi reads a quantity the game never exports, so it was "
                           "never evaluated",
-    "INCONCLUSIVE": "nothing to decide phi against (no trace / no violation / no R)",
+    "INCONCLUSIVE": "nothing to decide phi against (no trace / no violation / no "
+                    "candidate)",
     "SKIPPED": "the row carries no ground-truth phi (mined only)",
     "NEEDS_MANUAL": "left for a human: a manual predicate no hint covers, and the "
                     "run was --skip-manual (re-run the row interactively)",
@@ -124,6 +134,10 @@ class Row:
     #: that never mined, or a run written before the columns existed.
     variables: int | None = None
     varying: int | None = None
+    #: The labelled examples the ranking was learned from (metrics.py): pooled
+    #: trigger states where the spec held, and violation states. None as above.
+    good_states: int | None = None
+    bad_states: int | None = None
     #: ``((sort, rank), ...)`` over :data:`metrics.SORTS`, None where the row was not
     #: ranked under that sort or its ground truth was not found (metrics.py). A
     #: tuple, like ``phases``, so the row stays hashable.
@@ -171,14 +185,20 @@ def _float(cell: str | None) -> float | None:
 #: whole case and is read separately.
 _PHASE_SUFFIX = "_s"
 _TOTAL_COLUMN = "elapsed_s"
+#: Phases renamed since an archived run was written: steps 7a-8 were "refine" under
+#: the refinement objective.
+LEGACY_PHASE = {"refine": "localize"}
 
 
 def _phase_cells(d: dict) -> tuple[tuple[str, str], ...]:
     """The ``<phase>_s`` columns of one CSV row, in the file's own column order (which
     is the pipeline's phase order), so the report never hard-codes a phase list."""
-    return tuple((k[: -len(_PHASE_SUFFIX)], (v or "").strip() or "-")
-                 for k, v in d.items()
-                 if k and k.endswith(_PHASE_SUFFIX) and k != _TOTAL_COLUMN)
+    out = []
+    for k, v in d.items():
+        if k and k.endswith(_PHASE_SUFFIX) and k != _TOTAL_COLUMN:
+            name = k[: -len(_PHASE_SUFFIX)]
+            out.append((LEGACY_PHASE.get(name, name), (v or "").strip() or "-"))
+    return tuple(out)
 
 
 def row_from_dict(d: dict) -> Row:
@@ -186,7 +206,8 @@ def row_from_dict(d: dict) -> Row:
         return (d.get(key) or "").strip()
 
     return Row(game=cell("game"), branch=cell("row_branch") or cell("github_branch"),
-               status=cell("status"), phi=cell("phi") or cell("ground_truth"),
+               status=LEGACY_STATUS.get(cell("status"), cell("status")),
+               phi=cell("phi") or cell("ground_truth"),
                fault_type=cell("fault_type"),
                candidates=_int(d.get("candidates")), gt_rank=_int(d.get("gt_rank")),
                gt_match=cell("gt_match"),
@@ -196,6 +217,8 @@ def row_from_dict(d: dict) -> Row:
                elapsed_s=_float(d.get(_TOTAL_COLUMN)), phases=_phase_cells(d),
                variables=_int(d.get("variables")),
                varying=_int(d.get("varying_variables")),
+               good_states=_int(d.get("good_states")),
+               bad_states=_int(d.get("bad_states")),
                ranks=tuple((s, _int(d.get(c)))
                            for s, c in zip(metrics.SORTS, metrics.RANK_COLUMNS)))
 
@@ -213,6 +236,7 @@ def row_from_result(res) -> Row:
                elapsed_s=res.elapsed_s,
                phases=tuple(res.phase_cells().items()),
                variables=res.mining.variables, varying=res.mining.varying,
+               good_states=res.mining.good_states, bad_states=res.mining.bad_states,
                ranks=tuple((s, res.mining.ranks.get(s)) for s in metrics.SORTS))
 
 
@@ -356,7 +380,7 @@ def _mining_summary(rows: list[Row]) -> list[str]:
     if region:
         out.append(f"    by phi's own sound core region (no rank): {len(region)}")
     out.append(
-        f"  rejected by the single-refinement rule: {len(union)}  "
+        f"  rejected by the single-candidate rule: {len(union)}  "
         f"(only the union of several candidates covers phi)")
     below = [r for r in mined if r.below_top]
     if below:
@@ -607,14 +631,22 @@ def _settings_line(settings: dict | None) -> list[str]:
     def fmt(v) -> str:
         return ",".join(map(str, v)) if isinstance(v, list) else str(v)
 
-    # rank_sorts only says something when it names more than the row's own sort.
+    # rank_sorts only says something when it names more than the row's own sort. The
+    # last two knobs are recorded only by archived refinement-era runs.
     shown = {k: settings.get(k) for k in
              ("objective", "candidate_sort", "rank_sorts", "refinement_mode",
               "threshold_strategy")}
     if len(shown.get("rank_sorts") or ()) < 2:
         shown["rank_sorts"] = None
     parts = [f"{k}={fmt(v)}" for k, v in shown.items() if v]
-    return [f"settings: {'   '.join(parts)}"] if parts else []
+    out = [f"settings: {'   '.join(parts)}"] if parts else []
+    if settings.get("objective", "refinement") == "refinement":
+        # Written before the refinement objective was retired: its verdicts are
+        # about refinements R (phi -> R, R false on every violation), not about the
+        # bug conditions the meanings below describe.
+        out.append("archived refinement run: SUCCESS meant a single mined refinement "
+                   "R with phi -> R; the status meanings below are today's")
+    return out
 
 
 def render(rows: list[Row], title: str = "", settings: dict | None = None) -> str:
@@ -648,11 +680,11 @@ def render(rows: list[Row], title: str = "", settings: dict | None = None) -> st
     lines += _mining_table(by_category(rows), "bug category")
     lines += ["",
               "  mined  = rows that reached mining and carry a ground-truth phi",
-              "  found  = a single mined refinement establishes phi",
+              "  found  = a single top-ranked bug condition contains phi",
               "  union  = only the union of several candidates covers phi, so the",
               "           ground truth counts as not found (see metrics.py)",
-              "  cand   = the top-scored tier of the ranked candidate set (the",
-              "           refinements a user reads from the top); a phi established",
+              "  cand   = the top-ranked tier of the ranked candidate set (the",
+              "           bug conditions a user reads from the top); a phi established",
               "           only below that tier counts as not found too"]
 
     by_sort = sort_rank_lines(rows)

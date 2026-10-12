@@ -2,7 +2,7 @@
 
 Fault localization's compound sweep builds arithmetic terms over pairs of reported
 quantities. Unconstrained, that is where the candidate explosion lives: in one Super
-Tux run 2136 of 2136 perfectly-separating refinements were compound, only 9 of them
+Tux run 2136 of 2136 perfectly-separating candidates were compound, only 9 of them
 over a single variable. The allow-list (``gamerv/config/games/<game>/
 fl_term_rules.json``, consumed by ``runners.fl_term_rules``) cuts it to the
 combinations the game's source actually forms — if the game computes ``a - b``
@@ -52,7 +52,7 @@ pre-edit line numbers, so the tree the digest scans must be the pristine one.
 
 The same scan produces a second consumed output, ``fl_var_popularity.json``: how many
 source lines mention each reported quantity, which the ``popularity`` candidate sort
-(``--candidate-sort``) ranks mined refinements by. It is written beside the rules and
+(``--candidate-sort``) ranks mined candidates by. It is written beside the rules and
 is part of :func:`up_to_date`'s key, so a game digested before it existed is
 re-scanned once rather than left without counts forever.
 """

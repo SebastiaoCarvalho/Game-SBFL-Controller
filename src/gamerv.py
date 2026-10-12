@@ -377,33 +377,19 @@ def last_invalid_run() -> Path | None:
 
 
 def fault_localize(run_dir: Path, terms: list[str] | None = None,
-                   strategy: str | None = None,
-                   candidate_sort: str | None = None,
-                   objective: str | None = None) -> str:
-    """Localize the fault in ``run_dir``, mining a refinement R.
+                   candidate_sort: str | None = None) -> str:
+    """Localize the fault in ``run_dir``: rank its candidate bug conditions by Ochiai.
 
     When ``terms`` is given, mining is focused on exactly those raw game-state
     variables (the box-only vocabulary); otherwise gamerv discovers candidates
     generically from every logged variable. Terms are handed to the worker as a
-    single JSON list so values with spaces/parens survive argv intact. ``strategy``
-    selects how R's thresholds are placed (midpoints / weakest / gap-mean) and
-    ``candidate_sort`` how the mined candidates are ordered within one score tier
-    (none / type / popularity), and ``objective`` whether it mines refinements or
-    bug conditions (see ``config.OBJECTIVE``).
-
-    Once any knob is given, terms occupies a fixed argv slot ("null" if absent)
-    so the ones after it stay positionally addressable — the same fixed-slot
-    contract :func:`compare_refinement` uses.
+    single JSON list so values with spaces/parens survive argv intact ("null" when
+    absent, so the sort after it stays in a fixed argv slot). ``candidate_sort``
+    orders the candidates within one score tier (none / type / popularity).
     """
-    args = ["fault_localize", str(run_dir)]
-    if strategy is not None or candidate_sort is not None or objective is not None:
-        args += [json.dumps(list(terms) if terms else None),
-                 strategy or config.THRESHOLD_STRATEGY,
-                 candidate_sort or config.CANDIDATE_SORT,
-                 objective or config.OBJECTIVE]
-    elif terms:
-        args.append(json.dumps(list(terms)))
-    proc = _worker(*args)
+    proc = _worker("fault_localize", str(run_dir),
+                   json.dumps(list(terms) if terms else None),
+                   candidate_sort or config.CANDIDATE_SORT)
     if proc.stdout:
         print(proc.stdout, end="")
     if proc.returncode != 0:
@@ -411,128 +397,71 @@ def fault_localize(run_dir: Path, terms: list[str] | None = None,
     return proc.stdout or ""
 
 
-# --- Step 8: phi -> R containment ----------------------------------------
+# --- Step 8: phi against the ranked bug conditions ---------------------------
 
 @dataclass
 class Containment:
-    status: str             # SUCCESS | FAIL | REFINEMENT_NOT_FOUND
+    status: str             # SUCCESS | FAIL | CONDITION_NOT_FOUND
                             # | VARIABLE_NOT_FOUND | INCONCLUSIVE | SKIPPED | ERROR
-    r_text: str | None      # the mined refinement R, if printed
+    r_text: str | None      # the top-ranked bug condition B the verdict is about
     stdout: str
     verdict: str | None = None   # gamerv's one-line "=> ..." conclusion, for notes
 
 
-def _split_depth0(s: str, sep: str) -> list[str]:
-    """Split ``s`` on ``sep`` at paren depth 0 only."""
-    parts, buf, depth, i = [], [], 0, 0
-    while i < len(s):
-        c = s[i]
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-        elif depth == 0 and s.startswith(sep, i):
-            parts.append("".join(buf))
-            buf = []
-            i += len(sep)
-            continue
-        buf.append(c)
-        i += 1
-    parts.append("".join(buf))
-    return parts
-
-
-def _unwrap(s: str) -> str:
-    """Drop one pair of parens that wraps the whole expression."""
-    s = s.strip()
-    if not (s.startswith("(") and s.endswith(")")):
-        return s
-    depth = 0
-    for i, c in enumerate(s):
-        depth += (c == "(") - (c == ")")
-        if depth == 0 and i < len(s) - 1:
-            return s                # the opening paren closes early: not a wrapper
-    return s[1:-1].strip()
-
-
-_REFINED_MARKER = "Refined invariant:"
-#: fault_localize's line under the bug-condition objective, where there is no refined
-#: invariant — only the top of the Ochiai ranking: ``Most suspicious condition:  B``.
+#: fault_localize's line naming the top of the Ochiai ranking:
+#: ``Most suspicious condition:  B``.
 _MOST_SUSPICIOUS_MARKER = "Most suspicious condition:"
-#: A bug-condition compare_refinement run opens with this header.
-_BUG_RANKING_HEADER = "=== Bug Condition Ranking ==="
+#: The line that opens compare_bug_condition's containment check, so its own "=>"
+#: conclusion can be told apart from the score comparison's.
+_CONTAINMENT_MARKER = "(containment"
 
-#: gamerv's corroborate refuses to score a phi that reads a quantity no pooled
-#: state carries ("Could not evaluate phi: phi reads <k>, which no logged state
-#: reports — the game does not export the quantity ..."). That is a fault in the
-#: game's exported vocabulary, not in the experiment, so it gets its own status
-#: (VARIABLE_NOT_FOUND) rather than being lumped in with ERROR.
+#: gamerv refuses to score a phi that reads a quantity no pooled state carries
+#: ("Could not evaluate phi: phi reads <k>, which no logged state reports — the game
+#: does not export the quantity ..."). That is a fault in the game's exported
+#: vocabulary, not in the experiment, so it gets its own status (VARIABLE_NOT_FOUND)
+#: rather than being lumped in with ERROR.
 _UNEXPORTED_MARKER = "which no logged state reports"
 
-#: gamerv rejects a phi that is sound but holds on fewer good states than the best
-#: mined refinement does ("phi is sound but UNDER-SUPPORTED: ..."). phi is meant to be
-#: the condition the fault turns on, so it should hold wherever the property held; one
-#: below that ceiling is a weaker separator than the data affords. It is the VACUOUS
-#: rule (support 0) generalised, and it outranks containment — a phi strong enough to
-#: be contained in a degenerate R (a type-minimum bound contains everything) would
-#: otherwise be certified by it.
-_UNDER_SUPPORTED_MARKER = "UNDER-SUPPORTED"
-
-#: The bug-condition objective's verdicts on phi's own Ochiai score against the top of
-#: the ranking. OUTRANKED (below it) is the under-support rule's twin — decided on the
-#: data, ahead of containment. OUTRANKS (above it) means the search never built a
-#: condition as good as phi: not found, whatever containment would say. TOP_RANKED
-#: (equal) is the bug-condition "corroborated by the data".
+#: phi's own Ochiai score against the top of the ranking. OUTRANKED (below it) is
+#: decided on the data, ahead of containment: the data implicates another condition
+#: more strongly. OUTRANKS (above it) means the search never built a condition as good
+#: as phi: not found, whatever containment would say. TOP_RANKED (equal) is the one
+#: standing under which containment decides.
 _OUTRANKED_MARKER = "phi is OUTRANKED"
 _OUTRANKS_MARKER = "phi OUTRANKS every mined bug condition"
 _TOP_RANKED_MARKER = "phi IS a top-ranked bug condition"
 
 
 def mined_r(out: str) -> str | None:
-    """The mined R from fault_localize's ``Refined invariant:`` line, if it printed one
-    (or, under the bug-condition objective, the top-ranked B from its ``Most
-    suspicious condition:`` line).
-
-    The line reads ``Refined invariant:  G((P) & (R) -> (Q))``. Splitting at paren
-    depth 0 inside the ``G(...)`` isolates the antecedent ``(P) & (R)``, whose last
-    top-level conjunct is R — P's own ``&``s sit at depth 1, inside P's parens.
-    """
+    """The top-ranked bug condition B from fault_localize's ``Most suspicious
+    condition:`` line, if it printed one."""
     for line in reversed(out.splitlines()):
         s = line.strip()
         if s.startswith(_MOST_SUSPICIOUS_MARKER):
             return s[len(_MOST_SUSPICIOUS_MARKER):].strip() or None
-        if not s.startswith(_REFINED_MARKER):
-            continue
-        body = s[len(_REFINED_MARKER):].strip()
-        if not (body.startswith("G(") and body.endswith(")")):
-            return None
-        antecedent = _split_depth0(body[2:-1], "->")[0]
-        return _unwrap(_split_depth0(antecedent, "&")[-1]) or None
     return None
 
 
 def mine_only(run_dir: Path, terms: list[str] | None = None,
-              strategy: str | None = None,
-              candidate_sort: str | None = None,
-              objective: str | None = None) -> Containment:
-    """Mine R with no phi to judge it against — the SKIPPED path for a dataset row
+              candidate_sort: str | None = None) -> Containment:
+    """Rank bug conditions with no phi to judge — the SKIPPED path for a dataset row
     whose ``Target Phi`` cell is empty.
 
     There is no ground truth to compare, so there is no verdict to reach: the row
-    is reported ``SKIPPED`` rather than run through compare_refinement (which,
+    is reported ``SKIPPED`` rather than run through compare_bug_condition (which,
     handed an empty phi, could only fail to evaluate it and come back ERROR).
     Mining still runs, via fault_localize, because it is the half of step 8 that
-    does not depend on phi: it produces the same R_all a compare would have mined
+    does not depend on phi: it produces the same ranking a compare would have mined
     and persists it (``fault_localization.json``), so the row still contributes its
-    mined R and candidate count — the numbers that let a ground truth be written
-    for it later. A mining failure keeps the row SKIPPED (the row was never going
-    to yield a verdict); the reason is carried in the note.
+    most suspicious condition and candidate count — the numbers that let a ground
+    truth be written for it later. A mining failure keeps the row SKIPPED (the row
+    was never going to yield a verdict); the reason is carried in the note.
     """
     try:
-        out = fault_localize(run_dir, terms, strategy, candidate_sort, objective)
+        out = fault_localize(run_dir, terms, candidate_sort)
     except GameRVError as exc:
         return Containment("SKIPPED", None, str(exc),
-                           "no ground-truth phi (mining R failed)")
+                           "no ground-truth phi (mining failed)")
     return Containment("SKIPPED", mined_r(out), out,
                        "no ground-truth phi for this row — nothing to compare")
 
@@ -555,197 +484,128 @@ def _unexported_note(out: str) -> str | None:
     return None
 
 
-def parse_containment(out: str, mode: str = "auto") -> Containment:
-    """Classify a compare_refinement stdout into a verdict on phi as a refinement.
+def parse_containment(out: str) -> Containment:
+    """Classify a compare_bug_condition stdout into a verdict on phi.
 
-    gamerv's run_compare_refinement always runs the *data-direct* corroborate test
-    when phi is raw-evaluable: it evaluates phi on the pooled good (P & Q) and
-    violation (P & ~Q) states, independent of R's thresholds ("phi IS a sound
-    refinement" / "is NOT sound" / "VACUOUS"). For a non-raw phi it instead decides
-    symbolic containment — ``Exists R in R_all: phi -> R``, phi against each mined
-    refinement **on its own** ("IS CONTAINED in a single mined refinement" / "is NOT
-    contained in ANY single mined refinement") — and in ``symbolic`` mode it *also*
-    appends that containment view (a "(symbolic view …)" block) alongside the
-    corroborate verdict. So in symbolic mode the output carries BOTH conclusions.
+    gamerv scores phi exactly like every mined candidate — Ochiai over the pooled
+    violation (failing) and good (passing) states — and prints where that score
+    stands against the top of the ranking: *OUTRANKED* (below it), *top-ranked*
+    (equal), *OUTRANKS* (above it) or *VACUOUS* (phi holds on no violation). For a
+    top-ranked phi it then checks containment against the top tier, one candidate at
+    a time — ``Exists B in the top tier: phi -> B`` ("IS CONTAINED in a single
+    top-ranked bug condition" / "is NOT contained in ANY single mined bug
+    condition"). A phi reading a non-raw catalogue predicate has no score and goes
+    straight to containment.
 
-    The containment view is per-candidate on purpose: ``phi -> (R1 | … | Rn)`` against
-    their union passes as soon as several candidates *jointly* cover phi, which is not
-    a refinement any single mined R establishes. When that is what happened, gamerv
-    says so and the row is reported as the search having missed phi — the note carries
-    it, and ``metrics.Mining.union_only`` counts it.
-
-    Classification therefore depends on ``mode``:
-
-    * ``symbolic`` — SUCCESS is decided by the per-candidate containment ONLY. When no
-      single mined refinement establishes phi (phi not contained, or nothing was mined
-      over phi's variable) yet the data-direct corroborate test *does* show phi sound,
-      the mined R simply failed to *find* phi as a refinement even though the data says
-      it is one -> ``REFINEMENT_NOT_FOUND`` (distinct from both SUCCESS and FAIL). FAIL
-      is reserved for a phi that is genuinely unsound (keeps a violation) or not
-      contained with no corroboration.
-    * ``auto`` / ``data-direct`` — the data-direct corroborate verdict is
-      authoritative (gamerv's historical behaviour), with symbolic containment as the
-      fallback for a non-raw phi.
-
-    Ahead of both paths sits ``VARIABLE_NOT_FOUND``: gamerv could not evaluate phi at
-    all because it reads a quantity no logged state reports. Nothing was decided about
-    phi — the game simply does not export the variable its ground truth is written
-    over — so the row is neither a verdict nor an experiment failure (``ERROR``).
-
-    A **bug-condition** run (``config.OBJECTIVE``) ranks candidates by Ochiai, and
-    its data-side verdict compares phi's own score with the top of that ranking
-    instead of testing soundness: *OUTRANKED* (below it) plays the under-supported
-    part and is FAIL ahead of containment; *top-ranked* (equal) plays "corroborated
-    by the data"; *OUTRANKS* (above it) is REFINEMENT_NOT_FOUND outright — the search
-    never built a condition as good as phi. Containment and the statuses are
-    otherwise read exactly as for a refinement.
+    * ``VARIABLE_NOT_FOUND`` first: phi was never scored, because it reads a quantity
+      no logged state reports. Nothing was decided about phi — the game does not
+      export the variable its ground truth is written over — so the row is neither a
+      verdict nor an experiment failure (``ERROR``).
+    * ``FAIL`` for an OUTRANKED phi, decided on the data whatever a mined candidate
+      says about it: containment alone would call it a find whenever *some* top-ranked
+      candidate is weak enough to contain it.
+    * ``CONDITION_NOT_FOUND`` for a phi that OUTRANKS every mined candidate — the
+      search never built it.
+    * ``SUCCESS`` when a single top-ranked candidate contains phi.
+    * ``CONDITION_NOT_FOUND`` when phi ties the top score but no single top-ranked
+      candidate contains it (or none is over phi's variables): the data says phi is a
+      best explanation, the ranking just does not show it. The containment test is
+      per-candidate on purpose — against the union of several candidates phi would
+      pass as soon as they *jointly* cover it, which is not a condition any single
+      mined B establishes; when that is what happened gamerv says so, the note
+      carries it and ``metrics.Mining.union_only`` counts it.
+    * ``FAIL`` for a phi that is not contained (and not top-ranked), or VACUOUS.
+    * ``INCONCLUSIVE`` when there was nothing to decide phi against, else ``ERROR``.
 
     Pure string logic, separated out so it can be unit-tested without the worker.
     """
     r_text = None
-    verdict = None          # first conclusion (the data-direct one when phi is raw)
-    sym_verdict = None      # the phi -> R_all conclusion under the "(symbolic view …)"
-    in_symbolic = False
+    verdict = None          # first conclusion (the score comparison when phi is raw)
+    contain_verdict = None  # the phi -> B conclusion under the "(containment …)" line
+    in_containment = False
     for line in out.splitlines():
         s = line.strip()
-        if s.startswith(("R", "B ")) and "=" in s and r_text is None:
+        if s.startswith("B ") and "=" in s and r_text is None:
             r_text = s.split("=", 1)[1].strip()
-        if s.startswith("(symbolic view"):
-            in_symbolic = True
+        if s.startswith(_CONTAINMENT_MARKER):
+            in_containment = True
         if s.startswith("=>") or s.startswith("Could not") or s.startswith("Cannot compare"):
             concl = s.lstrip("=> ").strip()
             if verdict is None:
                 verdict = concl
-            if in_symbolic and sym_verdict is None:
-                sym_verdict = concl
+            if in_containment and contain_verdict is None:
+                contain_verdict = concl
 
     # Signals (mutually distinct substrings, so membership tests don't collide).
-    contained     = "IS CONTAINED" in out           # some single R establishes phi
-    not_contained = "is NOT contained" in out       # no single R does (witness shown)
+    contained     = "IS CONTAINED" in out           # some single B establishes phi
+    not_contained = "is NOT contained" in out       # no single B does (witness shown)
     # phi is covered only by the *union* of several candidates — gamerv reports it on a
-    # miss, and it is the reason a row the old union test called found is now a miss.
-    union_only    = ("established only by several mined refinements together" in out
-                     or "established only by several mined bug conditions together"
-                     in out)
-    no_r_all      = ("not comparable by containment" in out
-                     or "no mined refinement constrains" in out)
-    bug           = _BUG_RANKING_HEADER in out  # a bug-condition (Ochiai) run
-    # phi's score is above every mined candidate's: nothing the search built is phi.
+    # miss, and it is why a row the union would call found is a miss.
+    union_only    = "established only by several mined bug conditions together" in out
+    no_candidate  = "not comparable by containment" in out
     outranks      = _OUTRANKS_MARKER in out
-    # corroborate: sound + informative (a bug condition: as high as the best mined)
-    data_sound    = ("IS a sound refinement" in out or _TOP_RANKED_MARKER in out
-                     or outranks)
-    # Sound but weaker than the data affords (see _UNDER_SUPPORTED_MARKER), or — for a
-    # bug condition — scored below the top of the ranking. gamerv prints it *instead
-    # of* the corroborated line, so data_sound is already False here; it is named
-    # separately because it outranks the containment verdict.
-    data_under    = _UNDER_SUPPORTED_MARKER in out or _OUTRANKED_MARKER in out
-    data_unsound  = "is NOT sound" in out or "VACUOUS" in out or data_under
-    nothing_mined = ("No sound refinement R was mined" in out
-                     or "No bug condition B was mined" in out)
-    noun = "bug condition" if bug else "refinement"
+    top_ranked    = _TOP_RANKED_MARKER in out
+    outranked     = _OUTRANKED_MARKER in out
+    vacuous       = "VACUOUS" in out
+    nothing_mined = "No bug condition B was mined" in out
 
-    # Decided before either mode: phi was never scored, because the game exports
-    # none of the quantities it reads. Reported as its own outcome (a gap in the
-    # game's instrumentation) rather than as an ERROR (a broken experiment run).
     if _UNEXPORTED_MARKER in out:
         return Containment("VARIABLE_NOT_FOUND", r_text, out,
                            _unexported_note(out) or verdict)
-
-    if mode == "symbolic":
-        # Ahead of the containment verdict: an under-supported phi is rejected on the
-        # data whatever a mined R says about it. Containment alone would call it a find
-        # whenever *some* candidate is weak enough to contain it, which is how a phi
-        # holding on 1 of 2 good states came to be certified by `ticks_left > -32768`.
-        if data_under:
-            return Containment("FAIL", r_text, out, verdict)
-        if outranks:
-            return Containment("REFINEMENT_NOT_FOUND", r_text, out, (
-                "phi scores above every mined bug condition — the search did not "
-                "build it"))
-        # SUCCESS comes from the per-candidate containment only; everything else
-        # cross-references the data-direct verdict to separate REFINEMENT_NOT_FOUND (R
-        # missed a real refinement) from FAIL (phi genuinely not sound).
-        if contained:
-            status = "SUCCESS"
-            # A phi *stronger* than the mined R it is contained in is sound whatever the
-            # data says about its informativeness, so a VACUOUS corroborate verdict (phi
-            # excludes every good state too) can survive into a SUCCESS. Say so in the
-            # note rather than letting such a row read as a clean find.
-            note = (f"[vacuous on the data] {sym_verdict or verdict}"
-                    if "VACUOUS" in out else (sym_verdict or verdict))
-        elif (not_contained or no_r_all) and data_sound:
-            status = "REFINEMENT_NOT_FOUND"
-            note = (f"phi corroborated by the data, but no single mined {noun} "
-                    "establishes it — the search did not find it"
-                    + (" (only the union of several candidates covers it)"
-                       if union_only else ""))
-        elif not_contained or data_unsound:
-            status, note = "FAIL", (sym_verdict or verdict)
-        elif (nothing_mined or "Cannot compare phi" in out
-              or "No violated formula" in out or no_r_all):
-            status, note = "INCONCLUSIVE", verdict
-        else:
-            status, note = "ERROR", verdict
-        return Containment(status, r_text, out, note)
-
-    # auto / data-direct: data-direct corroborate is authoritative, symbolic is the
-    # non-raw fallback (historical behaviour).
-    if data_sound or contained:
-        status = "SUCCESS"                  # phi is a sound (valid) refinement
-    elif data_unsound or not_contained:
-        status = "FAIL"                     # phi does not exclude every violation
+    if outranked:
+        return Containment("FAIL", r_text, out, verdict)
+    if outranks:
+        return Containment("CONDITION_NOT_FOUND", r_text, out, (
+            "phi scores above every mined bug condition — the search did not "
+            "build it"))
+    if contained:
+        status, note = "SUCCESS", (contain_verdict or verdict)
+    elif (not_contained or no_candidate) and top_ranked:
+        status = "CONDITION_NOT_FOUND"
+        note = ("phi ties the top score, but no single top-ranked bug condition "
+                "contains it — the search did not find it"
+                + (" (only the union of several candidates covers it)"
+                   if union_only else ""))
+    elif not_contained or vacuous:
+        status, note = "FAIL", (contain_verdict or verdict)
     elif (nothing_mined or "Cannot compare phi" in out
-          or "No violated formula" in out):
-        status = "INCONCLUSIVE"             # nothing to decide phi against
-    else:  # "Could not evaluate phi" / "Could not decide containment" / unexpected
-        status = "ERROR"
-    return Containment(status, r_text, out, verdict)
+          or "No violated formula" in out or no_candidate):
+        status, note = "INCONCLUSIVE", verdict
+    else:
+        status, note = "ERROR", verdict
+    return Containment(status, r_text, out, note)
 
 
-def compare_refinement(run_dir: Path, phi: str,
-                       terms: list[str] | None = None,
-                       mode: str | None = None,
-                       strategy: str | None = None,
-                       candidate_sort: str | None = None,
-                       objective: str | None = None,
-                       echo: bool = True) -> Containment:
-    """Run gamerv's compare_refinement and classify the verdict on phi.
+def compare_bug_condition(run_dir: Path, phi: str,
+                          terms: list[str] | None = None,
+                          candidate_sort: str | None = None,
+                          echo: bool = True) -> Containment:
+    """Run gamerv's compare_bug_condition and classify the verdict on phi.
 
-    ``terms`` focuses R-mining on those raw variables (box-only), matching the
+    ``terms`` focuses mining on those raw variables (box-only), matching the
     vocabulary used in fault localization, so the verdict is decided against the
-    same R. Empty/None mines R generically. ``mode`` selects gamerv's decision
-    path (auto / data-direct / symbolic), ``strategy`` how R's thresholds are
-    placed (midpoints / weakest / gap-mean), and ``candidate_sort`` how the mined
-    candidates are ordered within one score tier (none / type / popularity — only
-    the order they are reported and checked in, never which R is mined), and
-    ``objective`` whether phi is a refinement or a bug condition (refinement /
-    bug-condition); each defaults to the config value.
-
-    terms/mode/strategy/sort/objective are passed as fixed argv positions (terms as
-    JSON, "null" when absent) so each stays addressable even when no terms are set.
+    same ranking. Empty/None mines generically. ``candidate_sort`` orders the mined
+    candidates within one score tier (none / type / popularity — only the order they
+    are reported and checked in, never which candidates are mined); it defaults to
+    the config value. terms and sort are passed as fixed argv positions (terms as
+    JSON, "null" when absent).
 
     An empty ``phi`` (a dataset row with no ground truth) is not an error: it is
-    routed to :func:`mine_only`, which mines R and returns ``SKIPPED``.
+    routed to :func:`mine_only`, which ranks the candidates and returns ``SKIPPED``.
 
     ``echo=False`` keeps gamerv's output (the whole candidate list) off stdout — for
     a re-ranking call, whose only product is the verdict it persists.
     """
     if not phi.strip():
         # No ground truth to compare: gamerv would only report that it could not
-        # evaluate an empty phi, which reads as an ERROR. Mine R instead.
-        return mine_only(run_dir, terms, strategy, candidate_sort, objective)
-    mode = mode or config.REFINEMENT_MODE
-    strategy = strategy or config.THRESHOLD_STRATEGY
-    candidate_sort = candidate_sort or config.CANDIDATE_SORT
-    objective = objective or config.OBJECTIVE
-    args = ["compare_refinement", str(run_dir), phi,
-            json.dumps(list(terms) if terms else None), mode, strategy,
-            candidate_sort, objective]
-    proc = _worker(*args)
+        # evaluate an empty phi, which reads as an ERROR. Rank the candidates instead.
+        return mine_only(run_dir, terms, candidate_sort)
+    proc = _worker("compare_bug_condition", str(run_dir), phi,
+                   json.dumps(list(terms) if terms else None),
+                   candidate_sort or config.CANDIDATE_SORT)
     out = proc.stdout or ""
     if proc.stdout and echo:
         print(out, end="")
     if proc.returncode != 0:
         return Containment("ERROR", None, out + "\n" + (proc.stderr or ""))
-    return parse_containment(out, mode)
+    return parse_containment(out)

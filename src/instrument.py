@@ -1,6 +1,6 @@
 """Step 2a — instrument the game's source so it reports its local variables.
 
-Fault localization can only refine an invariant over variables it can *see*, and
+Fault localization can only rank conditions over variables it can *see*, and
 a variable is only visible if the game's source reports it. gamerv's
 ``runners.source_instrument`` (branch ``local_vars``) closes that gap: it parses
 the game's C++ with libclang, picks the function-locals worth reporting, and

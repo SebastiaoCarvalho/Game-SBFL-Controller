@@ -26,39 +26,32 @@ GAMERV_DIR = Path("/home/sebastiao/nii/fl/gamerv")
 CONTROLLER_DIR = Path(__file__).resolve().parent.parent
 # The dataset, and the rest of the experiment's inputs (tapes, game state,
 # hints), are published separately -- see data/ (the fl-experiment-data repo,
-# added here as a submodule) and its sync_data.py. Read from, in order:
-# $FL_DATASET, $FL_DATA_DIR/dataset.csv, the working copy beside the controller,
+# added here as a submodule) and its sync_data.py. Each row's Target Phi is the
+# ground-truth BUG CONDITION: the condition under which the bug occurs, which step 8
+# ranks and decides (see "Fault localization" below). Read from, in order:
+# $FL_DATASET, $FL_DATA_DIR/<DATASET_NAME>, the working copy beside the controller,
 # and only then the submodule.
 #
 # The working copy comes BEFORE the submodule deliberately. It is the file that
-# gets edited, and data/dataset.csv is a published snapshot of it (refreshed by
+# gets edited, and data/<DATASET_NAME> is a published snapshot of it (refreshed by
 # sync_data.py collect, exactly like the tapes and hints) -- so preferring the
 # submodule would mean an edit here silently not taking effect. On any machine
 # without that path the submodule is what answers.
+#
+# (Until 2026-09-30 the controller could also score refinements -- conditions under
+# which the property holds -- against dataset.csv, of which this file was generated
+# as the negated mirror. That objective and its dataset are archived at the
+# `refinement-archive` tag of the controller, gamerv and data repos.)
+DATASET_NAME = "dataset_bug_condition.csv"
 _DATASET_CANDIDATES = (
     Path(os.environ["FL_DATASET"]) if os.environ.get("FL_DATASET") else None,
-    Path(os.environ["FL_DATA_DIR"]) / "dataset.csv"
+    Path(os.environ["FL_DATA_DIR"]) / DATASET_NAME
     if os.environ.get("FL_DATA_DIR") else None,
-    Path("/home/sebastiao/nii/fl/dataset.csv"),
-    CONTROLLER_DIR / "data" / "dataset.csv",
+    Path("/home/sebastiao/nii/fl") / DATASET_NAME,
+    CONTROLLER_DIR / "data" / DATASET_NAME,
 )
 DATASET = next((p for p in _DATASET_CANDIDATES if p and p.is_file()),
                _DATASET_CANDIDATES[-1])
-# The same dataset with each Target Phi restated as the condition under which the
-# bug OCCURS rather than the one under which the property holds -- the ground truth
-# the "bug-condition" OBJECTIVE is scored against (see below). Generated from
-# DATASET by scripts/mirror_bug_dataset.py, next to it; resolved the same way, with
-# $FL_BUG_DATASET in place of $FL_DATASET.
-BUG_DATASET_NAME = "dataset_bug_condition.csv"
-_BUG_DATASET_CANDIDATES = (
-    Path(os.environ["FL_BUG_DATASET"]) if os.environ.get("FL_BUG_DATASET") else None,
-    Path(os.environ["FL_DATA_DIR"]) / BUG_DATASET_NAME
-    if os.environ.get("FL_DATA_DIR") else None,
-    Path("/home/sebastiao/nii/fl") / BUG_DATASET_NAME,
-    CONTROLLER_DIR / "data" / BUG_DATASET_NAME,
-)
-BUG_DATASET = next((p for p in _BUG_DATASET_CANDIDATES if p and p.is_file()),
-                   _BUG_DATASET_CANDIDATES[-1])
 RESULTS_DIR = CONTROLLER_DIR / "results"
 # Cached operator answers for the manual image/audio predicate prompts, one file
 # per recording: hints/<game>/<branch>/<recX>.hint. Written whenever the operator
@@ -99,8 +92,8 @@ def build_log_path(game_name: str, branch: str) -> Path:
 # --- Source instrumentation (step 2a) -------------------------------------
 # Before compiling a branch, the controller runs gamerv's source instrumenter
 # (runners.source_instrument) over the game's source so the build reports its
-# function-local variables — fault localization can only refine over variables the
-# snapshot carries. The edit is transient: instrument → build → revert, all inside
+# function-local variables — fault localization can only rank conditions over
+# variables the snapshot carries. The edit is transient: instrument → build → revert, all inside
 # game_repo.build(). See instrument.py.
 #
 # Master switch for the step; per game it also needs Game.instrument_src set (a
@@ -122,7 +115,7 @@ INSTRUMENT_DIR = CONTROLLER_DIR / "instrument"
 # emits a plausible-looking set of keys, but every candidate is downgraded to
 # low-confidence and semantic detail as basic as "does this local have an
 # initializer" is lost — which is what hid `collision_static_constrains::movement`
-# (dataset row 1's whole refinement) from the snapshot. instrument.py therefore
+# (dataset row 1's whole ground truth) from the snapshot. instrument.py therefore
 # treats a missing directory as a hard error rather than parsing degraded.
 #
 # Populated from Ubuntu's clang headers, matching the wheel's libclang 18:
@@ -131,69 +124,24 @@ INSTRUMENT_DIR = CONTROLLER_DIR / "instrument"
 #   cp -r x/usr/lib/llvm-18/lib/clang/18 ~/.local/share/gamerv-clang/
 CLANG_RESOURCE_DIR = Path.home() / ".local" / "share" / "gamerv-clang" / "18"
 
-# --- Refinement decision path (step 8) -----------------------------------
-# How gamerv's compare_refinement decides whether phi is a valid refinement:
-#   "symbolic"    — force the symbolic phi -> R containment check against the
-#                   mined R (so R's thresholds matter — see THRESHOLD_STRATEGY).
-#                   Verdict reads "phi IS / is NOT CONTAINED in R". SUCCESS is
-#                   decided by phi -> R_all containment ONLY; when R_all does not
-#                   establish phi but the data-direct test does, the row is
-#                   classified REFINEMENT_NOT_FOUND (the mined R missed a real
-#                   refinement). Either mode reports VARIABLE_NOT_FOUND when phi
-#                   reads a quantity the game never exports, so nothing about phi
-#                   could be decided at all.
-#   "data-direct" — force the data-exact test: evaluate phi on the pooled
-#                   good (P & Q) / violation (P & ~Q) states, independent of R.
-#                   Verdict reads "phi IS a sound refinement, corroborated by
-#                   the data". Errors on a phi that reads a non-raw predicate.
-#   "auto"        — data-direct first, symbolic only as a fallback for non-raw phi
-#                   (gamerv's historical behaviour).
-# Overridable per run with --refinement-mode.
-REFINEMENT_MODE = "symbolic"
-REFINEMENT_MODES = ("auto", "data-direct", "symbolic")
-
-# --- Objective: what is mined, and what phi is read as --------------------
-#   "bug-condition" — the default, and the framing the experiment is reported
-#                     under: spectrum-based fault localization, a condition B
-#                     under which the BUG OCCURS. Every P-state is a test (failing =
-#                     violation, passing = good) and every candidate is ranked by
-#                     its Ochiai suspiciousness ef / sqrt(F * (ef + ep)), with no
-#                     hard constraint on either side. phi is the bad condition, so
-#                     rows are read from BUG_DATASET by default. phi is FAIL when it
-#                     scores below the top of the ranking, REFINEMENT_NOT_FOUND when
-#                     it scores above it (or ties it with no top-ranked candidate
-#                     containing it), SUCCESS when it ties it and a single
-#                     top-ranked B has phi -> B. The threshold strategy does not
-#                     apply: each split is placed where its Ochiai score is highest,
-#                     and fields and paths also get `x == v` atoms for recurring
-#                     values, so a negated equality phi (`x != 0`) has a
-#                     candidate to match.
-#   "refinement"    — a condition R under which the property is SOUND: R is false
-#                     on every violation (P & ~Q) — a hard constraint — and ranked
-#                     by the good states (P & Q) it keeps; G(P & R -> Q). phi is the
-#                     good condition, read from DATASET. Every run before
-#                     2026-09-26 was one of these.
-# Overridable per run with --objective.
-OBJECTIVE = "bug-condition"
-OBJECTIVES = ("refinement", "bug-condition")
-
-# --- Refinement threshold strategy ---------------------------------------
-# How R's numeric atom split-points are placed between the violation and good
-# values when mining R. Only affects the displayed R and the SYMBOLIC phi -> R
-# path (the data-direct verdict does not depend on R's threshold):
-#   "midpoints" — sample midpoints across the pooled values and let the mining
-#                 search pick (gamerv's historical behaviour).
-#   "weakest"   — the loosest sound separator: > max(violation) / < min(violation)
-#                 (the most permissive R; symbolic phi -> R accepts the most phis).
-#   "gap-mean"  — the midpoint of the violation->nearest-good gap (a stricter R).
-# Overridable per run with --threshold-strategy.
-THRESHOLD_STRATEGY = "weakest"
-THRESHOLD_STRATEGIES = ("midpoints", "weakest", "gap-mean")
+# --- Fault localization (step 8) ------------------------------------------
+# Step 8 is spectrum-based fault localization. Every P-state of the row's traces is
+# a test (failing = violation, passing = good), and every candidate condition B over
+# the raw logged variables is ranked by its Ochiai suspiciousness
+# ef / sqrt(F * (ef + ep)), with no hard constraint on either side; each numeric split
+# is placed where its Ochiai score is highest, and fields and paths also get
+# `x == v` atoms for recurring values, so a negated equality phi (`x != 0`) has a
+# candidate to match. phi, the row's ground-truth bug condition, is scored the same
+# way: FAIL when it scores below the top of the ranking, CONDITION_NOT_FOUND when it
+# scores above it (or ties it with no top-ranked candidate containing it), SUCCESS
+# when it ties it and a single top-ranked B has phi -> B. VARIABLE_NOT_FOUND when phi
+# reads a quantity the game never exports, so nothing about phi could be decided.
+# There is nothing to configure here; the within-tier order is the one knob.
 
 # --- Candidate ordering ---------------------------------------------------
-# gamerv scores every sound candidate refinement by its good-state support and
-# reports the top-scored tier: the leading run of candidates sharing the best
-# support. Inside that tier every candidate separates the fault equally well, so
+# gamerv scores every candidate bug condition by its Ochiai suspiciousness and
+# reports the top-ranked tier: the leading run of candidates sharing the best
+# score. Inside that tier every candidate implicates the fault equally strongly, so
 # the order a reader meets them in — and hence the ground truth's rank, the
 # `gt_rank` column — is decided by the miner's own tie-break (fewest literals,
 # then generation order). This selects that within-tier order:
@@ -207,8 +155,8 @@ THRESHOLD_STRATEGIES = ("midpoints", "weakest", "gap-mean")
 #                  own source (the per-variable count step 7a's digest writes to
 #                  gamerv's config/games/<game>/fl_var_popularity.json). Needs
 #                  that file: without it gamerv says so and keeps the mined order.
-# Support is always the primary key, so the tier boundaries, the candidate count
-# and below_top mean the same under every sort and results stay comparable.
+# The score is always the primary key, so the tier boundaries and the candidate
+# count mean the same under every sort and results stay comparable.
 # Overridable per run with --candidate-sort.
 CANDIDATE_SORT = "none"
 CANDIDATE_SORTS = ("none", "type", "popularity")
@@ -250,8 +198,14 @@ class Game:
     # (SuperTuxKart boots straight into the race; nothing tells it to wait).
     replay_delay_flag: str | None
     replay_delay: float                         # seconds until the replay's events start
-    replay_margin: float                        # extra wait after a replay's duration
-    seconds_per_step: float                     # wall-clock seconds per logical frame
+    # Seconds the log keeps running after the game reports its replay over (the
+    # frozen last frame, so the manual review's clips of the final events still
+    # have footage after them). See REPLAY_DONE_ENV.
+    replay_margin: float
+    # Wall-clock seconds per logical frame. Only an estimate of a replay's length
+    # now: step 5 waits for the game's own "replay over" signal, and this sizes
+    # the timeout and the progress line. See REPLAY_TIMEOUT_FACTOR.
+    seconds_per_step: float
     # Extra fixed args appended after the replay flag on every replay launch, for
     # games that need one. Witch Blast's replay obeys a per-run frame budget
     # (``--frames N``, default 600) and self-closes when it is spent, which would
@@ -861,6 +815,30 @@ GAMERV_PROPERTIES_BACKUP = CONTROLLER_DIR / ".properties_backup.json"
 # it overrides gamerv's config/active_game.txt, so setting it per row needs no
 # backup/restore. The value is the row's Game.name.
 GAMERV_GAME_ENV = "GAME"
+# Env var gamerv reads (verification.tools.nullable_members) for the game's key table,
+# the instrumenter's manifest kept per build (instrument.keys_path), so a member the
+# generated report_state nests through a pointer reads as null when it is absent
+# instead of as unreported. Set per row like GAME; the kept table follows the build
+# cache, so by step 8 it is the row's own branch's.
+GAMERV_KEY_TABLE_ENV = "FL_KEY_TABLE"
+
+# --- Replay end -------------------------------------------------------------
+# Step 5 stops a replay's log when the GAME says the replay is over, never on a
+# timer. Each game writes the file this env var names at the point where its
+# replay already freezes (the tape played to its end, or the run's own end: a
+# SuperTux level, a Witch Blast death, an STK race), and nothing else. A timer
+# sized from the tape's frame count cut replays short whenever the game ran
+# slower than the estimate (FreeMiner on battery: 13 fps against a 20 fps
+# floor), and the end of the tape, often the bug itself, never reached the
+# trace.
+REPLAY_DONE_ENV = "GAMERV_REPLAY_DONE"
+# How long to wait for that file before giving the tape up: this multiple of the
+# estimated replay length (frames x seconds_per_step), plus the fixed slack. Only
+# a game that hangs, or crawls along at under a quarter of its estimated speed,
+# reaches it. The tape then fails loudly (row ERROR) instead of being recorded
+# partially.
+REPLAY_TIMEOUT_FACTOR = 4.0
+REPLAY_TIMEOUT_SLACK = 60.0
 
 # --- Timeouts (seconds) ---------------------------------------------------
 BUILD_TIMEOUT = 60 * 30      # a clean cmake build can be slow

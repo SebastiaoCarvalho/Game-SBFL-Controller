@@ -11,7 +11,7 @@
   5. record traces via replay         (record_traces — launches the game per tape)
   6. validate all logs                (gamerv.py)
   7. select the last invalid trace    (fault localization skipped — see run_case)
-  8. check phi is a valid refinement  (gamerv.compare_refinement)
+  8. rank the bug conditions, decide phi (gamerv.compare_bug_condition)
   9. emit the test result
 
 The row's ``Game Name`` selects a :class:`config.Game` bundle — its repo, build,
@@ -37,6 +37,7 @@ build AND the replay (step 5), reverting once the traces are recorded.
 """
 
 import os
+import tempfile
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -59,14 +60,15 @@ from game_repo import DirtyTreeError
 
 # Ordered phase labels for per-case timing. The single elapsed_s total is split
 # across these; not every phase runs for every row (e.g. an early INCONCLUSIVE
-# return leaves later phases unrecorded). See run_case. "rerank" is step 8b, which
-# only a multi-sort run has: experiment bookkeeping, kept out of "refine" so the
+# return leaves later phases unrecorded). See run_case. "localize" is steps 7a-8
+# (rank the bug conditions, decide phi). "rerank" is step 8b, which only a
+# multi-sort run has: experiment bookkeeping, kept out of "localize" so the
 # method's own time is not inflated by it.
-PHASES = ("build", "record", "validate", "refine", "rerank")
+PHASES = ("build", "record", "validate", "localize", "rerank")
 
 #: What a re-ranking call (step 8b) rewrites in the run dir. Restored afterwards, so
 #: the row's artefacts — archived with its logs — are the primary sort's.
-_RANK_ARTEFACTS = ("phi_refinement.json", "refinement_separators.log")
+_RANK_ARTEFACTS = ("phi_verdict.json", "bug_conditions.log")
 
 #: gamerv's note that a sort could not do its job (popularity with no source counts)
 #: and left the mined order in place — see fault_localization._announce_sort.
@@ -90,7 +92,8 @@ class CaseResult:
     specification: str
     phi: str
     formula: str
-    status: str               # SUCCESS | FAIL | NOT_FOUND | INCONCLUSIVE
+    status: str               # SUCCESS | FAIL | CONDITION_NOT_FOUND
+                              # | VARIABLE_NOT_FOUND | INCONCLUSIVE
                               # | NEEDS_MANUAL | SKIPPED | ERROR
     r_text: str | None = None
     notes: str = ""
@@ -143,7 +146,7 @@ def record_traces(game: Game, branch: str) -> int:
     for rec in recs:
         frames = recordings.frame_count(rec)
         dur = recordings.replay_duration(game, rec)
-        print(f"    tape {rec.name}  ({frames} frames, ~{dur:.1f}s replay)")
+        print(f"    tape {rec.name}  ({frames} frames, ~{dur:.1f}s replay estimated)")
         run_dir = _record_one(game, rec, dur)
         if run_dir is not None:
             recorded += 1
@@ -151,19 +154,44 @@ def record_traces(game: Game, branch: str) -> int:
     return recorded
 
 
+class ReplayIncompleteError(RuntimeError):
+    """A tape's replay never reported its end: the trace would be cut short.
+
+    Raised instead of keeping a partial trace. A cut-short replay is not a smaller
+    experiment, it is a wrong one: the end of a tape is often where the bug is
+    (FreeMiner's fall through the floor was its last event), and a hint answered
+    on the full trace loses those answers when it is reconciled against a short
+    one. The row is reported ERROR, and nothing is cached.
+    """
+
+
 def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
-    """Launch the game on one tape, log the replay, then stop.
+    """Launch the game on one tape, log the replay until the game says it is over,
+    then stop.
+
+    The end comes from the game, never from a timer: each game writes the file
+    named by ``config.REPLAY_DONE_ENV`` where its replay freezes (see there), and
+    the log runs on for ``game.replay_margin`` after it, on the frozen last frame.
+    ``replay_dur`` is only the estimate the timeout is sized from. A replay that
+    does not report its end in time, or a game that exits before it does, raises
+    :class:`ReplayIncompleteError`.
 
     Returns the run dir gamerv just wrote (so the caller can tag it with its hint
-    id), or ``None`` if the tape was skipped/failed and produced no run dir. The
-    new run dir is found by diffing the logs dir before launch vs. after the log
-    is stopped (gamerv writes the dir at SIGINT, inside ``stop_log``).
+    id), or ``None`` if the tape was skipped (gamerv could not start logging) and
+    produced no run dir. The new run dir is found by diffing the logs dir before
+    launch vs. after the log is stopped (gamerv writes the dir at SIGINT, inside
+    ``stop_log``).
     """
     before = {d.name for d in gamerv.run_dirs()}
+    done_file = (Path(tempfile.gettempdir())
+                 / f"gamerv-replay-done-{os.getpid()}-{time.time_ns()}")
+    done_file.unlink(missing_ok=True)
     t_launch = time.time()
-    proc = repo.launch(game, game.replay_args(str(rec)))
+    proc = repo.launch(game, game.replay_args(str(rec)),
+                       env={config.REPLAY_DONE_ENV: str(done_file)})
     log = None
     ok = False
+    incomplete = ""
     try:
         # 1.1 start logging + attach to the window.
         log = gamerv.start_log()
@@ -181,21 +209,51 @@ def _record_one(game: Game, rec, replay_dur: float) -> Path | None:
                   f"(> replay_delay={game.replay_delay}s); early events may be "
                   f"missed — increase the game's replay_delay.")
 
-        # 1.2/1.3 wait for the replay to play out, then stop. Poll so we also
-        # stop promptly if the game exits early (replay ended / window closed /
-        # crash) rather than logging dead air until the timer elapses.
-        finish_at = t_launch + game.replay_delay + replay_dur + game.replay_margin
-        while time.time() < finish_at:
-            if proc.poll() is not None:
-                print(f"    [{game.name}] game exited — stopping log")
+        # 1.2/1.3 wait for the game to report the replay over, then let the log
+        # run on the frozen last frame for replay_margin. The estimate only sizes
+        # the timeout: a replay is allowed to run REPLAY_TIMEOUT_FACTOR times
+        # slower than estimated before the tape is given up.
+        give_up_at = (t_launch + game.replay_delay
+                      + config.REPLAY_TIMEOUT_FACTOR * replay_dur
+                      + game.replay_margin + config.REPLAY_TIMEOUT_SLACK)
+        why = None
+        while why is None:
+            if done_file.exists():
+                why = done_file.read_text().strip() or "done"
                 break
-            time.sleep(0.5)
-        ok = True
+            if proc.poll() is not None:
+                incomplete = (f"the game exited (rc {proc.returncode}) before "
+                              f"reporting the end of the replay")
+                break
+            if time.time() > give_up_at:
+                incomplete = (f"the replay did not report its end within "
+                              f"{give_up_at - t_launch:.0f}s of launch (estimated "
+                              f"{game.replay_delay + replay_dur:.0f}s)")
+                break
+            time.sleep(0.25)
+        if why is not None:
+            took = time.time() - t_launch
+            print(f"    [{game.name}] replay over ({why}) {took:.1f}s after launch "
+                  f"(estimated {game.replay_delay + replay_dur:.1f}s)")
+            settle_until = time.time() + game.replay_margin
+            while time.time() < settle_until and proc.poll() is None:
+                time.sleep(0.25)
+            ok = True
     finally:
         if log is not None:
             gamerv.stop_log(log)   # 1.3 stop logging (1.4: not validated here)
         repo.shutdown(proc, grace=game.shutdown_grace)
+        done_file.unlink(missing_ok=True)
 
+    if incomplete:
+        # The partial run dir stays in gamerv's logs for inspection (the next row's
+        # step 4 archives it), but this row records nothing and caches nothing.
+        partial = sorted({d.name for d in gamerv.run_dirs(include_empty=True)}
+                         - before)
+        where = f" (partial trace left in {partial[-1]})" if partial else ""
+        raise ReplayIncompleteError(
+            f"tape {rec.name}: {incomplete} — not recorded, since the trace would "
+            f"be cut short{where}")
     if not ok:
         return None
     new = sorted({d.name for d in gamerv.run_dirs()} - before)
@@ -298,12 +356,11 @@ def _record_or_restore(game: Game, case: TestCase,
 
 
 def _rerank(run_dir: Path, case: TestCase, sorts: list[str],
-            primary: metrics.Mining, primary_status: str, *, mode: str,
-            strategy: str, objective: str) -> dict[str, int | None]:
+            primary: metrics.Mining, primary_status: str) -> dict[str, int | None]:
     """Step 8b — the ground truth's rank under each of ``sorts``, over the candidates
     step 8 already mined.
 
-    Each sort is one more ``compare_refinement`` call on the same run dir. Its mining
+    Each sort is one more ``compare_bug_condition`` call on the same run dir. Its mining
     cache matches (the sort is not part of the signature), so nothing is re-mined:
     gamerv re-orders the cached tier and decides phi against it, exactly as a run
     started under that sort would — the rank recorded here is the one that run would
@@ -320,9 +377,8 @@ def _rerank(run_dir: Path, case: TestCase, sorts: list[str],
     ranks: dict[str, int | None] = {}
     try:
         for s in sorts:
-            cont = gamerv.compare_refinement(run_dir, case.phi, None, mode=mode,
-                                             strategy=strategy, candidate_sort=s,
-                                             objective=objective, echo=False)
+            cont = gamerv.compare_bug_condition(run_dir, case.phi, None,
+                                                candidate_sort=s, echo=False)
             m = metrics.read(run_dir, case.formula, case.phi)
             if _SORT_DEGRADED in cont.stdout:
                 print(f"    {s}: [warn] the sort had nothing to order by and kept the "
@@ -351,12 +407,9 @@ def _rerank(run_dir: Path, case: TestCase, sorts: list[str],
 
 
 def run_case(case: TestCase, manual_auto: bool = False,
-             refinement_mode: str | None = None,
-             threshold_strategy: str | None = None,
              instrument_source: bool | None = None,
              skip_manual: bool = False,
              candidate_sort: str | None = None,
-             objective: str | None = None,
              rank_sorts: tuple[str, ...] = ()) -> CaseResult:
     """Execute the pipeline for one dataset row.
 
@@ -373,17 +426,13 @@ def run_case(case: TestCase, manual_auto: bool = False,
     can be re-run interactively later. Steps 7-9 are not reached for such a row —
     its traces have no verdict, so there is nothing to decide phi against.
 
-    ``refinement_mode`` (auto / data-direct / symbolic) selects how step 8 decides
-    phi, ``threshold_strategy`` (midpoints / weakest / gap-mean) how R's
-    thresholds are placed, and ``candidate_sort`` (none / type / popularity) how
-    the mined candidates are ordered *within* one score tier — which moves the
-    ground truth's rank without changing the candidate set or the mined R.
-    ``objective`` (refinement / bug-condition) says whether step 8 mines conditions
-    under which the property holds or under which the bug occurs — and so which of
-    the two the row's phi is. ``None`` defers to ``config.REFINEMENT_MODE`` /
-    ``config.THRESHOLD_STRATEGY`` / ``config.CANDIDATE_SORT`` / ``config.OBJECTIVE``.
+    Step 8 ranks the row's candidate bug conditions by Ochiai and decides the row's
+    phi — the condition under which the bug occurs — against the top of that ranking.
+    ``candidate_sort`` (none / type / popularity) orders the mined candidates
+    *within* one score tier — which moves the ground truth's rank without changing
+    the candidate set or the top score. ``None`` defers to ``config.CANDIDATE_SORT``.
 
-Alongside the verdict, step 8's search metrics are attached to the result
+    Alongside the verdict, step 8's search metrics are attached to the result
     (:class:`metrics.Mining`): the candidate count, the ground truth's rank among the
     ranked candidates and the match tier.
 
@@ -424,6 +473,8 @@ Alongside the verdict, step 8's search metrics are attached to the result
     # Select gamerv's active game for the whole row (overrides active_game.txt).
     prev_game_env = os.environ.get(config.GAMERV_GAME_ENV)
     os.environ[config.GAMERV_GAME_ENV] = game.name
+    prev_keys_env = os.environ.get(config.GAMERV_KEY_TABLE_ENV)
+    os.environ[config.GAMERV_KEY_TABLE_ENV] = str(instrument.keys_path(game))
 
     instr = config.INSTRUMENT if instrument_source is None else instrument_source
 
@@ -492,20 +543,14 @@ Alongside the verdict, step 8's search metrics are attached to the result
 
         print("    mining generically (all logged variables)")
 
-        # Decision path + threshold placement + candidate order for step 8
-        # (default to config).
-        mode = refinement_mode or config.REFINEMENT_MODE
-        strategy = threshold_strategy or config.THRESHOLD_STRATEGY
+        # Candidate order for step 8 (defaults to config).
         sort = candidate_sort or config.CANDIDATE_SORT
-        goal = objective or config.OBJECTIVE
-        print(f"    refinement mode: {mode}   threshold strategy: {strategy}"
-              f"   candidate sort: {sort}   objective: {goal}")
+        print(f"    candidate sort: {sort}")
 
         # Step 7 — pick the trace to check phi against (the last invalid run).
-        # Fault localization is intentionally skipped: compare_refinement re-mines
-        # R itself and, on its data-direct path, decides whether phi is a sound
-        # refinement straight from the trace states (no dependence on R's midpoint
-        # thresholds), so a separate FL pass would only duplicate that mining.
+        # Fault localization is intentionally skipped: compare_bug_condition ranks
+        # the bug conditions itself and scores phi straight from the trace states,
+        # so a separate FL pass would only duplicate that mining.
         print("[7] select last invalid trace")
         run_dir = gamerv.last_invalid_run()
         if run_dir is None:
@@ -517,21 +562,19 @@ Alongside the verdict, step 8's search metrics are attached to the result
         # the game's base fields from. Cached on the instrumentation fingerprint, so
         # it costs a file read on a row that changed nothing. See term_rules.
         print("[7a] term rules (compound-term allow-list from source)")
-        with _phase(timings, "refine"):
+        with _phase(timings, "localize"):
             term_rules.ensure(game, run_dir)
 
-        # Step 8 — is phi a valid refinement? (mode/strategy chosen above)
-        noun = "bug condition" if goal == "bug-condition" else "refinement"
-        print(f"[8] check phi as {noun}   (phi = {case.phi})")
-        with _phase(timings, "refine"):
-            cont = gamerv.compare_refinement(run_dir, case.phi, None,
-                                             mode=mode, strategy=strategy,
-                                             candidate_sort=sort, objective=goal)
+        # Step 8 — rank the bug conditions and decide phi against the top of them.
+        print(f"[8] check phi as bug condition   (phi = {case.phi})")
+        with _phase(timings, "localize"):
+            cont = gamerv.compare_bug_condition(run_dir, case.phi, None,
+                                                candidate_sort=sort)
 
-        # The search metrics for the row: how many top-scored candidate refinements
+        # The search metrics for the row: how many top-ranked candidate bug conditions
         # the miner produced and where the ground truth sits among them, read off the
         # records step 8 just persisted in the run dir (metrics.py). Lower-scoring
-        # sound refinements stay in gamerv's log and out of the metrics.
+        # candidates stay in gamerv's log and out of the metrics.
         mining = metrics.read(run_dir, case.formula, case.phi)
         if mining.candidates is not None:
             rank = ("not among them" if mining.gt_rank is None
@@ -539,7 +582,7 @@ Alongside the verdict, step 8's search metrics are attached to the result
             tier = f" ({mining.gt_match})" if mining.gt_match else ""
             union = " [union-only]" if mining.union_only else ""
             below = " [below the top score]" if mining.below_top else ""
-            print(f"    mined {mining.candidates} top-scored candidate refinement(s) "
+            print(f"    mined {mining.candidates} top-ranked candidate bug condition(s) "
                   f"— {rank}{tier}{union}{below}")
             if case.phi.strip():
                 mining.ranks = {sort: mining.gt_rank}
@@ -549,13 +592,11 @@ Alongside the verdict, step 8's search metrics are attached to the result
         if extra and mining.ranks and cont.status != "ERROR":
             print(f"[8b] re-rank the same candidates under: {', '.join(extra)}")
             with _phase(timings, "rerank"):
-                mining.ranks.update(_rerank(run_dir, case, extra, mining, cont.status,
-                                            mode=mode, strategy=strategy,
-                                            objective=goal))
+                mining.ranks.update(_rerank(run_dir, case, extra, mining, cont.status))
 
         # Step 9 — emit result, carrying gamerv's one-line verdict as the note.
         return result(cont.status, r_text=cont.r_text,
-                      notes=cont.verdict or "see compare_refinement output")
+                      notes=cont.verdict or "see compare_bug_condition output")
 
     except DirtyTreeError:
         raise
@@ -575,3 +616,7 @@ Alongside the verdict, step 8's search metrics are attached to the result
             os.environ.pop(config.GAMERV_GAME_ENV, None)
         else:
             os.environ[config.GAMERV_GAME_ENV] = prev_game_env
+        if prev_keys_env is None:
+            os.environ.pop(config.GAMERV_KEY_TABLE_ENV, None)
+        else:
+            os.environ[config.GAMERV_KEY_TABLE_ENV] = prev_keys_env

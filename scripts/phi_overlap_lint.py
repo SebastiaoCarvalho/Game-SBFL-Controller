@@ -25,8 +25,8 @@ names a variable, and it is in the file because row 52 needed it.
 
 So: **no spec entry may name a program variable that appears in a ground-truth
 phi.** This script decides that mechanically, by intersecting the phi vocabulary
-of ``dataset.csv`` with the entries of every spec, and it is meant to run in CI so
-the property can be *verified* rather than asserted.
+of the dataset (``config.DATASET``) with the entries of every spec, and it is meant
+to run in CI so the property can be *verified* rather than asserted.
 
 WHAT IT CLASSIFIES, and why the three severities are not interchangeable:
 
