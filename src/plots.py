@@ -76,7 +76,8 @@ Only rows that actually mined are plotted in the mining figures: a blank
 ``candidates`` cell means the row never reached the point of persisting a mining
 record (see metrics.read), and counting it as zero would claim the miner came back
 empty-handed. The rank figure further keeps only the rows whose ground truth *was*
-found among the top-scored candidates (a blank ``gt_rank`` has no position to draw). The
+found among the top-scored candidates (a blank ``gt_rank`` has no position to draw) —
+the SUCCESS rows, since only a phi tying the top score is among them. The
 space figures likewise skip a row with no variable count (it never pooled states, or
 its run predates the columns). How many rows were dropped either way is printed in
 each figure's subtitle, so a box is never read as covering more rows than it does.
@@ -108,6 +109,7 @@ from functools import cached_property
 from pathlib import Path
 
 import config
+import metrics
 import report
 
 MINING_CSV = "mining.csv"
@@ -208,8 +210,11 @@ def read_mining(run_dir: Path) -> tuple[list[MinedRow], int]:
             if n is None:
                 dropped += 1
                 continue
+            # Only a SUCCESS row has a rank — see report.row_from_dict for the
+            # pre-2026-10-13 runs that also ranked an OUTRANKED phi.
+            found = (row.get("status") or "").strip() == metrics.FOUND_STATUS
             rows.append(MinedRow((row.get("game") or "?").strip(), n,
-                                 _int(row.get("gt_rank"))))
+                                 _int(row.get("gt_rank")) if found else None))
     return rows, dropped
 
 

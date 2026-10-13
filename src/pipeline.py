@@ -379,7 +379,7 @@ def _rerank(run_dir: Path, case: TestCase, sorts: list[str],
         for s in sorts:
             cont = gamerv.compare_bug_condition(run_dir, case.phi, None,
                                                 candidate_sort=s, echo=False)
-            m = metrics.read(run_dir, case.formula, case.phi)
+            m = metrics.read(run_dir, case.formula, case.phi, status=cont.status)
             if _SORT_DEGRADED in cont.stdout:
                 print(f"    {s}: [warn] the sort had nothing to order by and kept the "
                       f"mined order — no rank recorded")
@@ -581,8 +581,9 @@ def run_case(case: TestCase, manual_auto: bool = False,
         # The search metrics for the row: how many top-ranked candidate bug conditions
         # the miner produced and where the ground truth sits among them, read off the
         # records step 8 just persisted in the run dir (metrics.py). Lower-scoring
-        # candidates stay in gamerv's log and out of the metrics.
-        mining = metrics.read(run_dir, case.formula, case.phi)
+        # candidates stay in gamerv's log and out of the metrics, and the rank is kept
+        # only on a SUCCESS: a phi below the top score is not among the top-scored.
+        mining = metrics.read(run_dir, case.formula, case.phi, status=cont.status)
         if mining.candidates is not None:
             rank = ("not among them" if mining.gt_rank is None
                     else f"ground truth at rank {mining.gt_rank}")

@@ -89,9 +89,14 @@ def _counts(src: Path | None, row: dict) -> tuple[int, int] | None:
             continue
         if entry is None:
             continue
-        m = metrics.read(path.parent, row["formula"], row["phi"])
+        status = (row.get("status") or "").strip()
+        m = metrics.read(path.parent, row["formula"], row["phi"], status=status)
         got = dict(zip(metrics.COLUMNS, m.cells()))
-        if all(got[c] == (row.get(c) or "").strip() for c in CHECKED):
+        # A run written before metrics.read took the verdict ranked a non-SUCCESS
+        # row too; read that cell as the blank it now is (report.row_from_dict).
+        want = {c: ("" if c == "gt_rank" and status != metrics.FOUND_STATUS
+                    else (row.get(c) or "").strip()) for c in CHECKED}
+        if all(got[c] == want[c] for c in CHECKED):
             if m.good_states is not None and m.bad_states is not None:
                 return m.good_states, m.bad_states
     return None

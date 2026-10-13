@@ -192,12 +192,20 @@ def row_from_dict(d: dict) -> Row:
     def cell(key: str) -> str:
         return (d.get(key) or "").strip()
 
+    # Only a SUCCESS row has a rank (metrics.FOUND_STATUS). A run written before
+    # 2026-10-13 also ranked an OUTRANKED phi that a weaker top-ranked B contained;
+    # those cells read as blank, so an old run regenerates under the current rule.
+    found = cell("status") == metrics.FOUND_STATUS
+
+    def rank(key: str) -> int | None:
+        return _int(d.get(key)) if found else None
+
     return Row(game=cell("game"), branch=cell("row_branch") or cell("github_branch"),
                status=cell("status"),
                phi=cell("phi") or cell("ground_truth"),
                fault_type=cell("fault_type"),
-               candidates=_int(d.get("candidates")), gt_rank=_int(d.get("gt_rank")),
-               gt_match=cell("gt_match"),
+               candidates=_int(d.get("candidates")), gt_rank=rank("gt_rank"),
+               gt_match=cell("gt_match") if found else "",
                union_only=cell("union_only").lower() in ("yes", "true", "1"),
                case=_int(d.get("row")), notes=cell("notes"),
                elapsed_s=_float(d.get(_TOTAL_COLUMN)), phases=_phase_cells(d),
@@ -205,7 +213,7 @@ def row_from_dict(d: dict) -> Row:
                varying=_int(d.get("varying_variables")),
                good_states=_int(d.get("good_states")),
                bad_states=_int(d.get("bad_states")),
-               ranks=tuple((s, _int(d.get(c)))
+               ranks=tuple((s, rank(c))
                            for s, c in zip(metrics.SORTS, metrics.RANK_COLUMNS)))
 
 

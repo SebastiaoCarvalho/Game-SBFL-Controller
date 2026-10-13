@@ -93,11 +93,16 @@ nothing below indexes the tier by ``rank``. The tier is used only for its **size
 (a set, identical under every sort), and the exact/implication distinction comes off
 the verdict's own ``r_text``.
 
-**No verdict means not found.** gamerv persists a verdict only when containment
-runs — for a phi that ties the top score, or reads a non-raw catalogue predicate. A
-phi it rejects on its score alone (below the top, above it, or holding on no
-violation), or one over variables no top-ranked candidate constrains, leaves no
-record, and the row's ground truth is then simply not found.
+**Only a SUCCESS row is found.** A verdict record is not enough: gamerv runs
+containment — and persists it — for an OUTRANKED phi too, so a phi scoring below the
+top tier still gets a "rank" whenever some weaker top-ranked candidate contains it;
+and a record is never cleared, so one left by an earlier compare of the same run dir
+outlives a later compare that rejected phi on its score alone (above the top, or
+holding on no violation). Only a phi that ties the top score is a top-scored
+condition, which is exactly what the row's SUCCESS verdict says, so :func:`read`
+takes that verdict and keeps the rank only under it (:data:`FOUND_STATUS`). With no
+record at all — phi over variables no top-ranked candidate constrains — the ground
+truth is not found either.
 
 ``gt_match`` says which tier ``gt_rank`` refers to, so tiers are never silently mixed
 in a results table:
@@ -119,6 +124,10 @@ MINING_CACHE = "fault_localization.json"
 #: gamerv's persisted phi verdict (rank / candidate / union_only) — see the module
 #: docstring and runners.fault_localization._persist_phi_check.
 PHI_CACHE = "phi_verdict.json"
+
+#: The one row verdict under which the ground truth counts as found, and so carries a
+#: rank — see the module docstring's "Only a SUCCESS row is found".
+FOUND_STATUS = "SUCCESS"
 
 #: Comparison operators, longest first so "<=" is matched before "<".
 _OPS = ("<=", ">=", "==", "!=", "<", ">")
@@ -157,8 +166,9 @@ class Mining:
 
     @property
     def found(self) -> bool:
-        """Was the ground truth found by a single top-scored candidate? (The tier says
-        how; ``union_only`` is deliberately not it: it is a way of *missing*.)"""
+        """Was the ground truth found — phi top-scored and contained in a single
+        top-scored candidate? (The tier says how; ``union_only`` is deliberately not
+        it: it is a way of *missing*.)"""
         return bool(self.gt_match)
 
     def cells(self) -> list[str]:
@@ -434,12 +444,14 @@ def _phi_verdict(run_dir: Path, formula: str, phi: str) -> dict | None:
     return entry
 
 
-def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
+def read(run_dir: Path | str | None, formula: str, phi: str, *,
+         status: str) -> Mining:
     """Mining metrics for one case, read from ``run_dir``'s persisted records.
 
     The candidate count is the size of the mining cache's **top-ranked tier**, the
-    ground truth's rank and tier come from gamerv's phi verdict beside it; with no
-    verdict persisted the ground truth was not found (see the module docstring).
+    ground truth's rank and tier come from gamerv's phi verdict beside it — kept only
+    when the row's ``status`` is :data:`FOUND_STATUS`; any other verdict, or none
+    persisted, means the ground truth was not found (see the module docstring).
 
     Returns an empty :class:`Mining` when the run has no mining record (mining never
     reached the point of persisting: an unparseable property, no violation states, no
@@ -470,11 +482,15 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
 
     verdict = _phi_verdict(run_dir, formula, phi)
     if verdict is None:
-        # Containment never ran: phi was rejected on its score alone (below the top,
-        # above it, or on no violation), or no top-ranked candidate is over its
-        # variables. Nothing established it, so it is not found.
+        # Containment never ran: no top-ranked candidate is over phi's variables, or
+        # phi was rejected on its score alone. Nothing established it: not found.
         return m
     m.union_only = bool(verdict.get("union_only"))
+    if status != FOUND_STATUS:
+        # The record may still say phi -> B — an OUTRANKED phi inside a weaker
+        # top-ranked B, or a stale record from an earlier compare — but phi is not a
+        # top-scored condition, so it has no rank among them.
+        return m
     rank, match = verdict.get("rank"), (verdict.get("match") or "")
     if match == "implication" and rank:
         rank = int(rank)

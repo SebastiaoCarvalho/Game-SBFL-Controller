@@ -21,9 +21,11 @@ that folder's report.txt ("BY CASE"), not to stdout.
 
 import argparse
 import csv
+import hashlib
 import json
 import statistics
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +245,9 @@ def main(argv: list[str]) -> int:
               f"one results folder.")
 
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Taken before the first row, so "started" and the commits are the ones the run
+    # began from rather than whatever the trees hold when it ends.
+    settings = _settings(args, sorts)
     gamerv.backup_properties()
     try:
         try:
@@ -252,7 +257,7 @@ def main(argv: list[str]) -> int:
             # would abort on the same dirty tree.
             print(f"\nABORTING: {exc}", file=sys.stderr)
             return 2
-        out = _write_results(results, _settings(args, sorts),
+        out = _write_results(results, settings,
                              suffix="_bug" + ("_sorts" if multi else ""))
         _summary(results, out)
     finally:
@@ -303,6 +308,7 @@ def _settings(args, sorts: list[str]) -> dict:
     ``candidate_sort`` is the rows' own sort (their verdicts and ``gt_rank``);
     ``rank_sorts`` every sort a rank was recorded under, that one first.
     """
+    dataset = Path(args.dataset or config.DATASET)
     return {
         # Constant, but recorded so a results folder states what it measured.
         "objective": "bug-condition",
@@ -311,9 +317,30 @@ def _settings(args, sorts: list[str]) -> dict:
         "instrument_source": bool(args.instrument),
         "game": args.game,
         "rows": ([args.row] if args.row else list(args.rows) if args.rows else None),
-        "dataset": str(args.dataset or config.DATASET),
+        "dataset": str(dataset),
+        "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+        # What produced the numbers: the code (controller, gamerv) and the inputs
+        # (data: tapes, hints, games.lock.json). A "-dirty" sha ran with uncommitted
+        # changes to tracked files, so no commit reproduces it exactly.
+        "commits": {"controller": _commit(config.CONTROLLER_DIR),
+                    "gamerv": _commit(config.GAMERV_DIR),
+                    "data": _commit(config.CONTROLLER_DIR / "data")},
         "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def _commit(repo: Path) -> str | None:
+    """``repo``'s HEAD sha, with ``-dirty`` appended when tracked files differ from
+    it; ``None`` when ``repo`` is not a git checkout."""
+    def git(*argv: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    try:
+        sha = git("rev-parse", "HEAD")
+        dirty = git("status", "--porcelain", "--untracked-files=no")
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return sha + ("-dirty" if dirty else "")
 
 
 def _write_results(results, settings: dict | None = None,
@@ -336,7 +363,8 @@ def _write_results(results, settings: dict | None = None,
                    for rows that produced no candidate, so no cell is silently
                    blank.
       settings.json the knobs this batch ran under (candidate sort(s),
-                   instrumentation, row/game selection). Two runs over the same
+                   instrumentation, row/game selection, dataset) and the commits
+                   it started from (controller, gamerv, data). Two runs over the same
                    rows under different knobs are otherwise indistinguishable;
                    report.txt and the plots read it back.
       mining.csv   step 8's search metrics per row: how many top-ranked candidate

@@ -217,7 +217,10 @@ literals):
 A `phi` that reads a non-raw catalogue predicate has no score of its own and is
 decided by containment against the top tier alone. The containment verdict is
 persisted to the run dir's `phi_verdict.json` (rank, the candidate that established
-`phi`, `union_only`), the whole ranking to `bug_conditions.log`.
+`phi`, `union_only`), the whole ranking to `bug_conditions.log`. gamerv runs (and
+persists) containment for an OUTRANKED `phi` too, so a FAIL row's record can name a
+weaker top-ranked `B` that contains it. That is not a find: `phi` is not top-scored.
+So `gt_rank` — and every rank figure — is filled for SUCCESS rows only.
 
 Each numeric candidate is placed at its Ochiai-best split and spelled at the
 loosest edge of that data gap (`x > -1` when no value lies between -1 and the next
@@ -437,7 +440,7 @@ every per-case number (verdict, note, mining metrics, phase timings) goes to
 | `full.csv` | every column the pipeline produced (the dataset `row` number, fault type + parent category, phi, formula, notes, mining metrics, per-phase timings) — the archival record. |
 | `summary.csv` | the five columns a results table needs: game, branch, property, ground truth, and the bug condition found (the top-ranked candidate the verdict is about, column `B` in `full.csv`). |
 | `mining.csv` | step 8's search metrics per row: how many top-ranked candidate bug conditions were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. The **rank** is a position in the order `--candidate-sort` chose; the count is the tier's size and is the same under every sort. Also the size of the state the miner searched: `variables` (every `base.field` in the pooled good/violation states) and `varying_variables` (the ones not constant across them — the vocabulary atoms are built over), counted by gamerv (`raw_atoms.state_variables`) and blank for a row that never pooled states. Then the labelled examples the ranking learned from: `good_states` (pooled trigger states where the spec held) and `bad_states` (violations) — `scripts/backfill_states.py <run>` adds both to a run written before them. Then `gt_rank_<sort>` per candidate sort: the run's own sort always, every sort under `--candidate-sort all`. |
-| `settings.json` | the knobs the batch ran under — candidate sort(s), instrumentation, row/game selection, dataset (and `objective`, always `bug-condition`). Two runs over the same rows under different knobs are otherwise indistinguishable; `report.txt` and the figures read it back and caption themselves with it. |
+| `settings.json` | the knobs the batch ran under — candidate sort(s), instrumentation, row/game selection, dataset and its sha256 (and `objective`, always `bug-condition`) — plus the controller, gamerv and data commits it started from (`-dirty` when a tree had uncommitted changes). Two runs over the same rows under different knobs are otherwise indistinguishable; `report.txt` and the figures read it back and caption themselves with it. |
 | `report.txt` | the **aggregate** view: rows per classification, then the same counts per game, per **bug category** and per **parent category**, plus the mining rates for each — then `PER-GAME BREAKDOWN`, which repeats all of those cuts **over one game's rows at a time** (that game's classifications, category tables and mining numbers, with no other game in the denominators) — then the **per-case** division (`BY CASE`): one line per dataset row with its verdict, candidate count, ground-truth rank, match tier and note, followed by `BY CASE — TIMINGS` (per-case wall clock and phase seconds, with the run's totals). |
 | `success_by_fault_type.png` | one bar per **bug category**, grouped under its parent, split into success / fail / not mined (C_NF) / undecided (V_NF, INCO) / not evaluated (SKIP, MANU, ERR), with the success rate at its end. |
 | `success_by_parent.png` | the same split for the two **parent categories** (non-temporal vs temporal). |
