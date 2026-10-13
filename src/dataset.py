@@ -19,8 +19,8 @@ supplies BOTH the good (P & Q) and violation (P & ~Q) states, so phi is decided
 within that single branch.
 
 ``csv.DictReader`` handles the doubled-quote escaping in the file, so a cell
-written as ``"Walk -> ObjectPresent(""Tux"")"`` comes back as the plain string
-``Walk -> ObjectPresent("Tux")``.
+written as ``"Walk -> VisualPredicate(""Tux walks"")"`` comes back as the plain string
+``Walk -> VisualPredicate("Tux walks")``.
 """
 
 import csv

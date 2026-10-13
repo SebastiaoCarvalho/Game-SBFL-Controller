@@ -1,8 +1,7 @@
 """Human-in-the-loop answers for gamerv's manual predicate values.
 
-When ``MANUAL_PREDICATES`` is active (set in ``gamerv/.env``), gamerv can't
-compute the visual (LLM) and audio predicates itself. Its ``validate`` worker
-instead dumps the exact frames/audio it would have judged under
+gamerv's visual and audio predicates are answered by hand. Its ``validate``
+worker dumps each one's evidence (frames/audio) under
 ``<run_dir>/manual_assets/`` (plus, for a visual request, a ``clip.mp4`` of the
 same window — see ``_ask_one``), lists each undecided predicate in
 ``<run_dir>/manual_requests.json``, and exits ``NEEDS_MANUAL`` (3).
@@ -40,9 +39,9 @@ _NOTE_CALLS = 3
 
 class NoTTYError(RuntimeError):
     """Manual input is needed but there is no terminal to prompt the operator on
-    (e.g. a headless/CI controller run). Turn MANUAL_PREDICATES off, run the
-    experiment interactively, or pass --skip-manual to have such rows skipped
-    (NEEDS_MANUAL) instead of failing."""
+    (e.g. a headless/CI controller run). Run the experiment interactively, or
+    pass --skip-manual to have such rows skipped (NEEDS_MANUAL) instead of
+    failing."""
 
 
 class NeedsManualError(RuntimeError):
@@ -121,8 +120,8 @@ def collect(run_dir: Path, worker_output: str,
             f"{len(to_prompt)} predicate value(s) need manual input, but the "
             f"controller has no TTY to prompt on. Add a per-call default to the "
             f"hint (bare-call key, or hints/<branch>/{hints.DEFAULTS_FILE}), run "
-            f"the experiment interactively, pass --skip-manual to skip such rows, "
-            f"or turn MANUAL_PREDICATES off."
+            f"the experiment interactively, or pass --skip-manual to skip such "
+            f"rows."
         )
     if resolved:
         print(f"\n  [manual] auto-answered {len(resolved)} predicate value(s) "
@@ -131,7 +130,7 @@ def collect(run_dir: Path, worker_output: str,
     hand: dict[str, bool] = {}
     if to_prompt:
         print(f"\n  [manual] {len(to_prompt)} predicate value(s) need your "
-              f"judgement (MANUAL_PREDICATES is on):")
+              f"judgement:")
         hand = {r["key"]: _ask_one(run_dir, r) for r in to_prompt}
 
     answers = {**resolved, **hand}

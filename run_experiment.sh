@@ -7,7 +7,6 @@
 #     ./run_experiment.sh --rows 4-9 --manual-auto
 #     ./run_experiment.sh --rows 1-60 --skip-manual   # unattended (overnight)
 #     ./run_experiment.sh --skip-manual --candidate-sort all  # sweep: one run per sort
-#     ./run_experiment.sh --row 20 --refinement-mode symbolic --threshold-strategy weakest
 #
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

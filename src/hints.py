@@ -1,7 +1,7 @@
 """Cached operator answers ("hints") for the manual image/audio predicate prompts.
 
-When ``MANUAL_PREDICATES`` is on, gamerv can't compute the visual/audio
-predicates and the controller prompts the operator at the terminal for each one
+gamerv's visual/audio predicates are answered by hand: the controller prompts
+the operator at the terminal for each one
 (see ``manual_review``). Answering them by hand on every run is the cost this
 module removes: each answer is cached so a later run can replay it instead of
 re-asking.
@@ -14,7 +14,7 @@ at record time, when the controller knows which tape produced the run); the file
 itself is the same ``{key: bool}`` shape as ``manual_answers.json``.
 
 **Per-call defaults** sidestep the per-trace index entirely. A hint entry whose
-key is a *bare call string* (no ``::``) — e.g. ``"ObjectPresent(\"Tux\")": true``
+key is a *bare call string* (no ``::``) — e.g. ``"VisualPredicate(\"Tux jumps\")": true``
 — answers that predicate at EVERY state it is evaluated in the trace, regardless
 of the state index. It is index-free, so one such entry survives re-recording and
 can be shared across traces. Two places carry them: bare-call keys inside a tape's

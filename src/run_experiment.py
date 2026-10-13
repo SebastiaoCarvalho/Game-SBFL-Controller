@@ -304,9 +304,7 @@ def _settings(args, sorts: list[str]) -> dict:
     ``rank_sorts`` every sort a rank was recorded under, that one first.
     """
     return {
-        # Constant since the refinement objective was retired, but still written: an
-        # archived run without the key was a refinement run, and compare.py reads
-        # the difference off it.
+        # Constant, but recorded so a results folder states what it measured.
         "objective": "bug-condition",
         "candidate_sort": sorts[0],
         "rank_sorts": list(sorts),
@@ -323,9 +321,7 @@ def _write_results(results, settings: dict | None = None,
     """Write this run's CSVs into their own results/run_<timestamp>/ folder.
 
     ``suffix`` is appended to the folder name: every run ends in ``_bug``, and a
-    run ranked under several candidate sorts in ``_bug_sorts``. The bare
-    ``run_<timestamp>`` was a refinement run's name (archived under
-    ``results/refinement_archive/``), so the suffix keeps the two apart.
+    run ranked under several candidate sorts in ``_bug_sorts``.
 
     One folder per run, so a run can grow extra artefacts (more views of the
     same rows, plots) without cluttering results/:
@@ -482,10 +478,6 @@ def _summary(results, out) -> None:
         if union_only:
             print(f"              {union_only} further row(s) are covered only by the "
                   f"union of several candidates — not counted as found")
-        below_top = sum(1 for r in mined if r.mining.below_top)
-        if below_top:
-            print(f"              {below_top} further row(s) are covered by a single "
-                  f"candidate scoring below the top tier — not counted as found")
     # The same aggregation report.txt is written from, so the two cannot disagree.
     rows = report.rows_from_results(results)
     by_sort = report.sort_rank_lines(rows)

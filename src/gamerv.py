@@ -24,9 +24,9 @@ class GameRVError(RuntimeError):
     pass
 
 
-# Exit code gamerv's `validate` worker uses when MANUAL_PREDICATES is on and it
-# needs the operator to supply visual/audio predicate values (see manual_review
-# and gamerv's gui/worker.py / runners/validate.py).
+# Exit code gamerv's `validate` worker uses when it needs the operator to supply
+# visual/audio predicate values (see manual_review and gamerv's gui/worker.py /
+# runners/validate.py).
 NEEDS_MANUAL_EXIT = 3
 
 
@@ -173,6 +173,17 @@ def available_games() -> list[str]:
     return [str(g) for g in games] if isinstance(games, list) else []
 
 
+#: The per-game files gamerv's loaders read; each falls back to a built-in Super Tux
+#: default when absent, so a missing one is a silent change of game, not an error.
+GAME_CONFIG_FILES = ("game_profile.json", "event_types.json")
+
+
+def missing_game_files(game_name: str) -> list[str]:
+    """Which of :data:`GAME_CONFIG_FILES` the game's gamerv bundle lacks."""
+    folder = config.GAMERV_DIR / "config" / "games" / game_name
+    return [f for f in GAME_CONFIG_FILES if not (folder / f).is_file()]
+
+
 def check_formula(formula: str) -> tuple[bool, str | None]:
     """Validate predicate names/arity + Spot syntax. Returns (ok, error)."""
     proc = _worker("check_formula", formula)
@@ -275,12 +286,12 @@ def validate(run_dir: Path, auto: bool = False,
              skip_manual: bool = False) -> subprocess.CompletedProcess:
     """Validate a logged run, answering manual predicate prompts if gamerv asks.
 
-    With MANUAL_PREDICATES active, gamerv can't compute the visual/audio
-    predicates itself: its worker dumps the evidence and exits NEEDS_MANUAL. We
-    then collect the operator's True/False for each, save them, and re-invoke —
-    looping until the verdict is written (exit 0). Each pass only asks about
-    predicates still unanswered, so it converges (usually in one round). When
-    manual mode is off this is a single pass, exactly as before.
+    gamerv has no automatic evaluator for the visual/audio predicates: its
+    worker dumps the evidence and exits NEEDS_MANUAL. We then collect the
+    operator's True/False for each, save them, and re-invoke — looping until the
+    verdict is written (exit 0). Each pass only asks about predicates still
+    unanswered, so it converges (usually in one round). A property with no
+    visual/audio predicate validates in a single pass.
 
     The hint is first reconciled against this run's trace (``hints.reconcile``):
     its per-state keys are positions in the event log, so a trace that gained or

@@ -480,11 +480,18 @@ def run_case(case: TestCase, manual_auto: bool = False,
 
     try:
         # Preflight: gamerv must have a catalog bundle for this game, or it would
-        # silently fall back to its built-in default.
+        # silently fall back to its built-in default. Both files count: a folder
+        # without one of them still loads, under Super Tux's taxonomy or events.
         if game.name not in gamerv.available_games():
             return result("ERROR", notes=(
                 f"gamerv has no catalog for game {game.name!r} "
                 f"(config/games/{game.name}/); create it before running this row"))
+        missing = gamerv.missing_game_files(game.name)
+        if missing:
+            return result("ERROR", notes=(
+                f"gamerv's catalog for {game.name!r} lacks {', '.join(missing)} "
+                f"(config/games/{game.name}/); without it gamerv would use Super "
+                f"Tux's built-in one"))
 
         # Step 2 — checkout + build (launch happens per-tape in step 5). The
         # build instruments the source first (step 2a) unless the row opts out or
@@ -581,9 +588,8 @@ def run_case(case: TestCase, manual_auto: bool = False,
                     else f"ground truth at rank {mining.gt_rank}")
             tier = f" ({mining.gt_match})" if mining.gt_match else ""
             union = " [union-only]" if mining.union_only else ""
-            below = " [below the top score]" if mining.below_top else ""
             print(f"    mined {mining.candidates} top-ranked candidate bug condition(s) "
-                  f"— {rank}{tier}{union}{below}")
+                  f"— {rank}{tier}{union}")
             if case.phi.strip():
                 mining.ranks = {sort: mining.gt_rank}
 

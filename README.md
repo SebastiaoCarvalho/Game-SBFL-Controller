@@ -105,8 +105,9 @@ branch name (e.g. `base`) without colliding.
    (`REPLAY_TIMEOUT_FACTOR` × that + `REPLAY_TIMEOUT_SLACK`), and a replay that
    misses it fails the row (ERROR) instead of leaving a cut-short trace. Traces
    are **not** validated here.
-6. Validate every recorded run (`worker.py validate`). If `MANUAL_PREDICATES`
-   is on (see below), validate pauses for operator judgement — handled inline.
+6. Validate every recorded run (`worker.py validate`). A property with a
+   visual/audio predicate pauses for operator judgement (see below) — handled
+   inline.
 7. Select the last invalid trace. (A separate fault-localization pass is skipped —
    `compare_bug_condition` ranks the bug conditions itself, so it would duplicate it.)
 7a. **Term rules** (`term_rules.py`) — regenerate the game's compound-term
@@ -263,24 +264,10 @@ good states alone.
 **The dataset.** `dataset_bug_condition.csv` is the dataset and the file to edit
 (`config.DATASET`; `$FL_DATASET` or `$FL_DATA_DIR` override it, and `data/` holds the
 published snapshot). Its `Target Phi` reads like the mutation condition
-(`player.wading == true`, not `~(player.wading == false)`): it was generated as the
-negation of the earlier good-condition dataset, the negation pushed inside (De
-Morgan, `Exists` <-> `Forall`, flipped comparison operators, double negations
-dropped). Only row 95 keeps a `~`, on `~Exists(a & b)`, because a quantifier body
-cannot be a disjunction.
-
-**Archived: the refinement objective.** Until 2026-09-30 step 8 could instead mine
-*refinements*, conditions `R` under which the property is sound. Such an `R` is
-false on every violation, `G(P & R -> Q)` holds, and `R` is ranked by the good
-states it keeps. Those runs were scored against the good-condition `dataset.csv`,
-under the `--objective`, `--refinement-mode` and `--threshold-strategy` knobs. All
-of it is archived at the `refinement-archive` tag of the controller, gamerv and data
-repos (`git checkout refinement-archive`). Its results folders are under
-`results/refinement_archive/`, and `dataset.csv` is under `../archive/refinement/`.
-Archived runs can still be read. `report.py`, `plots.py` and `compare.py` read the
-old `REFINEMENT_NOT_FOUND` status as `CONDITION_NOT_FOUND` and the old `refine`
-phase as `localize`, and `metrics.read` falls back to an archived run dir's
-`phi_refinement.json`.
+(`player.wading == true`, not `~(player.wading == false)`), with any negation
+pushed inside (De Morgan, `Exists` <-> `Forall`, flipped comparison operators).
+Only row 95 keeps a `~`, on `~Exists(a & b)`, because a quantifier body cannot be a
+disjunction.
 
 #### Candidate ordering (step 8)
 
@@ -334,9 +321,7 @@ the point. It can also move `gt_match` from `exact` to `implication` where `phi`
 was spelled at a tighter split than the retained candidate: that spelling is not
 a candidate the tool would show.
 
-Re-reading an **archived** run whose verdict ranked `phi` over the whole list
-rather than the tier reports a rank past the tier as `below_top` (a miss). To
-compare orderings, rank every row under several sorts in one run:
+To compare orderings, rank every row under several sorts in one run:
 
 ```bash
 ./run_experiment.sh --skip-manual --candidate-sort all          # none, then type, popularity
@@ -366,7 +351,7 @@ Every row ends on exactly one of these:
 | --- | --- |
 | `SUCCESS` | `phi` ties the top Ochiai score and is contained in **a single** top-ranked bug condition `B` (`phi -> B`). |
 | `FAIL` | `phi` was decided and rejected: the data ranks another condition above it (*OUTRANKED*), it holds on no violation (*VACUOUS*), or a non-raw `phi` is contained in no top-ranked candidate. |
-| `CONDITION_NOT_FOUND` | `phi` scores as high as the best mined candidate, or higher, but no single top-ranked `B` contains it — **the search missed it**, `phi` is not wrong. Includes the rows only the *union* of several candidates covers (`union_only`). Archived runs call it `REFINEMENT_NOT_FOUND`. |
+| `CONDITION_NOT_FOUND` | `phi` scores as high as the best mined candidate, or higher, but no single top-ranked `B` contains it — **the search missed it**, `phi` is not wrong. Includes the rows only the *union* of several candidates covers (`union_only`). |
 | `VARIABLE_NOT_FOUND` | `phi` could not be evaluated at all: it reads a quantity **the game never exports**, so no logged state carries it. Nothing was decided about `phi`; the gap is in the game's reported vocabulary (see step 2a and gamerv's `report_state` coverage), not in the row. |
 | `INCONCLUSIVE` | Nothing to decide `phi` against — no tape recorded, no invalid trace, no positives to contrast, no candidate mined. |
 | `SKIPPED` | The row has no `Target Phi`; its bug conditions are still ranked and the most suspicious one reported, but there is no ground truth to compare. |
@@ -440,8 +425,7 @@ CONTROLLER_BUILD_OUTPUT=raw ./run_experiment.sh --row 4   # inherit the compiler
 ```
 
 Results are written to one folder per run, `results/run_<timestamp>_bug/`
-(`_bug_sorts` for a run ranked under several candidate sorts — the bare
-`run_<timestamp>` was a refinement run's, see the archive note above), and
+(`_bug_sorts` for a run ranked under several candidate sorts), and
 summarized on stdout. The closing stdout summary is **aggregate only** — the
 classification counts, the mining rates and the per-game / per-category divisions;
 every per-case number (verdict, note, mining metrics, phase timings) goes to
@@ -453,7 +437,7 @@ every per-case number (verdict, note, mining metrics, phase timings) goes to
 | `full.csv` | every column the pipeline produced (the dataset `row` number, fault type + parent category, phi, formula, notes, mining metrics, per-phase timings) — the archival record. |
 | `summary.csv` | the five columns a results table needs: game, branch, property, ground truth, and the bug condition found (the top-ranked candidate the verdict is about, column `B` in `full.csv`). |
 | `mining.csv` | step 8's search metrics per row: how many top-ranked candidate bug conditions were mined, the ground truth's rank among them, the match tier, and whether only the union of several candidates covered it. The **rank** is a position in the order `--candidate-sort` chose; the count is the tier's size and is the same under every sort. Also the size of the state the miner searched: `variables` (every `base.field` in the pooled good/violation states) and `varying_variables` (the ones not constant across them — the vocabulary atoms are built over), counted by gamerv (`raw_atoms.state_variables`) and blank for a row that never pooled states. Then the labelled examples the ranking learned from: `good_states` (pooled trigger states where the spec held) and `bad_states` (violations) — `scripts/backfill_states.py <run>` adds both to a run written before them. Then `gt_rank_<sort>` per candidate sort: the run's own sort always, every sort under `--candidate-sort all`. |
-| `settings.json` | the knobs the batch ran under — candidate sort(s), instrumentation, row/game selection, dataset (and `objective`, always `bug-condition`, so an archived refinement run is told apart). Two runs over the same rows under different knobs are otherwise indistinguishable; `report.txt` and the figures read it back and caption themselves with it. |
+| `settings.json` | the knobs the batch ran under — candidate sort(s), instrumentation, row/game selection, dataset (and `objective`, always `bug-condition`). Two runs over the same rows under different knobs are otherwise indistinguishable; `report.txt` and the figures read it back and caption themselves with it. |
 | `report.txt` | the **aggregate** view: rows per classification, then the same counts per game, per **bug category** and per **parent category**, plus the mining rates for each — then `PER-GAME BREAKDOWN`, which repeats all of those cuts **over one game's rows at a time** (that game's classifications, category tables and mining numbers, with no other game in the denominators) — then the **per-case** division (`BY CASE`): one line per dataset row with its verdict, candidate count, ground-truth rank, match tier and note, followed by `BY CASE — TIMINGS` (per-case wall clock and phase seconds, with the run's totals). |
 | `success_by_fault_type.png` | one bar per **bug category**, grouped under its parent, split into success / fail / not mined (C_NF) / undecided (V_NF, INCO) / not evaluated (SKIP, MANU, ERR), with the success rate at its end. |
 | `success_by_parent.png` | the same split for the two **parent categories** (non-temporal vs temporal). |
@@ -530,7 +514,7 @@ rank distributions are comparable):
 | line | what it says |
 |---|---|
 | `in the top k` | how often `phi` was among the first *k* mined candidates — the number a results table quotes, since *k* is how far a user reads. The cut-offs are `--top` (default `1,3,5,10`). |
-| `ranked at all` | and its two complements: **found without a rank** and **not found**. Only an archived run can have a found-without-a-rank row: that is the retired `region` tier, where `phi` was contained only in a region derived from `phi` itself. It is no longer counted as a find. |
+| `ranked at all` | and its complement, **not found**. |
 | `median rank` | the middle position, over each side's own ranked rows. |
 | `mean reciprocal rank` | `1/rank` averaged over *every* compared case, 0 where `phi` was not ranked — the single number that moves both when a fix finds `phi` on a new row and when it ranks `phi` higher. |
 | `median rank share` | the rank as a fraction of that run's candidate set, because the sets move too: rank 11 of 155 is deeper into the list than rank 12 of 236, and only this number says so. |
@@ -625,8 +609,8 @@ answers, so a second unattended pass covers them.
    `config/games/<Game Name>/` (matching the dataset name exactly), or the row is
    `ERROR`ed at preflight.
 3. **Dataset alignment.** `Specification` / `Target Phi` must use that game's
-   exact gamerv catalog vocabulary (`PlayerWalked`, `ObjectPresent`,
-   `VisualAssertion`, raw atoms like `player.hurt == false`). The controller feeds
+   exact gamerv catalog vocabulary (`PlayerWalked`, `VisualPredicate`,
+   `AudioPredicate`, raw atoms like `player.hurt == false`). The controller feeds
    specs verbatim — it does not translate names. Misaligned rows are reported as
    `ERROR` with the parser message.
 4. **Branch reconciliation.** Dataset branches must contain `base`'s
@@ -683,12 +667,9 @@ answers, so a second unattended pass covers them.
 - **Log cache (`log_cache/<game>/`).** Step 5's raw logs depend only on the binary
   and the row's tapes, so a content-hash hit restores the pristine run dirs and
   re-validates instead of re-recording. A changed binary/tape → miss → re-record.
-- `gamerv validate` invokes LLM vision (keys in `gamerv/.env`) + DeepFace and
-  needs a display for capture — heavyweight.
-- **Manual predicate values.** When `gamerv/.env` sets `MANUAL_PREDICATES`
-  (`true`, or a list like `audio`/`visual,audio`), gamerv does **not** compute
-  the visual (LLM) and audio predicates — it dumps the frames/audio it would
-  have judged and asks for them. The controller answers this inline in step 6
+- **Manual predicate values.** gamerv has no automatic evaluator for the visual
+  and audio predicates — it dumps each one's evidence (frames, clip, audio) and
+  asks for them. The controller answers this inline in step 6
   (`manual_review.collect`): for each undecided predicate it opens the frame/clip
   (`xdg-open`) and reads a `t`/`f` at the terminal, saves the answers, and
   re-runs validate until the verdict is written. This only triggers for rows
@@ -696,8 +677,7 @@ answers, so a second unattended pass covers them.
   validates untouched. **Requires an interactive run** — with no TTY (CI /
   detached) a row that needs manual input is reported `ERROR` (`NoTTYError`),
   unless `--skip-manual` was passed, which reports it `NEEDS_MANUAL` and moves on
-  (see below). Leave `MANUAL_PREDICATES` empty/unset to keep validation fully
-  automatic.
+  (see below).
 - **Replaying manual answers (`hints/`).** Every answer the operator gives is
   cached under `hints/<game>/<branch>/<recX>.hint` — one file per `.rec`
   recording, keyed by gamerv's stable `"<state_index>::<call>"`. Caching happens
@@ -714,7 +694,7 @@ answers, so a second unattended pass covers them.
   `<state_index>::<call>` keys are per-trace, hand-writing or copying them between
   traces is fragile (the indices rarely line up). When a predicate's answer is
   *uniform* across a trace — same value at every state it's evaluated — declare it
-  once as a **bare-call key** (no `::`), e.g. `{"ObjectPresent(\"Tux\")": true}`.
+  once as a **bare-call key** (no `::`), e.g. `{"VisualPredicate(\"Tux jumps\")": true}`.
   A bare-call entry answers that call at every state, independent of the index, so
   it survives re-recording and is reusable across traces. Put it either inside a
   tape's own `.hint` (applies to that recording) or, to cover every tape of a

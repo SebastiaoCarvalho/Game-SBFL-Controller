@@ -7,7 +7,7 @@
 describe the *engine* — its reporting ABI, its type spellings, where its source is
 — so that porting the tool to a new game costs a fixed, row-independent amount.
 What it actually accumulated is a second thing: entries that publish one specific
-variable *because a dataset row refines over it*. Witch Blast's spec states the
+variable *because a dataset row's phi reads it*. Witch Blast's spec states the
 practice outright, in its own comment: "Any equipment flag a dataset row refines
 over therefore has to be published by name here ... **Add one per slot a row
 needs.**"
@@ -292,7 +292,7 @@ def lint_game(game_name: str, spec_path: Path, phi: dict) -> list[dict]:
 def _fingerprint(f: dict) -> str:
     """Identity of a finding in the allowlist. Deliberately excludes ``rows``: a
     row renumbering must not silently re-accept a finding, and adding a row that
-    refines over the same key must not raise a second one."""
+    reads the same key must not raise a second one."""
     return f"{f['game']}|{f['path']}|{f['class']}|{f['name']}"
 
 

@@ -76,8 +76,7 @@ Only rows that actually mined are plotted in the mining figures: a blank
 ``candidates`` cell means the row never reached the point of persisting a mining
 record (see metrics.read), and counting it as zero would claim the miner came back
 empty-handed. The rank figure further keeps only the rows whose ground truth *was*
-found among the top-scored candidates (a blank ``gt_rank`` has no position to draw —
-including a ``below_top`` row, whose ground truth sits outside the plotted set). The
+found among the top-scored candidates (a blank ``gt_rank`` has no position to draw). The
 space figures likewise skip a row with no variable count (it never pooled states, or
 its run predates the columns). How many rows were dropped either way is printed in
 each figure's subtitle, so a box is never read as covering more rows than it does.
@@ -187,16 +186,11 @@ class MinedRow:
     gt_rank: int | None      # None when the ground truth was not found
 
 
-def read_mining(run_dir: Path) -> tuple[list[MinedRow], int, bool]:
-    """``(rows that mined, dropped, top_scored)`` from a run's ``mining.csv``.
+def read_mining(run_dir: Path) -> tuple[list[MinedRow], int]:
+    """``(rows that mined, dropped)`` from a run's ``mining.csv``.
 
     ``dropped`` counts the rows whose ``candidates`` cell is blank or unreadable —
     rows that never mined — which are excluded from every box.
-
-    ``top_scored`` says whether the counts are over the top-scored tier: the
-    ``below_top`` column is what a run written since that change carries, so a CSV
-    without it holds the older whole-list counts and is labelled as such rather than
-    captioned with a scope it does not have.
     """
     path = Path(run_dir) / MINING_CSV
     rows: list[MinedRow] = []
@@ -209,16 +203,14 @@ def read_mining(run_dir: Path) -> tuple[list[MinedRow], int, bool]:
             return None
 
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        top_scored = "below_top" in (reader.fieldnames or [])
-        for row in reader:
+        for row in csv.DictReader(f):
             n = _int(row.get("candidates"))
             if n is None:
                 dropped += 1
                 continue
             rows.append(MinedRow((row.get("game") or "?").strip(), n,
                                  _int(row.get("gt_rank"))))
-    return rows, dropped, top_scored
+    return rows, dropped
 
 
 @dataclass
@@ -228,7 +220,7 @@ class _Run:
     dir: Path
 
     @cached_property
-    def mining(self) -> tuple[list[MinedRow], int, bool]:
+    def mining(self) -> tuple[list[MinedRow], int]:
         return read_mining(self.dir)
 
     @cached_property
@@ -378,7 +370,7 @@ def _chrome(ax, value_label: str, title: str, subtitle: str,
         value_label, fontsize=10, color=INK_SECONDARY)
     # The subtitle grows upward from the axes top, so the title's pad has to clear it:
     # a fixed pad sized for two lines is overrun the moment a third is added (the
-    # pre-tier scope note), and the title lands on top of the caption.
+    # sort note), and the title lands on top of the caption.
     lines = subtitle.count("\n") + 1
     ax.set_title(title, loc="left", pad=8 + 13 * lines + lift, fontsize=13, color=INK)
     ax.annotate(subtitle, xy=(0, 1), xycoords="axes fraction",
@@ -871,8 +863,7 @@ def _render_ranks_by_sort(run: _Run, out: Path) -> Path | None:
 # --------------------------------------------------------------------------
 # Figure — candidate-set size
 # --------------------------------------------------------------------------
-def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str,
-                    top_scored: bool = True) -> Path:
+def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
     """Boxplot of the top-scored candidate count, one box per game (matplotlib must
     import)."""
     groups = _grouped(rows)
@@ -881,10 +872,8 @@ def draw_candidates(rows: list[MinedRow], out_path: Path, subtitle: str,
 
     fig, ax = _new_axes(len(series))
     log = _log_if_wide(ax, _boxes(ax, labels, series), headroom=2.0)
-    scope = "Top-ranked candidate" if top_scored else "Candidate"
-    _chrome(ax, ("top-ranked candidate bug conditions" if top_scored
-                 else "candidate conditions mined") + (" (log scale)" if log else ""),
-            f"{scope} bug conditions per row", subtitle)
+    _chrome(ax, "top-ranked candidate bug conditions" + (" (log scale)" if log else ""),
+            "Top-ranked candidate bug conditions per row", subtitle)
     return _save(fig, out_path)
 
 
@@ -932,15 +921,14 @@ def _rank_groups(rows: list[MinedRow]) -> list[tuple[str, list[int], list[int]]]
     return out
 
 
-def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str,
-               top_scored: bool = True) -> Path:
+def draw_ranks(rows: list[MinedRow], out_path: Path, subtitle: str) -> Path:
     """Paired boxplot: the candidate count and the ground truth's rank, per game.
 
     Only the rows whose ground truth was found are drawn — a row with no rank has no
     position to compare against its candidate count. Both series share one axis (they
     are the size of, and an index into, the same ranked list).
     """
-    scope = "top-scored candidates" if top_scored else "candidates"
+    scope = "top-scored candidates"
     return _paired_boxes(_rank_groups(rows), out_path,
                          (scope, "rank of ground truth"),
                          f"{scope} / ground-truth rank",
@@ -1080,13 +1068,6 @@ def _sort_note(run_dir: Path | str) -> str:
     return f"\ncandidates within a tier ordered by: {sort}" if sort and sort != "none" else ""
 
 
-def _scope_note(top_scored: bool) -> str:
-    """The caption line naming what the counts are over. A run written before the
-    metric was narrowed to the top-scored tier is captioned as the whole ranked list,
-    so an old figure is never read as a new one (see read_mining)."""
-    return "" if top_scored else "\ncounts over the whole ranked list (pre-tier run)"
-
-
 def _candidates_subtitle(rows: list[MinedRow], dropped: int) -> str:
     tail = f", {dropped} excluded (never mined)" if dropped else ""
     return f"{len(rows)} mined row(s){tail}\n{_BOX_LEGEND}"
@@ -1104,14 +1085,11 @@ def _ranks_subtitle(ranked: list[MinedRow], mined: int) -> str:
 # Entry points
 # --------------------------------------------------------------------------
 def _render_candidates(run: _Run, out: Path) -> Path | None:
-    rows, dropped, top_scored = run.mining
+    rows, dropped = run.mining
     if not rows:
         print("    no mined rows in this run — candidates boxplot skipped")
         return None
-    return draw_candidates(rows, out,
-                           _candidates_subtitle(rows, dropped)
-                           + _scope_note(top_scored) + run.sort_note,
-                           top_scored)
+    return draw_candidates(rows, out, _candidates_subtitle(rows, dropped) + run.sort_note)
 
 
 def _render_ranks(run: _Run, out: Path) -> Path | None:
@@ -1123,16 +1101,13 @@ def _render_ranks(run: _Run, out: Path) -> Path | None:
         print("    ranked under several candidate sorts — the candidates-vs-rank "
               "boxplot is drawn per sort in ranks_by_sort.png instead")
         return None
-    rows, _dropped, top_scored = run.mining
+    rows, _dropped = run.mining
     ranked = [r for r in rows if r.gt_rank]
     if not ranked:
         print("    no row's ground truth was ranked — candidates-vs-rank boxplot "
               "skipped")
         return None
-    return draw_ranks(ranked, out,
-                      _ranks_subtitle(ranked, len(rows))
-                      + _scope_note(top_scored) + run.sort_note,
-                      top_scored)
+    return draw_ranks(ranked, out, _ranks_subtitle(ranked, len(rows)) + run.sort_note)
 
 
 def _states_rows(run: _Run, figure: str) -> tuple[list[report.Row], str] | None:

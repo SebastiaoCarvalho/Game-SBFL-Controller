@@ -5,7 +5,7 @@ The manual-answer cache (`hints/<branch>/<recX>.hint`) keys every answer by
 gamerv's per-trace `"<state_index>::<call>"`. Those indices don't line up between
 traces, so copying a `.hint` from one recording to another is unreliable. When a
 predicate's answer is the SAME at every state it's evaluated, that fragility is
-avoidable: a bare-call default (`{"ObjectPresent(\"Tux\")": true}`) answers the
+avoidable: a bare-call default (`{"VisualPredicate(\"Tux jumps\")": true}`) answers the
 call at every state, index-free, and can live in `hints/<branch>/_defaults.hint`
 to cover every tape of the branch at once (see `src/hints.py`).
 

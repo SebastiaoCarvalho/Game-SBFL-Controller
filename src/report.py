@@ -70,12 +70,6 @@ SETTINGS_JSON = "settings.json"
 STATUSES = ("SUCCESS", "FAIL", "CONDITION_NOT_FOUND", "VARIABLE_NOT_FOUND",
             "INCONCLUSIVE", "SKIPPED", "NEEDS_MANUAL", "ERROR")
 
-#: Statuses renamed since an archived run was written, mapped onto their current
-#: names when its ``full.csv`` is read back, so an old run's report, plots and
-#: comparisons count them under today's word. REFINEMENT_NOT_FOUND was the refinement
-#: objective's (and the early bug-condition runs') name for CONDITION_NOT_FOUND.
-LEGACY_STATUS = {"REFINEMENT_NOT_FOUND": "CONDITION_NOT_FOUND"}
-
 #: Short column heads for the per-group tables (a full status word is 19 chars).
 ABBREV = {"SUCCESS": "SUCC", "FAIL": "FAIL", "CONDITION_NOT_FOUND": "C_NF",
           "VARIABLE_NOT_FOUND": "V_NF", "INCONCLUSIVE": "INCO", "SKIPPED": "SKIP",
@@ -117,10 +111,6 @@ class Row:
     gt_rank: int | None
     gt_match: str
     union_only: bool
-    #: phi is established, but by a candidate scoring below the top-scored tier the
-    #: metrics report — a miss here that can still be SUCCESS in ``status``
-    #: (see metrics.py).
-    below_top: bool = False
     #: The dataset row this case came from (1-based), None for a run written before
     #: the column existed — the per-case table then falls back to branch order.
     case: int | None = None
@@ -185,9 +175,6 @@ def _float(cell: str | None) -> float | None:
 #: whole case and is read separately.
 _PHASE_SUFFIX = "_s"
 _TOTAL_COLUMN = "elapsed_s"
-#: Phases renamed since an archived run was written: steps 7a-8 were "refine" under
-#: the refinement objective.
-LEGACY_PHASE = {"refine": "localize"}
 
 
 def _phase_cells(d: dict) -> tuple[tuple[str, str], ...]:
@@ -197,7 +184,7 @@ def _phase_cells(d: dict) -> tuple[tuple[str, str], ...]:
     for k, v in d.items():
         if k and k.endswith(_PHASE_SUFFIX) and k != _TOTAL_COLUMN:
             name = k[: -len(_PHASE_SUFFIX)]
-            out.append((LEGACY_PHASE.get(name, name), (v or "").strip() or "-"))
+            out.append((name, (v or "").strip() or "-"))
     return tuple(out)
 
 
@@ -206,13 +193,12 @@ def row_from_dict(d: dict) -> Row:
         return (d.get(key) or "").strip()
 
     return Row(game=cell("game"), branch=cell("row_branch") or cell("github_branch"),
-               status=LEGACY_STATUS.get(cell("status"), cell("status")),
+               status=cell("status"),
                phi=cell("phi") or cell("ground_truth"),
                fault_type=cell("fault_type"),
                candidates=_int(d.get("candidates")), gt_rank=_int(d.get("gt_rank")),
                gt_match=cell("gt_match"),
                union_only=cell("union_only").lower() in ("yes", "true", "1"),
-               below_top=cell("below_top").lower() in ("yes", "true", "1"),
                case=_int(d.get("row")), notes=cell("notes"),
                elapsed_s=_float(d.get(_TOTAL_COLUMN)), phases=_phase_cells(d),
                variables=_int(d.get("variables")),
@@ -231,7 +217,6 @@ def row_from_result(res) -> Row:
                fault_type=res.fault_type, candidates=res.mining.candidates,
                gt_rank=res.mining.gt_rank, gt_match=res.mining.gt_match,
                union_only=res.mining.union_only,
-               below_top=res.mining.below_top,
                case=getattr(res, "row", None) or None, notes=res.notes,
                elapsed_s=res.elapsed_s,
                phases=tuple(res.phase_cells().items()),
@@ -365,7 +350,6 @@ def _mining_summary(rows: list[Row]) -> list[str]:
         return ["  no row both mined and carried a ground-truth phi."]
     found = [r for r in mined if r.found]
     ranked = [r for r in mined if r.gt_rank]
-    region = [r for r in found if r.gt_match == "region"]   # archived runs only
     exact = [r for r in found if r.gt_match == "exact"]
     union = [r for r in mined if r.union_only]
     cands = [r.candidates for r in mined]
@@ -377,17 +361,9 @@ def _mining_summary(rows: list[Row]) -> list[str]:
         f"    at a known rank among the candidates: {len(ranked)}  "
         f"(spelled exactly as phi: {len(exact)})",
     ]
-    if region:
-        out.append(f"    by phi's own sound core region (no rank): {len(region)}")
     out.append(
         f"  rejected by the single-candidate rule: {len(union)}  "
         f"(only the union of several candidates covers phi)")
-    below = [r for r in mined if r.below_top]
-    if below:
-        out.append(
-            f"  rejected as below the top score: {len(below)}  "
-            f"(a single mined candidate covers phi, but one scoring below the "
-            f"top-scored tier — such a row can still be SUCCESS in the status column)")
     if cands:
         out.append(f"  candidates per row:  median {statistics.median(cands):g}   "
                    f"min {min(cands)}   max {max(cands)}")
@@ -512,8 +488,7 @@ def _case_table(rows: list[Row]) -> list[str]:
     gw = max([4] + [len(r.game or "?") for r in ordered])
     bw = max([6] + [len(r.branch or "?") for r in ordered])
     sw = max([6] + [len(r.status or "?") for r in ordered])
-    mw = max([5] + [len(r.gt_match) for r in ordered]
-             + [9 for r in ordered if r.below_top])   # "below-top"
+    mw = max([5] + [len(r.gt_match) for r in ordered])
     out = [f"  {'row':>3}  {'game':<{gw}}  {'branch':<{bw}}  {'status':<{sw}}  "
            f"{'cand':>5}  {'rank':>5}  {'match':<{mw}}  {'time':>8}"]
     for r in ordered:
@@ -523,7 +498,7 @@ def _case_table(rows: list[Row]) -> list[str]:
             f"{r.status or '?':<{sw}}  "
             f"{'-' if r.candidates is None else r.candidates:>5}  "
             f"{'-' if r.gt_rank is None else r.gt_rank:>5}  "
-            f"{r.gt_match or ('below-top' if r.below_top else '-'):<{mw}}  "
+            f"{r.gt_match or '-':<{mw}}  "
             f"{'-' if r.elapsed_s is None else f'{r.elapsed_s:.1f}s':>8}")
         out += _wrap(r.notes, " " * 7)
     return out
@@ -631,22 +606,12 @@ def _settings_line(settings: dict | None) -> list[str]:
     def fmt(v) -> str:
         return ",".join(map(str, v)) if isinstance(v, list) else str(v)
 
-    # rank_sorts only says something when it names more than the row's own sort. The
-    # last two knobs are recorded only by archived refinement-era runs.
-    shown = {k: settings.get(k) for k in
-             ("objective", "candidate_sort", "rank_sorts", "refinement_mode",
-              "threshold_strategy")}
+    # rank_sorts only says something when it names more than the row's own sort.
+    shown = {k: settings.get(k) for k in ("objective", "candidate_sort", "rank_sorts")}
     if len(shown.get("rank_sorts") or ()) < 2:
         shown["rank_sorts"] = None
     parts = [f"{k}={fmt(v)}" for k, v in shown.items() if v]
-    out = [f"settings: {'   '.join(parts)}"] if parts else []
-    if settings.get("objective", "refinement") == "refinement":
-        # Written before the refinement objective was retired: its verdicts are
-        # about refinements R (phi -> R, R false on every violation), not about the
-        # bug conditions the meanings below describe.
-        out.append("archived refinement run: SUCCESS meant a single mined refinement "
-                   "R with phi -> R; the status meanings below are today's")
-    return out
+    return [f"settings: {'   '.join(parts)}"] if parts else []
 
 
 def render(rows: list[Row], title: str = "", settings: dict | None = None) -> str:

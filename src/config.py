@@ -37,11 +37,6 @@ CONTROLLER_DIR = Path(__file__).resolve().parent.parent
 # sync_data.py collect, exactly like the tapes and hints) -- so preferring the
 # submodule would mean an edit here silently not taking effect. On any machine
 # without that path the submodule is what answers.
-#
-# (Until 2026-09-30 the controller could also score refinements -- conditions under
-# which the property holds -- against dataset.csv, of which this file was generated
-# as the negated mirror. That objective and its dataset are archived at the
-# `refinement-archive` tag of the controller, gamerv and data repos.)
 DATASET_NAME = "dataset_bug_condition.csv"
 _DATASET_CANDIDATES = (
     Path(os.environ["FL_DATASET"]) if os.environ.get("FL_DATASET") else None,
@@ -846,5 +841,5 @@ BUILD_TIMEOUT = 60 * 30      # a clean cmake build can be slow
 # check). Seconds in practice for SuperTux; the ceiling is only there so a wedged
 # libclang fails the row instead of hanging the batch.
 INSTRUMENT_TIMEOUT = 60 * 15
-VALIDATE_TIMEOUT = 60 * 30   # gamerv validate fans out to LLM/DeepFace
+VALIDATE_TIMEOUT = 60 * 30   # one gamerv validate pass (decodes + dumps the manual evidence)
 GAMERV_OP_TIMEOUT = 60 * 30

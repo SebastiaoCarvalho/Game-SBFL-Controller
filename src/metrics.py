@@ -35,7 +35,7 @@ does move the count and a ground truth's rank, which is the point. It can also m
 than the retained candidate: that tighter spelling is not a candidate the tool would
 show.
 
-Four numbers per case:
+Three numbers per case:
 
   candidates  how many top-ranked candidate bug conditions the miner produced.
               Independent of the candidate ordering: the tier is a *set*, and the
@@ -44,11 +44,6 @@ Four numbers per case:
               blank when phi is not among those candidates.
   union_only  phi is established only by several candidates *together* — the case
               the single-candidate rule below rejects.
-  below_top   read from archived runs only: phi *was* established by a single mined
-              candidate, but one scoring below the top tier (a verdict persisted
-              before gamerv decided phi against the top tier itself). Such a row can
-              read SUCCESS in its status column while the mining metrics count it as
-              a miss; the flag keeps that difference visible instead of silent.
 
 and two numbers for the size of the state the miner searched (the run's **space**),
 counted by gamerv over the pooled good/violation states it persisted
@@ -102,10 +97,7 @@ the verdict's own ``r_text``.
 runs — for a phi that ties the top score, or reads a non-raw catalogue predicate. A
 phi it rejects on its score alone (below the top, above it, or holding on no
 violation), or one over variables no top-ranked candidate constrains, leaves no
-record, and the row's ground truth is then simply not found. (Refinement-era runs
-had data-direct modes in which the verdict came from the data instead; for those a
-textual fallback matched phi against the tier by spelling. It is archived with the
-refinement objective and no longer reads anything.)
+record, and the row's ground truth is then simply not found.
 
 ``gt_match`` says which tier ``gt_rank`` refers to, so tiers are never silently mixed
 in a results table:
@@ -114,13 +106,6 @@ in a results table:
   implication  that single candidate is implied by phi (``phi -> B`` holds) without
                being spelled the same — a mined threshold is placed from the data,
                so it rarely equals a hand-written constant.
-  region       RETIRED (2026-09-28), still read from archived runs: no mined
-               candidate established phi, only phi's own sound core region did. That
-               region is derived from phi, so it contains any sound phi — a
-               self-match, not a find.
-  threshold    RETIRED with the refinement objective (2026-09-30), still read from
-               archived runs: the textual fallback's same-quantity, same-direction,
-               different-split match.
 """
 
 from __future__ import annotations
@@ -134,9 +119,6 @@ MINING_CACHE = "fault_localization.json"
 #: gamerv's persisted phi verdict (rank / candidate / union_only) — see the module
 #: docstring and runners.fault_localization._persist_phi_check.
 PHI_CACHE = "phi_verdict.json"
-#: The same record's name in run dirs archived before the refinement objective was
-#: retired, so :func:`read` still reads an archived run's logs.
-LEGACY_PHI_CACHE = "phi_refinement.json"
 
 #: Comparison operators, longest first so "<=" is matched before "<".
 _OPS = ("<=", ">=", "==", "!=", "<", ">")
@@ -153,7 +135,7 @@ _FLOAT_SUFFIX = re.compile(r"(?<=[0-9.])[fF](?![0-9A-Za-z_.])")
 SORTS = ("none", "type", "popularity")
 RANK_COLUMNS = tuple(f"gt_rank_{s}" for s in SORTS)
 
-COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only", "below_top",
+COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only",
            "variables", "varying_variables", "good_states", "bad_states",
            *RANK_COLUMNS)
 
@@ -165,8 +147,6 @@ class Mining:
     gt_rank: int | None = None      # 1-based position of phi in it, None if not there
     gt_match: str = ""              # see the module docstring's tier list ("" = none)
     union_only: bool = False        # only the union of candidates establishes phi
-    below_top: bool = False         # a single candidate establishes phi, but a
-                                    # lower-scoring one than the top tier
     variables: int | None = None    # base.field variables in the mined states
     varying: int | None = None      # ... of which change across them
     good_states: int | None = None  # pooled P & Q states (gamerv's pos_raw)
@@ -178,8 +158,7 @@ class Mining:
     @property
     def found(self) -> bool:
         """Was the ground truth found by a single top-scored candidate? (The tier says
-        how; ``union_only`` and ``below_top`` are deliberately not it: both are ways of
-        *missing*. An archived run may also carry the retired ``region`` tier.)"""
+        how; ``union_only`` is deliberately not it: it is a way of *missing*.)"""
         return bool(self.gt_match)
 
     def cells(self) -> list[str]:
@@ -188,7 +167,6 @@ class Mining:
                 "" if self.gt_rank is None else str(self.gt_rank),
                 self.gt_match,
                 "yes" if self.union_only else "",
-                "yes" if self.below_top else "",
                 "" if self.variables is None else str(self.variables),
                 "" if self.varying is None else str(self.varying),
                 "" if self.good_states is None else str(self.good_states),
@@ -448,10 +426,7 @@ def _phi_verdict(run_dir: Path, formula: str, phi: str) -> dict | None:
     did not run (or ran for a *different* phi — the file is keyed by formula, so a
     re-compare of the same run with another ground truth would otherwise be read as
     this row's)."""
-    path = run_dir / PHI_CACHE
-    if not path.is_file():
-        path = run_dir / LEGACY_PHI_CACHE      # a run dir archived before the rename
-    entry = _entry(path, formula)
+    entry = _entry(run_dir / PHI_CACHE, formula)
     if entry is None or entry.get("error"):
         return None
     if _canonical(entry.get("phi") or "") != _canonical(phi):
@@ -504,21 +479,13 @@ def read(run_dir: Path | str | None, formula: str, phi: str) -> Mining:
     if match == "implication" and rank:
         rank = int(rank)
         if rank > len(top):
-            # gamerv's rank indexes the whole ranked list (an archived verdict): phi
-            # is established, but by a candidate scoring below the top tier. Not
-            # found here, and flagged so the miss and the row's SUCCESS status can be
-            # reconciled.
-            m.below_top = True
-            return m
+            return m                  # outside the top tier: not a find
         # Name the tier the way a results table reads it: a candidate that is
         # *spelled* like phi is an exact match, one that merely implies it is not.
         m.gt_rank = rank
         m.gt_match = ("exact" if _same_formula(verdict.get("r_text"), phi)
                       else "implication")
-    # Any other match is the retired "region" tier (phi contained in a region derived
-    # from phi itself). gamerv does not rewrite the phi cache when no candidate is
-    # eligible, so a record left over from before the retirement can still sit beside
-    # a trace. It is not a find, so it is ignored.
+    # Any other match is not a find.
     return m
 
 

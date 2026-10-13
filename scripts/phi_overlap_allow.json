@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Accepted findings of phi_overlap_lint.py — the spec entries that currently",
-    "name a variable some row's ground-truth phi refines over.",
+    "name a variable some row's ground-truth phi reads.",
     "",
     "This is a DEBT LIST, not an exemption list. Every entry names the generic",
     "mechanism that removes the need for it; when that mechanism lands, the spec",

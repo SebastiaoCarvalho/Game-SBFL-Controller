@@ -36,8 +36,7 @@ distributions are comparable) it reports
     in the top k      how often phi was among the first k mined candidates, at
                       the cut-offs ``--top`` names (1, 3, 5, 10 by default) — the
                       row a results table quotes, since k is how far a user reads
-    ranked at all     and its two complements: found but unranked (only an
-                      archived run's retired ``region`` tier), and not found
+    ranked at all     and its complement, not found
     median rank       the middle position, over each side's own ranked rows
     mean reciprocal rank   1/rank averaged over *every* compared case, 0 where phi
                       was not ranked — the one number that moves both when a fix
@@ -64,10 +63,6 @@ is a reading aid over :data:`PROGRESS`, a heuristic ordering of how much a statu
 settled (ERROR decided nothing, FAIL decided phi and rejected it,
 CONDITION_NOT_FOUND says phi was right and the search missed it) — useful for
 skimming, not a second criterion.
-
-An archived run's statuses are read under today's names (``report.LEGACY_STATUS``:
-REFINEMENT_NOT_FOUND is CONDITION_NOT_FOUND), so a comparison across the rename shows
-no change that is only a change of word.
 
     python src/compare.py A B --out cmp.txt     # also write it to a file
     python src/compare.py A B --csv cmp.csv     # the per-case table, machine-readable
@@ -557,13 +552,9 @@ def _rank_summary(pairs: list[Pair], top_k: tuple[int, ...]) -> list[str]:
                                       counted(b_rows, k)) for k in top_k]
     ranked = (len([r for r in a_rows if r.gt_rank]),
               len([r for r in b_rows if r.gt_rank]))
-    unranked = (sum(1 for r in a_rows if r.found and not r.gt_rank),
-                sum(1 for r in b_rows if r.found and not r.gt_rank))
     table += [
         line("ranked at all", *ranked),
-        line("found without a rank", *unranked),
-        line("not found at all", len(a_rows) - ranked[0] - unranked[0],
-             len(b_rows) - ranked[1] - unranked[1]),
+        line("not found at all", len(a_rows) - ranked[0], len(b_rows) - ranked[1]),
         None,
         ("median rank", _median([r.gt_rank for r in a_rows if r.gt_rank]),
          _median([r.gt_rank for r in b_rows if r.gt_rank]), _median_delta(a_rows, b_rows)),
@@ -676,8 +667,8 @@ def _rank_moves(pairs: list[Pair], limit: int | None) -> list[str]:
 
 def _settings_lines(cmp: Comparison) -> list[str]:
     """The knobs that differed between the runs — the first thing to check when a
-    comparison shows a big move, since a run under another candidate sort — or an
-    archived run under another objective — is not the same experiment.
+    comparison shows a big move, since a run under another candidate sort is not
+    the same experiment.
 
     A run written before ``settings.json`` existed records none; the line says so
     rather than pretending the knobs matched.
@@ -688,12 +679,8 @@ def _settings_lines(cmp: Comparison) -> list[str]:
     if a is None or b is None:
         missing = "A" if a is None else "B"
         return [f"  run {missing} recorded no settings.json — knobs not comparable."]
-    # A run recorded before the objective knob existed was a refinement run.
-    a = {"objective": "refinement", **a}
-    b = {"objective": "refinement", **b}
-    keys = [k for k in ("objective", "candidate_sort", "refinement_mode",
-                        "threshold_strategy", "instrument_source", "game", "rows",
-                        "dataset")
+    keys = [k for k in ("objective", "candidate_sort", "instrument_source", "game",
+                        "rows", "dataset")
             if a.get(k) != b.get(k)]
     if not keys:
         return ["  identical knobs on both runs "
@@ -808,9 +795,8 @@ def render(cmp: Comparison, limit: int | None = MOVES_SHOWN,
         lines += _rank_moves(cmp.pairs, limit)
         lines += ["",
                   "  ranked = phi is at a known position among the top-scored mined",
-                  "  candidates; an archived run's retired region match is found but",
-                  "  unranked, and counts 0 in the reciprocal rank. The",
-                  "  rank is a position in the order --candidate-sort chose, so a run",
+                  "  candidates; a row where it is not counts 0 in the reciprocal rank.",
+                  "  The rank is a position in the order --candidate-sort chose, so a run",
                   "  under another sort ranks the same candidate set differently",
                   "  (SETTINGS above says whether that is the case here)."]
 
