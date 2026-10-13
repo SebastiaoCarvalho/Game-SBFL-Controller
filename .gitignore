@@ -10,4 +10,5 @@ scripts/*.csv
 instrument/
 list.txt
 build_logs/
+*.drawio
 
