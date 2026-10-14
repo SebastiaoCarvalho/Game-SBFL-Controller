@@ -88,6 +88,11 @@ The best case is always rank 1 (phi ties the top score, so some order puts a
 containing candidate first), so it has no column. Like ``gt_rank``, the three are
 kept only on a SUCCESS row.
 
+Then how closely the candidate at ``gt_rank`` matches phi — ``gt_match`` says only
+whether it is spelled the same — as one of :data:`STRENGTHS` (``gt_strength``) and
+what separates the two when they are not provably equivalent
+(``gt_strength_reason``); see :func:`match_strength`. SUCCESS-only as well.
+
 Finally, one rank per candidate sort, ``gt_rank_<sort>`` (``none`` / ``type`` /
 ``popularity``): the ground truth's position in the *same* top tier read in that
 sort's order. The run's own sort always fills its column (equal to ``gt_rank``); a run
@@ -167,10 +172,15 @@ RANK_COLUMNS = tuple(f"gt_rank_{s}" for s in SORTS)
 #: The order-free rank columns (see the module docstring), after the per-sort ones so
 #: a run written before them keeps every column it had in place.
 TIE_COLUMNS = ("pool", "gt_contained", "gt_rank_expected", "gt_rank_worst")
+#: How closely the candidate at ``gt_rank`` matches phi (see :func:`match_strength`).
+STRENGTH_COLUMNS = ("gt_strength", "gt_strength_reason")
 
 COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only",
            "variables", "varying_variables", "good_states", "bad_states",
-           *RANK_COLUMNS, *TIE_COLUMNS)
+           *RANK_COLUMNS, *TIE_COLUMNS, *STRENGTH_COLUMNS)
+
+#: The match-strength classes, strictest first (:func:`match_strength`).
+STRENGTHS = ("exact", "equivalent", "same-on-data", "weaker-on-data", "undecided")
 
 
 def expected_rank(n: int, k: int) -> float:
@@ -220,6 +230,8 @@ class Mining:
     ranks: dict = field(default_factory=dict)
     pool: int | None = None         # every ranked candidate: tier + folded + lower
     contained: int | None = None    # k: tier candidates establishing phi (found only)
+    strength: str = ""              # one of STRENGTHS (found only; "" = not recorded)
+    strength_reason: str = ""       # what separates B from phi, "+"-joined
 
     @property
     def found(self) -> bool:
@@ -256,7 +268,8 @@ class Mining:
                 "" if self.pool is None else str(self.pool),
                 "" if self.contained is None else str(self.contained),
                 "" if expected is None else _fmt_rank(expected),
-                "" if self.rank_worst is None else str(self.rank_worst)]
+                "" if self.rank_worst is None else str(self.rank_worst),
+                self.strength, self.strength_reason]
 
 
 # --------------------------------------------------------------------------
@@ -577,8 +590,48 @@ def read(run_dir: Path | str | None, formula: str, phi: str, *,
         m.gt_match = ("exact" if _same_formula(verdict.get("r_text"), phi)
                       else "implication")
         m.contained = contained_count(verdict, len(top))
+        m.strength, m.strength_reason = match_strength(verdict, m.gt_match)
     # Any other match is not a find.
     return m
+
+
+def match_strength(verdict: dict, gt_match: str) -> tuple[str, str]:
+    """``(class, reason)`` for the candidate that established phi, off gamerv's
+    ``contained_strength`` record of it; ``("", "")`` for a verdict written before
+    gamerv recorded one. The classes, strictest first (:data:`STRENGTHS`):
+
+      exact           B is spelled as phi (``gt_match``), and the converse check does
+                      not refute it. Spelling alone is not enough: the canonical form
+                      reads ``x != v`` as ``~(x == v)``, which differs for a ``subject``
+                      field when the event has no subject (both atoms read False).
+      equivalent      ``B -> phi`` holds too.
+      same-on-data    not provably equivalent, but B and phi hold on exactly the same
+                      recorded states — no recording at hand tells them apart.
+      weaker-on-data  B holds on some recorded state phi does not.
+      undecided       either could not be evaluated on the states, or the evaluation
+                      failed its self-checks.
+
+    The reason (``same_variables`` / ``fewer_variables`` / ``unused_alternative``,
+    ``+``-joined) says what separates a B that is not provably equivalent from phi.
+    """
+    records = verdict.get("contained_strength")
+    if not isinstance(records, list):
+        return "", ""
+    rec = next((r for r in records if isinstance(r, dict)
+                and r.get("r_text") == verdict.get("r_text")), None)
+    if rec is None:
+        return "", ""
+    equivalent = rec.get("equivalent")
+    if gt_match == "exact" and equivalent is not False:
+        return "exact", ""
+    if equivalent is True:
+        return "equivalent", ""
+    reason = "+".join(rec.get("reasons") or [])
+    if rec.get("same_on_data") is True:
+        return "same-on-data", reason
+    if rec.get("same_on_data") is False:
+        return "weaker-on-data", reason
+    return "undecided", reason
 
 
 def contained_count(verdict: dict, n_top: int) -> int | None:

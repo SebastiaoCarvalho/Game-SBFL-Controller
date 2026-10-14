@@ -137,6 +137,10 @@ class Row:
     #: the columns, k also off a SUCCESS row.
     pool: int | None = None
     contained: int | None = None
+    #: How closely the candidate at gt_rank matches phi (metrics.match_strength),
+    #: "" when not recorded or not a SUCCESS row.
+    strength: str = ""
+    strength_reason: str = ""
 
     def rank_under(self, sort: str) -> int | None:
         return dict(self.ranks).get(sort)
@@ -233,7 +237,9 @@ def row_from_dict(d: dict) -> Row:
                bad_states=_int(d.get("bad_states")),
                ranks=tuple((s, rank(c))
                            for s, c in zip(metrics.SORTS, metrics.RANK_COLUMNS)),
-               pool=_int(d.get("pool")), contained=rank("gt_contained"))
+               pool=_int(d.get("pool")), contained=rank("gt_contained"),
+               strength=cell("gt_strength") if found else "",
+               strength_reason=cell("gt_strength_reason") if found else "")
 
 
 def row_from_result(res) -> Row:
@@ -250,7 +256,9 @@ def row_from_result(res) -> Row:
                variables=res.mining.variables, varying=res.mining.varying,
                good_states=res.mining.good_states, bad_states=res.mining.bad_states,
                ranks=tuple((s, res.mining.ranks.get(s)) for s in metrics.SORTS),
-               pool=res.mining.pool, contained=res.mining.contained)
+               pool=res.mining.pool, contained=res.mining.contained,
+               strength=res.mining.strength,
+               strength_reason=res.mining.strength_reason)
 
 
 def rows_from_results(results) -> list[Row]:
@@ -555,6 +563,66 @@ def tie_rank_lines(rows: list[Row]) -> list[str]:
     return out
 
 
+#: Example-count bins for the strength cross-tab — the states figure's bins.
+_STATE_BINS = (("2", 2, 2), ("3-4", 3, 4), ("5-9", 5, 9), ("10+", 10, None))
+
+
+def strength_lines(rows: list[Row]) -> list[str]:
+    """How closely each found ground truth's candidate matches it
+    (metrics.match_strength): per game (after the pooled ``all``) the count per
+    class, then the strictness ladder — SUCCESS counted at each level — then what
+    separates a candidate from phi when they are not provably equivalent, and the
+    classes against the number of labelled states. Empty for a run that recorded no
+    strength."""
+    found = [r for r in rows if r.found]
+    known = [r for r in found if r.strength]
+    if not known:
+        return []
+    classes = list(metrics.STRENGTHS)
+    games = by_game(known)
+    groups = ([("all", known)] if len(games) > 1 else []) + games
+    label_w = max([len("game")] + [len(g) for g, _ in groups])
+    col_w = max(len(c) for c in classes) + 1
+    out = [f"  {'game':<{label_w}}  {'found':>5}  "
+           + "  ".join(f"{c:>{col_w}}" for c in classes)]
+    for label, group in groups:
+        n = {c: sum(1 for r in group if r.strength == c) for c in classes}
+        out.append(f"  {label:<{label_w}}  {len(group):>5}  "
+                   + "  ".join(f"{n[c]:>{col_w}}" for c in classes))
+
+    out += ["", f"  SUCCESS at each strictness level (of {len(rows)} row(s)):"]
+    running = 0
+    for c in classes:
+        running += sum(1 for r in known if r.strength == c)
+        out.append(f"    up to {c:<15} {running:>4}")
+    unknown = len(found) - len(known)
+    if unknown:
+        out.append(f"    + {unknown} found row(s) with no strength recorded")
+
+    reasons: dict[str, int] = {}
+    for r in known:
+        if r.strength not in ("exact", "equivalent"):
+            for part in (r.strength_reason or "?").split("+"):
+                reasons[part] = reasons.get(part, 0) + 1
+    if reasons:
+        out += ["", "  what separates B from phi when not provably equivalent "
+                    "(a row can carry two):"]
+        out += [f"    {k:<20} {v:>4}" for k, v in sorted(reasons.items(),
+                                                         key=lambda kv: -kv[1])]
+
+    sized = [r for r in known if r.good_states is not None and r.bad_states is not None]
+    if sized:
+        out += ["", "  by labelled states (good + bad):",
+                f"    {'':<{col_w}}" + "".join(f"{b:>7}" for b, _lo, _hi in _STATE_BINS)]
+        for c in classes:
+            cells = [sum(1 for r in sized if r.strength == c
+                         and lo <= r.good_states + r.bad_states
+                         and (hi is None or r.good_states + r.bad_states <= hi))
+                     for _b, lo, hi in _STATE_BINS]
+            out.append(f"    {c:<{col_w}}" + "".join(f"{n:>7}" for n in cells))
+    return out
+
+
 def _wrap(text: str, indent: str, width: int = 78) -> list[str]:
     """``text`` folded to ``width``, every line prefixed with ``indent`` (empty for
     an empty note, so a case with nothing to say costs no line)."""
@@ -765,6 +833,15 @@ def render(rows: list[Row], title: str = "", settings: dict | None = None) -> st
              "  random = expected rank under a random order, (n+1)/(k+1); worst =",
              "  n-k+1; best is always 1. Medians over the SUCCESS rows.", ""]
             + ties)
+
+    strength = strength_lines(rows)
+    if strength:
+        lines += _section(
+            "MATCH STRENGTH",
+            ["  how closely the candidate B that established phi (the one at gt_rank)",
+             "  matches it: exact spelling; equivalent (B -> phi holds too); the same on",
+             "  every recorded state; weaker on some recorded state; or undecided.", ""]
+            + strength)
 
     # Then the same analysis per game, so each game's own numbers can be read
     # (and quoted) without the rest of the run diluting them.
