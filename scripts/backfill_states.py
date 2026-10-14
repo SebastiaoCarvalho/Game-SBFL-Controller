@@ -79,6 +79,20 @@ def _sources(rows: list[dict], end: str) -> list[Path | None]:
 
 def _counts(src: Path | None, row: dict) -> tuple[int, int] | None:
     """``(good, bad)`` from the run dir under ``src`` whose cache is this row's."""
+    hit = run_dir_for(src, row)
+    if hit is None:
+        return None
+    m = hit[1]
+    if m.good_states is None or m.bad_states is None:
+        return None
+    return m.good_states, m.bad_states
+
+
+def run_dir_for(src: Path | None, row: dict) -> tuple[Path, metrics.Mining] | None:
+    """The run dir under ``src`` whose mining cache is this row's, with the metrics
+    read off it — or None. Accepted only when the cache holds the row's own formula
+    and :func:`metrics.read` reproduces the row's :data:`CHECKED` cells (see the
+    module docstring); shared with the other backfills, which map rows the same way."""
     if src is None:
         return None
     for path in sorted(src.glob(f"*/{metrics.MINING_CACHE}")):
@@ -97,8 +111,7 @@ def _counts(src: Path | None, row: dict) -> tuple[int, int] | None:
         want = {c: ("" if c == "gt_rank" and status != metrics.FOUND_STATUS
                     else (row.get(c) or "").strip()) for c in CHECKED}
         if all(got[c] == want[c] for c in CHECKED):
-            if m.good_states is not None and m.bad_states is not None:
-                return m.good_states, m.bad_states
+            return path.parent, m
     return None
 
 

@@ -132,9 +132,27 @@ class Row:
     #: ranked under that sort or its ground truth was not found (metrics.py). A
     #: tuple, like ``phases``, so the row stays hashable.
     ranks: tuple[tuple[str, int | None], ...] = ()
+    #: Every candidate the miner ranked, and k — how many top-tier candidates
+    #: establish phi (metrics.py's order-free ranks). None for a run written before
+    #: the columns, k also off a SUCCESS row.
+    pool: int | None = None
+    contained: int | None = None
 
     def rank_under(self, sort: str) -> int | None:
         return dict(self.ranks).get(sort)
+
+    @property
+    def rank_expected(self) -> float | None:
+        """Phi's expected rank under a uniformly random order of the tier."""
+        if self.candidates is None or not self.contained:
+            return None
+        return metrics.expected_rank(self.candidates, self.contained)
+
+    @property
+    def rank_worst(self) -> int | None:
+        if self.candidates is None or not self.contained:
+            return None
+        return metrics.worst_rank(self.candidates, self.contained)
 
     @property
     def fault_class(self) -> str:
@@ -214,7 +232,8 @@ def row_from_dict(d: dict) -> Row:
                good_states=_int(d.get("good_states")),
                bad_states=_int(d.get("bad_states")),
                ranks=tuple((s, rank(c))
-                           for s, c in zip(metrics.SORTS, metrics.RANK_COLUMNS)))
+                           for s, c in zip(metrics.SORTS, metrics.RANK_COLUMNS)),
+               pool=_int(d.get("pool")), contained=rank("gt_contained"))
 
 
 def row_from_result(res) -> Row:
@@ -230,7 +249,8 @@ def row_from_result(res) -> Row:
                phases=tuple(res.phase_cells().items()),
                variables=res.mining.variables, varying=res.mining.varying,
                good_states=res.mining.good_states, bad_states=res.mining.bad_states,
-               ranks=tuple((s, res.mining.ranks.get(s)) for s in metrics.SORTS))
+               ranks=tuple((s, res.mining.ranks.get(s)) for s in metrics.SORTS),
+               pool=res.mining.pool, contained=res.mining.contained)
 
 
 def rows_from_results(results) -> list[Row]:
@@ -375,6 +395,12 @@ def _mining_summary(rows: list[Row]) -> list[str]:
     if cands:
         out.append(f"  candidates per row:  median {statistics.median(cands):g}   "
                    f"min {min(cands)}   max {max(cands)}")
+    pooled = [r for r in mined if r.pool and r.candidates is not None]
+    if pooled:
+        share = statistics.median(r.candidates / r.pool for r in pooled)
+        out.append(f"  top tier / pool:     median {100.0 * share:.0f}%   "
+                   f"(pool median {statistics.median(r.pool for r in pooled):g} "
+                   f"candidates, over {len(pooled)} row(s))")
     if ranks:
         out.append(f"  ground-truth rank:   median {statistics.median(ranks):g}   "
                    f"min {min(ranks)}   max {max(ranks)}   "
@@ -464,6 +490,68 @@ def sort_rank_lines(rows: list[Row]) -> list[str]:
     note = sort_left_out_note(rows, sorts)
     if note:
         out.append(f"  {note}")
+    return out
+
+
+#: The cut-offs "found within the top N" is reported at.
+TOP_NS = (1, 5, 10)
+
+
+def one_decimal(x: float) -> str:
+    """``481.5`` / ``20`` — a median rank, which can fall between two ranks."""
+    return f"{x:.1f}".rstrip("0").rstrip(".")
+
+
+def tie_rank_lines(rows: list[Row]) -> list[str]:
+    """The ground truth's rank with the order taken out (metrics.py's order-free
+    ranks): per game (after the pooled ``all``), the median tier size n, the median k,
+    the expected rank under a random order of the tier and the worst one, next to each
+    sort's median rank; then how many rows each order puts within the top N — for the
+    random order an expectation — and how often each sort beats the random
+    expectation. Empty for a run that recorded no k.
+    """
+    known = [r for r in rows if r.found and r.contained and r.candidates]
+    if not known:
+        return []
+    sorts = ranked_sorts(known)
+    both = sort_ranked(known, sorts) if sorts else known
+    games = by_game(both)
+    groups = ([("all", both)] if len(games) > 1 else []) + games
+    label_w = max([len("game")] + [len(g) for g, _ in groups])
+    cols = ["random", "worst", *sorts]
+    col_w = max(8, *(len(c) + 1 for c in cols))
+    out = [f"  {'game':<{label_w}}  {'rows':>5}  {'med.n':>6}  {'med.k':>5}  "
+           + "  ".join(f"{c:>{col_w}}" for c in cols)]
+    for label, group in groups:
+        meds = [statistics.median(r.rank_expected for r in group),
+                statistics.median(r.rank_worst for r in group),
+                *(statistics.median(r.rank_under(s) for r in group) for s in sorts)]
+        out.append(f"  {label:<{label_w}}  {len(group):>5}  "
+                   f"{statistics.median(r.candidates for r in group):>6g}  "
+                   f"{statistics.median(r.contained for r in group):>5g}  "
+                   + "  ".join(f"{one_decimal(m):>{col_w}}" for m in meds))
+
+    out += ["", f"  found within the top N, of {len(both)} row(s) "
+                f"(random = the expected count):"]
+    out.append(f"  {'':<{label_w}}  " + "  ".join(f"{c:>{col_w}}"
+                                                 for c in ["random", *sorts]))
+    for top in TOP_NS:
+        rnd = sum(metrics.hit_probability(r.candidates, r.contained, top) for r in both)
+        hits = [sum(1 for r in both if r.rank_under(s) <= top) for s in sorts]
+        out.append(f"  {f'top {top}':<{label_w}}  {rnd:>{col_w}.1f}  "
+                   + "  ".join(f"{h:>{col_w}}" for h in hits))
+    if sorts:
+        beats = [f"{s} {sum(1 for r in both if r.rank_under(s) < r.rank_expected)}"
+                 for s in sorts]
+        out += ["", f"  ranked above the random expectation: {'   '.join(beats)}"
+                    f"   (of {len(both)})"]
+    unknown = sum(1 for r in rows if r.found and not r.contained)
+    if unknown:
+        out.append(f"  {unknown} found row(s) left out: no k recorded (a run "
+                   f"written before gamerv listed every containing candidate)")
+    if len(both) < len(known):
+        out.append(f"  {len(known) - len(both)} row(s) left out: ranked under only "
+                   f"some of the sorts")
     return out
 
 
@@ -667,6 +755,16 @@ def render(rows: list[Row], title: str = "", settings: dict | None = None) -> st
             ["  the same top-scored candidates, read in each sort's order; medians",
              "  over the rows whose ground truth was ranked under every sort.", ""]
             + by_sort)
+
+    ties = tie_rank_lines(rows)
+    if ties:
+        lines += _section(
+            "RANK WITH TIES",
+            ["  every candidate in the top tier ties on score, so a rank also measures",
+             "  the order. n = tier size, k = tier candidates that contain phi;",
+             "  random = expected rank under a random order, (n+1)/(k+1); worst =",
+             "  n-k+1; best is always 1. Medians over the SUCCESS rows.", ""]
+            + ties)
 
     # Then the same analysis per game, so each game's own numbers can be read
     # (and quoted) without the rest of the run diluting them.

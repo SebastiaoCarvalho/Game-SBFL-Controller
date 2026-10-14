@@ -789,19 +789,27 @@ _SORT_SHORT = {"none": "none", "type": "type", "popularity": "pop."}
 
 
 def draw_ranks_by_sort(rows: list[report.Row], sorts: list[str], out_path: Path,
-                       subtitle: str) -> Path:
+                       subtitle: str, random: bool = False) -> Path:
     """Per game (after the pooled ``all``): one box of top-scored candidate counts,
-    then one box of ground-truth ranks per sort, over the same rows.
+    then — with ``random`` — one box of the ground truth's expected rank under a
+    random order of the tier (metrics.expected_rank), then one box of ground-truth
+    ranks per sort, over the same rows.
 
     The sort only permutes the top tier, so the candidate count is one box for all of
     them, and every rank box indexes into the list that box sizes — one shared axis,
-    log-scaled when the spans are far apart. Every box is named, with its median,
-    under the axis; the games are labelled below that.
+    log-scaled when the spans are far apart. The random box is the baseline a sort is
+    worth its name against, so it is neutral gray (blue, gray, orange, aqua, yellow
+    validates as an adjacent run: worst CVD Delta E 9.2, worst normal-vision 17.2).
+    The worst order is not drawn: at n - k + 1 with k of 1-4 it is the candidate box
+    again. Every box is named, with its median, under the axis; the games are
+    labelled below that.
     """
     games = sorted(report.by_game(rows),
                    key=lambda lg: -statistics.median(r.candidates for r in lg[1]))
     groups = ([(ALL, rows)] if len(games) > 1 else []) + games
     series = [("cand.", ACCENT, ACCENT_FILL, lambda r: r.candidates)]
+    if random:
+        series.append(("random", NEUTRAL, NEUTRAL_LIGHT, lambda r: r.rank_expected))
     series += [(_SORT_SHORT.get(s, s), *_SORT_STYLE.get(s, (NEUTRAL, NEUTRAL_LIGHT)),
                 lambda r, s=s: r.rank_under(s)) for s in sorts]
     k = len(series)
@@ -820,7 +828,7 @@ def draw_ranks_by_sort(rows: list[report.Row], sorts: list[str], out_path: Path,
         _scatter(ax, positions, data, color, spread=0.045)
         for x, vals in zip(positions, data):
             ticks.append(x)
-            labels.append(f"{short}\n{statistics.median(vals):g}")
+            labels.append(f"{short}\n{report.one_decimal(statistics.median(vals))}")
         values += [v for vals in data for v in vals]
 
     log = _log_if_wide(ax, values, headroom=3.0)
@@ -838,6 +846,8 @@ def draw_ranks_by_sort(rows: list[report.Row], sorts: list[str], out_path: Path,
             "Top-scored candidates vs. rank of the ground truth, per candidate sort",
             subtitle)
     _legend(ax, [("top-scored candidates", ACCENT, ACCENT_FILL)]
+                + ([("rank · random order (expected)", NEUTRAL, NEUTRAL_LIGHT)]
+                   if random else [])
                 + [(f"rank · {s}", *_SORT_STYLE.get(s, (NEUTRAL, NEUTRAL_LIGHT)))
                    for s in sorts])
     return _save(fig, out_path)
@@ -857,12 +867,21 @@ def _render_ranks_by_sort(run: _Run, out: Path) -> Path | None:
         return None
     note = report.sort_left_out_note(rows, sorts)
     tail = f", {note}" if note else ""
+    # The random box needs k on every row, or it would summarise other rows than the
+    # boxes beside it; a run that recorded none simply draws without it.
+    random = all(r.rank_expected is not None for r in both)
+    if not random:
+        missing = sum(1 for r in both if r.rank_expected is None)
+        print(f"    {missing} row(s) carry no k (gt_contained) — random-order box "
+              f"left out")
     return draw_ranks_by_sort(
         both, sorts, out,
         f"{len(both)} row(s) whose ground truth was ranked under every sort{tail}\n"
         f"every sort orders the same top-scored candidates, so their count is one "
-        f"box and each sort's rank another\n"
-        f"label = median · {_BOX_LEGEND}")
+        f"box and each sort's rank another"
+        + ("; random = expected rank under a random order, (n+1)/(k+1)"
+           if random else "") + "\n"
+        f"label = median · {_BOX_LEGEND}", random=random)
 
 
 # --------------------------------------------------------------------------

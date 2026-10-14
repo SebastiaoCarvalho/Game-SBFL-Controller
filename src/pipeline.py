@@ -392,6 +392,10 @@ def _rerank(run_dir: Path, case: TestCase, sorts: list[str],
             if m.candidates != primary.candidates:
                 print(f"    {s}: [warn] {m.candidates} candidate(s), not "
                       f"{primary.candidates} — the call re-mined instead of re-ranking")
+            if m.found and primary.found and m.contained != primary.contained:
+                # k counts a set: the order may move the first hit, never how many.
+                print(f"    {s}: [warn] {m.contained} candidate(s) contain phi, not "
+                      f"{primary.contained} — the phi scan saw a different set")
             if cont.status != primary_status or m.found != primary.found:
                 print(f"    {s}: [warn] verdict {cont.status} "
                       f"({'found' if m.found else 'not found'}), where the row's own "

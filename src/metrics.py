@@ -68,6 +68,26 @@ the ground truth can sit deep in it; the two counts let a results section show t
 Read off the same cache as the space, so they are known whenever the miner pooled
 states.
 
+Then the rank with the order taken out. Every candidate in the top tier ties on score
+and size, so any order of it is as justified as another, and a single rank says as
+much about the order as about the scoring:
+
+  pool              every candidate the miner ranked (the tier, the spellings folded
+                    into it, and the lower-scoring rest); the tier's share of it is
+                    how far the scoring narrowed the search. Its size moves with the
+                    miner's grammar knobs, so it is the secondary number.
+  gt_contained      k, how many tier candidates establish phi (gamerv's
+                    ``contained_ranks``). Blank when the run predates the field or
+                    the scan was cut short (the count is then a lower bound).
+  gt_rank_expected  where the first of them lands under a uniformly random order
+                    of the tier, ``(n + 1) / (k + 1)`` — the baseline every sort is
+                    measured against.
+  gt_rank_worst     where it lands under the worst order, ``n - k + 1``.
+
+The best case is always rank 1 (phi ties the top score, so some order puts a
+containing candidate first), so it has no column. Like ``gt_rank``, the three are
+kept only on a SUCCESS row.
+
 Finally, one rank per candidate sort, ``gt_rank_<sort>`` (``none`` / ``type`` /
 ``popularity``): the ground truth's position in the *same* top tier read in that
 sort's order. The run's own sort always fills its column (equal to ``gt_rank``); a run
@@ -144,9 +164,44 @@ _FLOAT_SUFFIX = re.compile(r"(?<=[0-9.])[fF](?![0-9A-Za-z_.])")
 SORTS = ("none", "type", "popularity")
 RANK_COLUMNS = tuple(f"gt_rank_{s}" for s in SORTS)
 
+#: The order-free rank columns (see the module docstring), after the per-sort ones so
+#: a run written before them keeps every column it had in place.
+TIE_COLUMNS = ("pool", "gt_contained", "gt_rank_expected", "gt_rank_worst")
+
 COLUMNS = ("candidates", "gt_rank", "gt_match", "union_only",
            "variables", "varying_variables", "good_states", "bad_states",
-           *RANK_COLUMNS)
+           *RANK_COLUMNS, *TIE_COLUMNS)
+
+
+def expected_rank(n: int, k: int) -> float:
+    """Expected position of the first of ``k`` marked items when ``n`` are put in a
+    uniformly random order: ``(n + 1) / (k + 1)``."""
+    return (n + 1) / (k + 1)
+
+
+def worst_rank(n: int, k: int) -> int:
+    """Position of the first of ``k`` marked items when all ``n - k`` others come
+    first."""
+    return n - k + 1
+
+
+def hit_probability(n: int, k: int, top: int) -> float:
+    """Chance that a uniformly random order of ``n`` items puts at least one of ``k``
+    marked ones within the first ``top``: ``1 - C(n-k, top) / C(n, top)``. Summed
+    over rows it is how many a random order is expected to find within ``top``."""
+    if k <= 0:
+        return 0.0
+    if top >= n - k + 1:
+        return 1.0
+    p_miss = 1.0
+    for i in range(top):          # the product form of C(n-k, top) / C(n, top)
+        p_miss *= (n - k - i) / (n - i)
+    return 1.0 - p_miss
+
+
+def _fmt_rank(x: float) -> str:
+    """A rank that may be fractional, to two decimals without trailing zeros."""
+    return f"{x:.2f}".rstrip("0").rstrip(".")
 
 
 @dataclass
@@ -163,6 +218,8 @@ class Mining:
     #: ``{sort: rank}`` for every sort the row was ranked under (the run's own sort
     #: included); a sort mapped to None was ranked and the ground truth not found.
     ranks: dict = field(default_factory=dict)
+    pool: int | None = None         # every ranked candidate: tier + folded + lower
+    contained: int | None = None    # k: tier candidates establishing phi (found only)
 
     @property
     def found(self) -> bool:
@@ -171,8 +228,21 @@ class Mining:
         it: it is a way of *missing*.)"""
         return bool(self.gt_match)
 
+    @property
+    def rank_expected(self) -> float | None:
+        if self.candidates is None or not self.contained:
+            return None
+        return expected_rank(self.candidates, self.contained)
+
+    @property
+    def rank_worst(self) -> int | None:
+        if self.candidates is None or not self.contained:
+            return None
+        return worst_rank(self.candidates, self.contained)
+
     def cells(self) -> list[str]:
         """The :data:`COLUMNS` cells, blank where the metric does not apply."""
+        expected = self.rank_expected
         return ["" if self.candidates is None else str(self.candidates),
                 "" if self.gt_rank is None else str(self.gt_rank),
                 self.gt_match,
@@ -182,7 +252,11 @@ class Mining:
                 "" if self.good_states is None else str(self.good_states),
                 "" if self.bad_states is None else str(self.bad_states),
                 *("" if self.ranks.get(s) is None else str(self.ranks[s])
-                  for s in SORTS)]
+                  for s in SORTS),
+                "" if self.pool is None else str(self.pool),
+                "" if self.contained is None else str(self.contained),
+                "" if expected is None else _fmt_rank(expected),
+                "" if self.rank_worst is None else str(self.rank_worst)]
 
 
 # --------------------------------------------------------------------------
@@ -476,7 +550,8 @@ def read(run_dir: Path | str | None, formula: str, phi: str, *,
         return space
     top = _top_tier(shown)            # the reported candidate set — see _top_tier
     m = Mining(candidates=len(top), variables=space.variables, varying=space.varying,
-               good_states=space.good_states, bad_states=space.bad_states)
+               good_states=space.good_states, bad_states=space.bad_states,
+               pool=len(shown))
     if not phi.strip():
         return m                      # no ground truth on this row to look for
 
@@ -501,8 +576,24 @@ def read(run_dir: Path | str | None, formula: str, phi: str, *,
         m.gt_rank = rank
         m.gt_match = ("exact" if _same_formula(verdict.get("r_text"), phi)
                       else "implication")
+        m.contained = contained_count(verdict, len(top))
     # Any other match is not a find.
     return m
+
+
+def contained_count(verdict: dict, n_top: int) -> int | None:
+    """k off a phi verdict: how many top-tier candidates establish phi (gamerv's
+    ``contained_ranks``), or None when the verdict cannot say — written before gamerv
+    listed them, a scan cut short by its budget (the list is then a lower bound), or a
+    list that does not fit the tier or the verdict's own rank."""
+    hits = verdict.get("contained_ranks")
+    if not isinstance(hits, list) or not hits or verdict.get("truncated"):
+        return None
+    if any(not isinstance(r, int) or not 1 <= r <= n_top for r in hits):
+        return None
+    if min(hits) != verdict.get("rank"):
+        return None
+    return len(set(hits))
 
 
 def _count(value) -> int | None:
